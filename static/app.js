@@ -7,18 +7,6 @@
   const VIEWS = ["home", "search", "kept", "downloads"];
   const ACTIVE = ["queued", "downloading", "converting"];
   const FROM = { results: "From search", history: "Kept", recent: "Recently played" };
-  const TILES = [
-    ["Hits", "#d9a90a", "top hits this week"],
-    ["Pop", "#e2577f", "pop hits"],
-    ["Hip-Hop", "#4f7fe0", "hip hop hits"],
-    ["Country", "#d9801c", "country hits"],
-    ["Dance", "#22a874", "dance hits"],
-    ["Rock", "#d9603f", "rock classics"],
-    ["Latin", "#df2f78", "latin hits"],
-    ["R&B", "#7a63d6", "r&b hits"],
-    ["Chill", "#2f8f9e", "chill lofi"],
-    ["Throwback", "#b8336a", "2000s hits"],
-  ];
 
   const store = {
     get(k, d) { try { const v = localStorage.getItem("reef." + k); return v ? JSON.parse(v) : d; } catch { return d; } },
@@ -42,6 +30,11 @@
     shuffle: false,
     repeat: "off",
     health: null,
+    // Search sources from /api/sources; `source` is the chip picked for searching.
+    sources: [{ key: "yt", name: "YouTube", can_keep: true, codec_label: "AAC" }],
+    source: store.get("source", null),
+    // Mood/genre tiles; seeded by the server-rendered page, refreshed from /api/tiles.
+    tiles: (() => { try { return JSON.parse($("#tiles-data").textContent); } catch { return []; } })(),
   };
 
   const lists = {
@@ -53,11 +46,39 @@
   // ---------- helpers ----------
   const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
   const icon = (n, cls = "") => `<svg class="i ${cls}" aria-hidden="true"><use href="#i-${n}"/></svg>`;
+  // Direct YouTube URLs, used only for mediaSession artwork (iOS wants absolute, fetchable URLs).
   const thumb = (id) => `https://i.ytimg.com/vi/${id}/mqdefault.jpg`;
   const bigThumb = (id) => `https://i.ytimg.com/vi/${id}/maxresdefault.jpg`;
+  // Everything else goes through /api/art: the Navidrome cover for kept tracks, else a redirect to
+  // YouTube (size <= 200 -> mqdefault 16:9, < 600 -> hqdefault 4:3 letterboxed, >= 600 -> maxres).
+  // Sizes are [not kept, kept]: YouTube art stays <= 200 in square crops so hqdefault's black bars
+  // never show; kept tracks are served from Navidrome (no bars), so they get sharper sizes.
+  const ART = { small: [200, 480], big: [720, 720], fallback: [200, 480], tile: [320, 320], mini: [160, 320], bg: [160, 160] };
+  // encodeURIComponent turns "mc:123" into "mc%3A123", which Flask decodes back before routing.
+  const artUrl = (id, size) => `/api/art/${encodeURIComponent(id)}?size=${size}`;
+  const artSize = (id, kind) => ART[kind][keepState(id) === "kept" ? 1 : 0];
+  // Only YouTube has a smaller second-choice thumbnail; other sources fall back to the app icon.
+  const artFallback = (id) => (srcKey(id) === "yt" ? artUrl(id, artSize(id, "fallback")) : "/static/icon.svg");
   const art = (id, big = false) => big
-    ? `<img src="${bigThumb(id)}" data-fallback="${thumb(id)}" alt="" loading="lazy">`
-    : `<img src="${thumb(id)}" alt="" loading="lazy">`;
+    ? `<img src="${artUrl(id, artSize(id, "big"))}" data-fallback="${artFallback(id)}" alt="" loading="lazy">`
+    : `<img src="${artUrl(id, artSize(id, "small"))}" alt="" loading="lazy">`;
+
+  // ---------- sources ----------
+  // Ids are "<key>:<native>" except YouTube's bare ones. KNOWN covers sources that are off right now
+  // (e.g. a Navidrome track in "recently played" while Navidrome is unconfigured).
+  const KNOWN = {
+    yt: { key: "yt", name: "YouTube", can_keep: true, codec_label: "AAC" },
+    mc: { key: "mc", name: "Monochrome", can_keep: true, codec_label: "FLAC" },
+    nd: { key: "nd", name: "Library", can_keep: false, codec_label: "" },
+  };
+  const srcKey = (id) => (/^[a-z]{2}:/.test(id || "") ? id.slice(0, 2) : "yt");
+  const srcInfo = (key) => state.sources.find((x) => x.key === key) || KNOWN[key] || { key, name: key, can_keep: false, codec_label: "" };
+  const canKeep = (id) => srcInfo(srcKey(id)).can_keep !== false;
+  const currentSource = () => (state.sources.some((x) => x.key === state.source) ? state.source
+    : (state.sources.find((x) => x.default) || state.sources[0] || KNOWN.yt).key);
+  // " · Monochrome" after a non-YouTube track's subtitle; YouTube is the default, so it stays unlabeled.
+  const srcBadge = (t) => (srcKey(t.id) === "yt" ? "" : ` · ${esc(srcInfo(srcKey(t.id)).name)}`);
+  const codecLabel = (t) => (t.codec ? String(t.codec).toUpperCase() : srcInfo(srcKey(t.id)).codec_label);
 
   function fmt(sec) {
     if (!isFinite(sec) || sec < 0) sec = 0;
@@ -88,9 +109,22 @@
     return body;
   }
 
+  // Warm the server's stream-URL cache; best effort, never blocks or surfaces errors.
+  function prefetch(ids) {
+    ids = ids.filter(Boolean);
+    if (!ids.length) return;
+    try {
+      fetch("/api/prefetch", {
+        method: "POST", keepalive: true,
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ids }),
+      }).catch(() => {});
+    } catch {}
+  }
+
   const navidromeUrl = (path) => `${location.protocol}//${location.hostname}:4533${path}`;
   const cur = () => state.queue[state.index];
-  const slim = (t) => ({ id: t.id, title: t.title, channel: t.channel, duration: t.duration });
+  const slim = (t) => ({ id: t.id, title: t.title, channel: t.channel, duration: t.duration, source: t.source || srcKey(t.id), ...(t.codec ? { codec: t.codec } : {}) });
 
   // YouTube serves a 120x90 placeholder (sometimes with status 404) when maxres art is missing.
   function fallbackImg(img) {
@@ -105,6 +139,7 @@
   // ---------- keep state ----------
   function keepState(id) {
     if (!id) return "none";
+    if (srcKey(id) === "nd") return "kept"; // Navidrome results are the library itself
     if (state.history.some((h) => h.id === id)) return "kept";
     if (state.jobs.some((j) => j.video_id === id && ACTIVE.includes(j.status))) return "pending";
     return "none";
@@ -112,6 +147,7 @@
 
   function keepBtn(id, list) {
     const s = keepState(id);
+    if (s !== "kept" && !canKeep(id)) return "";
     return `<button class="keep ${s}" data-keep="${esc(id)}" data-list="${list}" aria-label="${s === "kept" ? "In your library" : "Keep in library"}">${icon(s === "kept" ? "check" : "plus")}</button>`;
   }
 
@@ -182,13 +218,17 @@
   }
 
   function tiles() {
-    return `<div class="tiles">${TILES.map(([label, c, q]) =>
-      `<button class="tile" style="--c:${c}" data-search="${esc(q)}"><span>${esc(label)}</span>${icon("note")}</button>`).join("")}</div>`;
+    return `<div class="tiles">${state.tiles.map((t) => {
+      const id = (t.ids || [])[0];
+      return id
+        ? `<button class="tile has-art" style="--c:${esc(t.color)}" data-search="${esc(t.query)}"><img src="${artUrl(id, artSize(id, "tile"))}" alt="" loading="lazy"><span>${esc(t.label)}</span></button>`
+        : `<button class="tile" style="--c:${esc(t.color)}" data-search="${esc(t.query)}"><span>${esc(t.label)}</span>${icon("note")}</button>`;
+    }).join("")}</div>`;
   }
 
   function row(t, i, list, sub) {
     const playing = cur()?.id === t.id;
-    const subtitle = sub ?? `${esc(t.channel)}${t.duration ? ` · ${fmt(t.duration)}` : ""}`;
+    const subtitle = sub ?? `${esc(t.channel)}${t.duration ? ` · ${fmt(t.duration)}` : ""}${srcBadge(t)}`;
     return `<li class="row${playing ? " playing" : ""}" data-track="${esc(t.id)}">
       <button class="row-main" data-play="${i}" data-list="${list}">
         <span class="row-art">${art(t.id)}${eqIfPlaying(t.id)}</span>
@@ -235,18 +275,26 @@
     $("#view-home").innerHTML = html;
   }
 
+  // Source picker, shown only when there is more than one enabled source.
+  function sourceChips() {
+    if (state.sources.length < 2) return "";
+    const on = currentSource();
+    return `<div class="chips src-chips">${state.sources.map((x) =>
+      `<button class="chip${x.key === on ? " on" : ""}" data-source="${esc(x.key)}">${esc(x.name)}</button>`).join("")}</div>`;
+  }
+
   function renderSearch() {
     const el = $("#view-search");
     if (!state.query) {
       const searches = store.get("searches", []);
-      el.innerHTML = (searches.length ? `
+      el.innerHTML = sourceChips() + (searches.length ? `
         <div class="head-row"><h2 class="section-title">Recent</h2><button class="link-btn" data-clear-searches>Clear</button></div>
         <ul class="rows">${searches.map((q) => `<li class="row"><button class="row-main" data-search="${esc(q)}"><span class="row-art" style="display:grid;place-items:center;color:var(--faint)">${icon("clock")}</span><span class="row-text"><span class="row-t">${esc(q)}</span></span></button></li>`).join("")}</ul>` : "")
         + `<h2 class="section-title">Browse Categories</h2>${tiles()}`;
       return;
     }
 
-    const chips = `<div class="chips">${[["top", "Top Results"], ["songs", "Songs"], ["kept", "In library"]].map(([k, l]) =>
+    const chips = sourceChips() + `<div class="chips">${[["top", "Top Results"], ["songs", "Songs"], ["kept", "In library"]].map(([k, l]) =>
       `<button class="chip${state.filter === k ? " on" : ""}" data-filter="${k}">${l}</button>`).join("")}</div>`;
 
     if (state.searching) {
@@ -272,7 +320,7 @@
           <span class="top-art">${art(t.id)}</span>
           <div class="top-meta">
             <div class="top-t">${esc(t.title)}</div>
-            <div class="top-s">Song · ${esc(t.channel)}${t.duration ? ` · ${fmt(t.duration)}` : ""}</div>
+            <div class="top-s">Song · ${esc(t.channel)}${t.duration ? ` · ${fmt(t.duration)}` : ""}${srcBadge(t)}</div>
             <div class="top-actions">
               <button class="play-round" data-play="0" data-list="results" aria-label="Play">${icon("play", "fill")}</button>
               ${keepBtn(t.id, "results")}
@@ -380,6 +428,24 @@
     if (state.view === "home") renderHome();
   }
 
+  async function loadTiles() {
+    let list;
+    try { list = await api("/api/tiles"); } catch { return; }
+    if (!Array.isArray(list) || JSON.stringify(list) === JSON.stringify(state.tiles)) return;
+    state.tiles = list;
+    if (state.view === "home") renderHome();
+    else if (state.view === "search" && !state.query) renderSearch();
+  }
+
+  async function loadSources() {
+    let list;
+    try { list = await api("/api/sources"); } catch { return; }
+    if (!Array.isArray(list) || !list.length) return;
+    state.sources = list;
+    if (state.view === "search") renderSearch();
+    refreshKeepButtons();
+  }
+
   async function loadHealth() {
     try { state.health = await api("/api/health"); } catch { state.health = null; }
     const dot = $("#status-dot");
@@ -426,7 +492,7 @@
     if (location.hash !== "#search") location.hash = "#search"; else renderSearch();
     const seq = ++searchSeq;
     try {
-      const r = await api(`/api/search?q=${encodeURIComponent(q)}`);
+      const r = await api(`/api/search?q=${encodeURIComponent(q)}&src=${encodeURIComponent(currentSource())}`);
       if (seq !== searchSeq) return;
       state.results = r;
     } catch (e) {
@@ -449,6 +515,7 @@
       i = Math.floor(Math.random() * list.length);
     }
     state.index = Math.min(Math.max(i, 0), list.length - 1);
+    prefetch([cur()?.id]);
     load();
   }
 
@@ -461,14 +528,19 @@
     if (!t) return;
     audio.src = `/api/stream/${encodeURIComponent(t.id)}`;
     audio.play().catch(() => {});
+    // Resolve the next track once this one is playing, so it doesn't compete for the extractor.
+    prefetchNext = state.queue[state.index + 1]?.id || null;
     rememberPlay(t);
     updatePlayer();
     markPlaying();
     setProgress(0, t.duration || 0);
     if ("mediaSession" in navigator) {
+      const abs = (u) => new URL(u, location.href).href;
       navigator.mediaSession.metadata = new MediaMetadata({
         title: t.title, artist: t.channel, album: "Reef",
-        artwork: [{ src: thumb(t.id), sizes: "320x180", type: "image/jpeg" }, { src: bigThumb(t.id), sizes: "1280x720", type: "image/jpeg" }],
+        artwork: srcKey(t.id) === "yt"
+          ? [{ src: thumb(t.id), sizes: "320x180", type: "image/jpeg" }, { src: bigThumb(t.id), sizes: "1280x720", type: "image/jpeg" }]
+          : [{ src: abs(artUrl(t.id, 600)), sizes: "600x600", type: "image/jpeg" }],
       });
     }
   }
@@ -507,23 +579,30 @@
     if (!t) { mini.hidden = true; document.body.classList.remove("has-mini"); return; }
     mini.hidden = false;
     document.body.classList.add("has-mini");
-    $("#mini-art").src = thumb(t.id);
+    $("#mini-art").src = artUrl(t.id, artSize(t.id, "mini"));
     $("#mini-t").textContent = t.title;
     $("#mini-s").textContent = t.channel;
 
     const artImg = $("#np-art");
     if (artImg.dataset.id !== t.id) {
       artImg.dataset.id = t.id;
-      artImg.dataset.fallback = thumb(t.id);
-      artImg.src = bigThumb(t.id);
-      $("#np-bg").src = thumb(t.id);
+      artImg.dataset.fallback = artFallback(t.id);
+      artImg.src = artUrl(t.id, artSize(t.id, "big"));
+      $("#np-bg").src = artUrl(t.id, artSize(t.id, "bg"));
     }
     $("#np-t").textContent = t.title;
     $("#np-s").textContent = t.channel;
     $("#np-from").textContent = state.from;
-    $("#np-yt").href = `https://www.youtube.com/watch?v=${encodeURIComponent(t.id)}`;
+    const yt = srcKey(t.id) === "yt";
+    $("#np-yt").style.visibility = yt ? "" : "hidden"; // keeps the header centered
+    if (yt) $("#np-yt").href = `https://www.youtube.com/watch?v=${encodeURIComponent(t.id)}`;
+    const codec = codecLabel(t);
+    $("#np-src").textContent = srcInfo(srcKey(t.id)).name + (codec ? ` · ${codec}` : "");
     $("#np-keep").dataset.keep = t.id;
     $("#np-keep2").dataset.keep = t.id;
+    const keepable = canKeep(t.id) || keepState(t.id) === "kept";
+    $("#np-keep").hidden = !keepable;
+    $("#np-keep2").hidden = !keepable;
     refreshKeepButtons();
     const s = keepState(t.id);
     $("#np-keep2").classList.toggle("kept", s === "kept");
@@ -550,6 +629,12 @@
     audio.loop = state.repeat === "one";
   }
 
+  let prefetchNext = null;
+  function setLoading(on) {
+    document.body.classList.toggle("is-loading", on);
+    for (const id of ["#mini-play", "#np-play"]) $(id).setAttribute("aria-busy", on ? "true" : "false");
+  }
+
   let seeking = false;
   function duration() {
     return isFinite(audio.duration) && audio.duration > 0 ? audio.duration : (cur()?.duration || 0);
@@ -571,7 +656,16 @@
   audio.addEventListener("play", updatePlayState);
   audio.addEventListener("pause", updatePlayState);
   audio.addEventListener("ended", () => { updatePlayState(); next(); });
-  audio.addEventListener("error", () => { if (audio.getAttribute("src")) toast("Couldn't play this one"); updatePlayState(); });
+  audio.addEventListener("error", () => { setLoading(false); if (audio.getAttribute("src")) toast("Couldn't play this one"); updatePlayState(); });
+  audio.addEventListener("loadstart", () => { if (audio.getAttribute("src")) setLoading(true); });
+  audio.addEventListener("waiting", () => setLoading(true));
+  audio.addEventListener("playing", () => {
+    setLoading(false);
+    if (prefetchNext) { prefetch([prefetchNext]); prefetchNext = null; }
+  });
+  audio.addEventListener("pause", () => setLoading(false));
+  audio.addEventListener("ended", () => setLoading(false));
+  audio.addEventListener("emptied", () => { if (!audio.getAttribute("src")) setLoading(false); });
 
   const seek = $("#np-seek");
   seek.addEventListener("input", () => {
@@ -642,7 +736,7 @@
       const job = await api("/api/download", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ id, title: t.title }),
+        body: JSON.stringify({ id, title: t.title, channel: t.channel || "" }),
       });
       state.jobs.unshift(job);
       refreshKeepButtons();
@@ -659,9 +753,10 @@
   async function share() {
     const t = cur();
     if (!t) return;
-    const url = `https://www.youtube.com/watch?v=${t.id}`;
+    // Only YouTube tracks have a public page; others share "Title – Artist" as text.
+    const url = srcKey(t.id) === "yt" ? `https://www.youtube.com/watch?v=${t.id}` : `${t.title}${t.channel ? ` – ${t.channel}` : ""}`;
     try {
-      if (navigator.share) { await navigator.share({ title: t.title, url }); return; }
+      if (navigator.share) { await navigator.share(srcKey(t.id) === "yt" ? { title: t.title, url } : { title: t.title, text: url }); return; }
       if (navigator.clipboard && window.isSecureContext) { await navigator.clipboard.writeText(url); toast("Link copied"); return; }
     } catch (e) {
       if (e && e.name === "AbortError") return;
@@ -718,12 +813,18 @@
 
   // ---------- events ----------
   document.addEventListener("click", (e) => {
-    const t = e.target.closest("[data-keep],[data-play],[data-search],[data-home-tab],[data-filter],[data-dismiss],[data-play-all],[data-shuffle-all],[data-close],[data-clear-finished],[data-clear-searches]");
+    const t = e.target.closest("[data-keep],[data-play],[data-search],[data-source],[data-home-tab],[data-filter],[data-dismiss],[data-play-all],[data-shuffle-all],[data-close],[data-clear-finished],[data-clear-searches]");
     if (!t) return;
     const d = t.dataset;
     if ("keep" in d) { e.preventDefault(); if (d.keep) keep(d.keep, d.list); return; }
     if ("play" in d) { play(d.list, Number(d.play)); return; }
     if ("search" in d) { runSearch(d.search); return; }
+    if ("source" in d) {
+      state.source = d.source;
+      store.set("source", d.source);
+      if (state.query) runSearch(state.query); else renderSearch();
+      return;
+    }
     if ("homeTab" in d) {
       state.homeTab = d.homeTab;
       if (state.homeTab === "library" && state.library === null) loadLibrary();
@@ -791,7 +892,9 @@
   // ---------- boot ----------
   state.view = "";
   route();
+  loadSources();
   loadHealth();
   loadHistory();
+  loadTiles();
   pollJobs();
 })();

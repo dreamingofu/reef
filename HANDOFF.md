@@ -57,11 +57,20 @@ Pass the Navidrome password through the environment. Don't put it in a committed
 
 ## Code map
 
-- `app.py`: routes (`/api/search`, `/api/stream/<id>` with Range passthrough, `/api/download`, `/api/jobs`, `/api/history`,
-  `/api/library/recent`, `/api/cover/<id>`, `/api/health`).
-- `search.py`: yt-dlp flat search. `streamer.py`: resolves bestaudio (m4a preferred for iOS) and proxies it.
-- `downloader.py`: in-memory job queue + worker (yt-dlp → Opus, tags, cover, blank description) → `history.add` → Navidrome rescan.
-- `history.py`: `history.json` list of kept tracks (git-ignored). `navidrome.py`: Subsonic token auth, ping, startScan, newest albums, cover art.
+- `app.py`: routes (`/api/search?q=&src=`, `/api/sources`, `/api/stream/<id>` with Range passthrough, `/api/prefetch`,
+  `/api/download`, `/api/jobs`, `/api/history`, `/api/library/recent`, `/api/cover/<id>`, `/api/art/<id>`, `/api/tiles`, `/api/health`).
+  Track ids: bare 11-char = YouTube, `mc:<id>` = Monochrome, `nd:<id>` = Navidrome library (`sources.parse`).
+- `sources/`: one adapter per source (`youtube.py` wraps yt-dlp + the Piped/Invidious fallback hooks, `monochrome.py`,
+  `navidrome_src.py`, `piped.py`, `invidious.py`), `failover.py` rotates across instance lists, `__init__.py` is the registry.
+- `search.py`: yt-dlp flat search (one shared `YoutubeDL`, video ids only). `streamer.py`: source-agnostic resolve cache
+  (1 h TTL, concurrent calls for one id share one extraction, 2-thread prefetch pool that yields to the player), keep-alive
+  `requests.Session`, Range proxy, per-request timing log line (`stream id=… cache=hit|wait|miss resolve_ms=… ttfb_ms=…`).
+- `downloader.py`: in-memory job queue + worker. YouTube: yt-dlp → Opus, tags, cover, blank description. Other sources:
+  fetch → ffmpeg → mutagen tags + cover. Both → `history.add` → Navidrome rescan → try to record the Navidrome cover id.
+- `history.py`: `history.json` (git-ignored); entries gain `nd_cover`/`nd_id` once Navidrome has scanned the file.
+  `navidrome.py`: Subsonic token auth, ping, startScan, newest albums, cover art, `find_song`.
+- `tiles.py`: the home mood/genre tiles + a daily background search that caches 4 video ids per tile in `tiles.json`.
+- `scripts/bench_resolve.py VIDEO_ID`: times yt-dlp resolution per player client, to pick `REEF_YT_CLIENT` on the phone.
 - `templates/index.html` + `static/style.css` + `static/app.js`: the mobile UI, vanilla JS, no build step.
 
 ## UI (Octave-style redesign, 2026-10-21)
@@ -72,9 +81,24 @@ mini-player that opens a full-screen Now Playing sheet (blurred artwork backgrou
 For you / Library toggle, a "Jump back in" poster shelf, Recently kept, Recent searches, and genre tiles. Search shows a Top
 result card, Songs rows with **+**, and filter chips. Design tokens are at the top of `static/style.css`.
 
+## Round 2 (2026-10-21): thumbnails, latency, sources
+
+- Now Playing art is sized from the available height (`container-type: size` + `100cqh`), so it no longer bleeds into
+  the title row on short phones. "Jump back in" posters are square art with the text below, not an overlay.
+- Artwork goes through `/api/art/<id>`: Navidrome cover for kept + scanned tracks, else YouTube/Monochrome art.
+  Mood/genre tiles show the top result's thumbnail from `tiles.json`.
+- Play latency: the cold path is still one yt-dlp extraction (2-10 s on the phone). Everything else is now warm:
+  search prefetches the top 3, tapping prefetches the tapped id, the next queue item is resolved once playback starts,
+  one keep-alive connection serves Safari's Range requests, and a spinner shows while loading. Cached starts are < 50 ms
+  on the Mac. On the phone run `python scripts/bench_resolve.py <id>` and set `REEF_YT_CLIENT` if a client is clearly faster
+  (on the Mac only the default produced an audio-only m4a).
+- Sources: YouTube, Monochrome (`tracks.monochrome.st`, FLAC, keepable), Navidrome library (plays the original file).
+  Piped/Invidious are YouTube fallbacks, off unless instances are configured; public ones were mostly dead on 2026-10-21.
+- `docs/INTEGRATION_LIST.md` (untracked) was produced by another session from a survey of five similar apps; not part of this round.
+
 ## Ideas / next steps
 
-- Check the redesign on the iPhone (Safari and the Home Screen app): safe-area spacing, glass blur performance.
-- Play kept and Navidrome tracks from Navidrome's own stream instead of YouTube (add a `/api/nd-stream/<id>` proxy).
+- Check round 2 on the iPhone: Now Playing on the small screen, tile artwork, source chips, FLAC playback over cellular.
+- Run `scripts/bench_resolve.py` on the phone and record the numbers here.
 - Save the playback queue across reloads; add a lyrics view.
 - Optional `REEF_PASSWORD` in `reef.env` if Reef ever gets exposed beyond the tailnet.

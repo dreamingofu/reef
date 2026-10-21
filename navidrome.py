@@ -1,9 +1,16 @@
 import hashlib
+import os
 import secrets
 
 import requests
+from requests.adapters import HTTPAdapter
 
 from config import NAVIDROME_PASS, NAVIDROME_URL, NAVIDROME_USER
+
+
+_session = requests.Session()
+_session.mount("http://", HTTPAdapter(pool_connections=2, pool_maxsize=8))
+_session.mount("https://", HTTPAdapter(pool_connections=2, pool_maxsize=8))
 
 
 def configured():
@@ -17,7 +24,7 @@ def _auth_params():
 
 
 def _call(endpoint, **params):
-    r = requests.get(f"{NAVIDROME_URL}/rest/{endpoint}", params={**_auth_params(), **params}, timeout=10)
+    r = _session.get(f"{NAVIDROME_URL}/rest/{endpoint}", params={**_auth_params(), **params}, timeout=10)
     r.raise_for_status()
     body = r.json()["subsonic-response"]
     if body.get("status") != "ok":
@@ -63,8 +70,29 @@ def newest_albums(size=20):
     ]
 
 
+def find_song(title, file_basename):
+    """The library song for a file Reef kept, or None. Raises on Navidrome errors.
+
+    Matches on the song's `path` ending with the file's basename. Navidrome reports a synthetic
+    `Artist/Album/NN - Title.ext` path unless "Report Real Path" is on, so fall back to a song whose
+    title and suffix match exactly, but only when that match is unique.
+    """
+    if not configured() or not title or not file_basename:
+        return None
+    body = _call("search3", query=title, songCount=10, albumCount=0, artistCount=0)
+    songs = (body.get("searchResult3") or {}).get("song") or []
+    for s in songs:
+        path = (s.get("path") or "").replace("\\", "/")
+        if path == file_basename or path.endswith("/" + file_basename):
+            return s
+    suffix = os.path.splitext(file_basename)[1].lstrip(".").lower()
+    same = [s for s in songs
+            if (s.get("title") or "").casefold() == title.casefold() and (s.get("suffix") or "").lower() == suffix]
+    return same[0] if len(same) == 1 else None
+
+
 def cover_art(cover_id, size=300):
-    r = requests.get(
+    r = _session.get(
         f"{NAVIDROME_URL}/rest/getCoverArt",
         params={**_auth_params(), "id": cover_id, "size": size},
         timeout=15,

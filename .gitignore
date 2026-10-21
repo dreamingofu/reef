@@ -1,7 +1,10 @@
 reef.env
 history.json
+tiles.json
+tiles.json.tmp
 tmp/
 *.log
 *.pid
 __pycache__/
 .venv/
+.playwright-cli/

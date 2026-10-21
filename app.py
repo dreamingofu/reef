@@ -1,20 +1,38 @@
 import hmac
+import os
 import re
+import threading
+import time
 
 import yt_dlp
-from flask import Flask, Response, abort, jsonify, render_template, request
+from flask import Flask, Response, abort, jsonify, redirect, render_template, request
 
 import config
 import downloader
 import history
 import navidrome
-import search
+import sources
 import streamer
+import tiles
 
 VIDEO_ID = re.compile(r"^[A-Za-z0-9_-]{11}$")
+TRACK_ID = re.compile(r"^(?:[a-z]{2}:)?[\w.-]{1,128}$")
 COVER_ID = re.compile(r"^[\w.-]{1,128}$")
+ART_CACHE = "public, max-age=86400"
+ART_LOOKUP_BACKOFF = 600  # seconds before retrying a Navidrome lookup that found nothing
 
 app = Flask(__name__)
+
+
+def _track(track_id):
+    """(source, canonical id, native id) for a valid track id of an enabled source, else None."""
+    if not isinstance(track_id, str) or not TRACK_ID.match(track_id):
+        return None
+    key, native = sources.parse(track_id)
+    src = sources.get(key)
+    if src is None or (key == "yt" and not VIDEO_ID.match(native)):
+        return None
+    return src, sources.track_id(key, native), native
 
 
 @app.before_request
@@ -29,7 +47,7 @@ def require_password():
 
 @app.get("/")
 def index():
-    return render_template("index.html")
+    return render_template("index.html", tiles=tiles.load())
 
 
 @app.get("/api/health")
@@ -39,30 +57,56 @@ def health():
         "navidrome": navidrome.ping(),
         "download_dir": str(config.DOWNLOAD_DIR),
         "ytdlp": yt_dlp.version.__version__,
+        "yt_client": config.YT_CLIENT,
+        "yt_backend": sources.youtube.last_backend,
+        "yt_fallbacks": sources.youtube.fallback_names(),
+        "stream_timing": streamer.last_timing,
+        "sources": list(sources.SOURCES),
     })
 
 
 @app.get("/api/search")
 def api_search():
     q = request.args.get("q", "").strip()
+    src = sources.get(request.args.get("src") or sources.default_key())
+    if src is None:
+        return jsonify({"error": "unknown source"}), 400
     if not q:
         return jsonify([])
     try:
-        results = search.search(q)
+        results = src.search(q, config.SEARCH_LIMIT)
     except Exception as e:
         return jsonify({"error": str(e)[:300]}), 502
+    streamer.prefetch([r["id"] for r in results[:3] if _track(r["id"])])
     kept = history.ids()
     for r in results:
-        r["kept"] = r["id"] in kept
+        r.setdefault("source", src.key)
+        r["kept"] = r.get("kept") or r["id"] in kept
     return jsonify(results)
 
 
-@app.get("/api/stream/<video_id>")
-def api_stream(video_id):
-    if not VIDEO_ID.match(video_id):
+@app.get("/api/sources")
+def api_sources():
+    return jsonify(sources.enabled())
+
+
+@app.post("/api/prefetch")
+def api_prefetch():
+    body = request.get_json(silent=True) or {}
+    ids = body.get("ids")
+    if not isinstance(ids, list):
+        return jsonify({"error": "ids must be a list"}), 400
+    ids = [t[1] for t in map(_track, ids) if t][:5]
+    return jsonify({"queued": streamer.prefetch(ids)}), 202
+
+
+@app.get("/api/stream/<track_id>")
+def api_stream(track_id):
+    t = _track(track_id)
+    if not t:
         abort(404)
     try:
-        return streamer.proxy(video_id)
+        return streamer.proxy(t[1])
     except Exception as e:
         return jsonify({"error": str(e)[:300]}), 502
 
@@ -70,10 +114,12 @@ def api_stream(video_id):
 @app.post("/api/download")
 def api_download():
     body = request.get_json(silent=True) or {}
-    video_id = str(body.get("id", ""))
-    if not VIDEO_ID.match(video_id):
-        return jsonify({"error": "invalid video id"}), 400
-    return jsonify(downloader.enqueue(video_id, str(body.get("title", ""))[:200])), 202
+    t = _track(str(body.get("id", "")))
+    if not t:
+        return jsonify({"error": "invalid track id"}), 400
+    if not t[0].can_keep:
+        return jsonify({"error": f"{t[0].name} tracks are already in your library"}), 400
+    return jsonify(downloader.enqueue(t[1], str(body.get("title", ""))[:200], str(body.get("channel", ""))[:200])), 202
 
 
 @app.get("/api/jobs")
@@ -101,21 +147,88 @@ def api_library_recent():
         return jsonify([])
 
 
+def _art_size():
+    return min(max(request.args.get("size", 300, type=int), 64), 1000)
+
+
+def _navidrome_cover(cover_id, size):
+    """Navidrome cover art as a cacheable response, or None when it can't be fetched."""
+    try:
+        data, mime = navidrome.cover_art(cover_id, size)
+    except Exception:
+        return None
+    if not mime.startswith("image/"):
+        return None
+    return Response(data, content_type=mime, headers={"Cache-Control": ART_CACHE})
+
+
 @app.get("/api/cover/<cover_id>")
 def api_cover(cover_id):
     if not COVER_ID.match(cover_id) or not navidrome.configured():
         abort(404)
-    size = min(max(request.args.get("size", 300, type=int), 64), 1000)
+    resp = _navidrome_cover(cover_id, _art_size())
+    if resp is None:
+        abort(404)
+    return resp
+
+
+_lookup_misses = {}  # track id -> monotonic time of the last lookup that found nothing
+_lookup_lock = threading.Lock()
+
+
+def _lookup_cover(entry):
+    """Find a kept track's Navidrome cover once (then at most every ART_LOOKUP_BACKOFF s) and persist it."""
+    track_id = entry["id"]
+    with _lookup_lock:
+        last = _lookup_misses.get(track_id)
+        if last is not None and time.monotonic() - last < ART_LOOKUP_BACKOFF:
+            return None
+        _lookup_misses[track_id] = time.monotonic()  # also stops concurrent duplicate lookups
     try:
-        data, mime = navidrome.cover_art(cover_id, size)
+        song = navidrome.find_song(entry.get("title") or "", os.path.basename(entry.get("file") or ""))
     except Exception:
+        return None
+    if not song or not song.get("coverArt"):
+        return None
+    history.update(track_id, nd_cover=song["coverArt"], nd_id=song.get("id"))
+    with _lookup_lock:
+        _lookup_misses.pop(track_id, None)
+    return song["coverArt"]
+
+
+@app.get("/api/art/<track_id>")
+def api_art(track_id):
+    """Artwork for a track: its Navidrome cover once kept and scanned, else the source's own artwork."""
+    t = _track(track_id)
+    if not t:
         abort(404)
-    if not mime.startswith("image/"):
+    src, track_id, native = t
+    size = _art_size()
+    if src.can_keep and navidrome.configured():
+        entry = history.get(track_id)
+        if entry:
+            cover = entry.get("nd_cover") or _lookup_cover(entry)
+            if cover and COVER_ID.match(cover):
+                resp = _navidrome_cover(cover, size)
+                if resp is not None:
+                    return resp
+    found = src.art(native, size)
+    if not found:
         abort(404)
-    return Response(data, content_type=mime, headers={"Cache-Control": "public, max-age=86400"})
+    if found[0] == "bytes":
+        return Response(found[1], content_type=found[2], headers={"Cache-Control": ART_CACHE})
+    resp = redirect(found[1], 302)
+    resp.headers["Cache-Control"] = "public, max-age=3600"
+    return resp
+
+
+@app.get("/api/tiles")
+def api_tiles():
+    return jsonify(tiles.load())
 
 
 if __name__ == "__main__":
     downloader.start_worker()
+    tiles.start_refresher()
     print(f"Reef listening on http://{config.HOST}:{config.PORT}  (downloads -> {config.DOWNLOAD_DIR})")
     app.run(host=config.HOST, port=config.PORT, threaded=True)

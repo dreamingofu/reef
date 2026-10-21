@@ -117,7 +117,7 @@
     </div>
     <div class="np-progress">
       <input type="range" id="np-seek" min="0" max="1000" value="0" step="1" aria-label="Seek">
-      <div class="np-times"><span id="np-cur">0:00</span><span class="qpill">YouTube · Opus</span><span id="np-rem">-0:00</span></div>
+      <div class="np-times"><span id="np-cur">0:00</span><span class="qpill" id="np-src">YouTube · AAC</span><span id="np-rem">-0:00</span></div>
     </div>
     <div class="np-controls">
       <button class="icon-btn mode" id="np-shuffle" aria-label="Shuffle"><svg class="i"><use href="#i-shuffle"/></svg></button>
@@ -146,7 +146,8 @@
 </div>
 
 <div class="toast glass" id="toast" role="status" aria-live="polite"></div>
-<audio id="audio" preload="none" playsinline></audio>
+<audio id="audio" preload="auto" playsinline></audio>
+<script id="tiles-data" type="application/json">{{ tiles|tojson }}</script>
 <script src="/static/app.js"></script>
 </body>
 </html>
