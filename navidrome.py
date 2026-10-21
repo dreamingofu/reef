@@ -43,3 +43,31 @@ def rescan():
         return True
     except Exception:
         return False
+
+
+def newest_albums(size=20):
+    if not configured():
+        return []
+    body = _call("getAlbumList2", type="newest", size=size)
+    albums = (body.get("albumList2") or {}).get("album") or []
+    return [
+        {
+            "id": a.get("id"),
+            "name": a.get("name", ""),
+            "artist": a.get("artist", ""),
+            "cover": a.get("coverArt"),
+            "year": a.get("year"),
+            "songCount": a.get("songCount"),
+        }
+        for a in albums
+    ]
+
+
+def cover_art(cover_id, size=300):
+    r = requests.get(
+        f"{NAVIDROME_URL}/rest/getCoverArt",
+        params={**_auth_params(), "id": cover_id, "size": size},
+        timeout=15,
+    )
+    r.raise_for_status()
+    return r.content, r.headers.get("Content-Type", "image/jpeg")

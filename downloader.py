@@ -6,6 +6,7 @@ import uuid
 import yt_dlp
 from yt_dlp.postprocessor.metadataparser import MetadataParserPP
 
+import history
 import navidrome
 from config import AUDIO_FORMAT, DOWNLOAD_DIR, TMP_DIR
 
@@ -91,6 +92,14 @@ def _run(job):
         job["title"] = info.get("title") or job["title"]
         job["percent"] = 100
         job["status"] = "done"
+        history.add({
+            "id": job["video_id"],
+            "title": job["title"],
+            "channel": info.get("channel") or info.get("uploader") or "",
+            "duration": info.get("duration"),
+            "thumb": f"https://i.ytimg.com/vi/{job['video_id']}/mqdefault.jpg",
+            "file": job["file"],
+        })
         job["rescanned"] = navidrome.rescan()
     except Exception as e:
         job["status"] = "error"

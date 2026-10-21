@@ -2,9 +2,9 @@
   "name": "Reef",
   "short_name": "Reef",
   "description": "Search YouTube, play instantly, keep tracks in Navidrome.",
-  "start_url": "/",
+  "start_url": "/#home",
   "display": "standalone",
-  "background_color": "#0b1220",
-  "theme_color": "#0b1220",
-  "icons": [{ "src": "/static/icon.svg", "sizes": "any", "type": "image/svg+xml" }]
+  "background_color": "#000000",
+  "theme_color": "#000000",
+  "icons": [{ "src": "/static/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }]
 }

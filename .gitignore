@@ -1,4 +1,5 @@
 reef.env
+history.json
 tmp/
 *.log
 *.pid

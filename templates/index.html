@@ -4,46 +4,149 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="apple-mobile-web-app-title" content="Reef">
-<meta name="theme-color" content="#0b1220">
+<meta name="theme-color" content="#000000">
 <title>Reef</title>
 <link rel="manifest" href="/static/manifest.json">
 <link rel="icon" href="/static/icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="/static/icon.svg">
 <link rel="stylesheet" href="/static/style.css">
 </head>
-<body>
-<header>
-  <h1><span class="logo"></span>Reef</h1>
-  <span id="nd-status" class="pill">checking…</span>
+<body data-view="home">
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <linearGradient id="g-logo" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#ff5c8a"/><stop offset="1" stop-color="#e0124a"/>
+    </linearGradient>
+  </defs>
+  <symbol id="i-home" viewBox="0 0 24 24"><path d="M3.5 10.2 12 3.5l8.5 6.7V19a1.5 1.5 0 0 1-1.5 1.5h-4.2v-6h-5.6v6H5A1.5 1.5 0 0 1 3.5 19z"/></symbol>
+  <symbol id="i-search" viewBox="0 0 24 24"><circle cx="10.8" cy="10.8" r="6.8"/><path d="m16 16 4.6 4.6"/></symbol>
+  <symbol id="i-disc" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.6"/><circle cx="12" cy="12" r="2.4"/><path d="M12 6.2a5.8 5.8 0 0 0-5.8 5.8"/></symbol>
+  <symbol id="i-download" viewBox="0 0 24 24"><path d="M12 3.8v11.4m-4.6-4.6 4.6 4.6 4.6-4.6M5 20.2h14"/></symbol>
+  <symbol id="i-play" viewBox="0 0 24 24"><path fill="currentColor" stroke="none" d="M7.5 5.3v13.4a1 1 0 0 0 1.53.85l10.7-6.7a1 1 0 0 0 0-1.7L9.03 4.45A1 1 0 0 0 7.5 5.3z"/></symbol>
+  <symbol id="i-pause" viewBox="0 0 24 24"><rect fill="currentColor" stroke="none" x="6" y="4.5" width="4.2" height="15" rx="1.2"/><rect fill="currentColor" stroke="none" x="13.8" y="4.5" width="4.2" height="15" rx="1.2"/></symbol>
+  <symbol id="i-next" viewBox="0 0 24 24"><path fill="currentColor" stroke="none" d="M3.5 6.6v10.8a.9.9 0 0 0 1.38.76l8.12-5.4a.9.9 0 0 0 0-1.5L4.88 5.84a.9.9 0 0 0-1.38.76zm8.8 0v10.8a.9.9 0 0 0 1.38.76l8.12-5.4a.9.9 0 0 0 0-1.5l-8.12-5.42a.9.9 0 0 0-1.38.76z"/></symbol>
+  <symbol id="i-prev" viewBox="0 0 24 24"><path fill="currentColor" stroke="none" d="M20.5 6.6v10.8a.9.9 0 0 1-1.38.76L11 12.76a.9.9 0 0 1 0-1.5l8.12-5.42a.9.9 0 0 1 1.38.76zm-8.8 0v10.8a.9.9 0 0 1-1.38.76L2.2 12.76a.9.9 0 0 1 0-1.5l8.12-5.42a.9.9 0 0 1 1.38.76z"/></symbol>
+  <symbol id="i-shuffle" viewBox="0 0 24 24"><path d="M3 7h3.2c1.9 0 3.1.9 4.2 2.8l3.2 5.4c1.1 1.9 2.3 2.8 4.2 2.8H21M3 17h3.2c1.4 0 2.4-.5 3.2-1.4M14.6 8.4C15.4 7.5 16.4 7 17.8 7H21m-2.6-2.8L21 7l-2.6 2.8m0 4.4L21 17l-2.6 2.8"/></symbol>
+  <symbol id="i-repeat" viewBox="0 0 24 24"><path d="m17 3 3 3-3 3M4 11.5V10a4 4 0 0 1 4-4h12M7 21l-3-3 3-3m13-2.5V14a4 4 0 0 1-4 4H4"/></symbol>
+  <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><path d="m5 12.6 4.4 4.4L19 7.4"/></symbol>
+  <symbol id="i-share" viewBox="0 0 24 24"><path d="M12 3.5v11.5M7.8 7.6 12 3.5l4.2 4.1M8 10.5H6.5A1.5 1.5 0 0 0 5 12v7a1.5 1.5 0 0 0 1.5 1.5h11A1.5 1.5 0 0 0 19 19v-7a1.5 1.5 0 0 0-1.5-1.5H16"/></symbol>
+  <symbol id="i-chev-down" viewBox="0 0 24 24"><path d="m6 9.5 6 6 6-6"/></symbol>
+  <symbol id="i-chev-right" viewBox="0 0 24 24"><path d="m9.5 6 6 6-6 6"/></symbol>
+  <symbol id="i-x" viewBox="0 0 24 24"><path d="M6.5 6.5l11 11m0-11-11 11"/></symbol>
+  <symbol id="i-server" viewBox="0 0 24 24"><rect x="3.8" y="4" width="16.4" height="6.6" rx="2"/><rect x="3.8" y="13.4" width="16.4" height="6.6" rx="2"/><path d="M7.6 7.3h.01M7.6 16.7h.01"/></symbol>
+  <symbol id="i-sparkle" viewBox="0 0 24 24"><path d="m11 3.5 1.7 4.6 4.6 1.7-4.6 1.7L11 16.1l-1.7-4.6-4.6-1.7 4.6-1.7zM18 14.5l.8 2.1 2.1.8-2.1.8-.8 2.1-.8-2.1-2.1-.8 2.1-.8z"/></symbol>
+  <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3 2"/></symbol>
+  <symbol id="i-trend" viewBox="0 0 24 24"><path d="m3 16.5 5.8-5.8 4 4L21 6.5M15.5 6.5H21V12"/></symbol>
+  <symbol id="i-note" viewBox="0 0 24 24"><path d="M9 18V5.5l10.5-2V16"/><circle cx="6.5" cy="18" r="2.5"/><circle cx="17" cy="16" r="2.5"/></symbol>
+  <symbol id="i-external" viewBox="0 0 24 24"><path d="M14 4h6v6m0-6-8.5 8.5M18 14v4.5a1.5 1.5 0 0 1-1.5 1.5h-11A1.5 1.5 0 0 1 4 18.5v-11A1.5 1.5 0 0 1 5.5 6H10"/></symbol>
+  <symbol id="i-device" viewBox="0 0 24 24"><rect x="6.5" y="2.8" width="11" height="18.4" rx="2.4"/><path d="M10.5 18h3"/></symbol>
+  <symbol id="i-alert" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M12 7.8v4.6M12 16h.01"/></symbol>
+  <symbol id="i-logo" viewBox="0 0 32 32"><circle cx="16" cy="16" r="15" fill="url(#g-logo)" stroke="none"/><path d="M10.5 12v8M16 8.5v15M21.5 13v6" stroke="#fff" stroke-width="2.6" stroke-linecap="round" fill="none"/></symbol>
+</svg>
+
+<header class="top" id="top">
+  <a class="brand" href="#home" aria-label="Reef home">
+    <svg class="brand-logo" aria-hidden="true"><use href="#i-logo"/></svg>
+    <span>Reef</span>
+  </a>
+  <div class="top-actions">
+    <a class="hbtn" href="#downloads" aria-label="Downloads">
+      <svg class="i"><use href="#i-download"/></svg>
+      <span class="badge" id="hdr-badge" hidden></span>
+    </a>
+    <button class="hbtn hbtn-accent" id="status-btn" aria-label="Server status">
+      <svg class="i"><use href="#i-server"/></svg>
+      <span class="dot" id="status-dot"></span>
+    </button>
+  </div>
 </header>
 
-<form id="search-form" role="search">
-  <input id="q" type="search" placeholder="Search YouTube…" autocomplete="off" enterkeyhint="search" autofocus>
-</form>
-
-<main>
-  <section id="downloads" hidden>
-    <h2>Downloads</h2>
-    <ul id="jobs"></ul>
-  </section>
-  <ul id="results">
-    <li class="msg">Search for a song, play it instantly, tap + to keep it in Navidrome.</li>
-  </ul>
+<main class="app">
+  <section class="view" id="view-home"></section>
+  <section class="view" id="view-search" hidden></section>
+  <section class="view" id="view-kept" hidden></section>
+  <section class="view" id="view-downloads" hidden></section>
 </main>
 
-<footer id="player" hidden>
-  <div class="np">
-    <img id="np-thumb" alt="">
-    <div class="meta">
-      <div id="np-title" class="title"></div>
-      <div id="np-channel" class="sub"></div>
-    </div>
-    <button id="np-add" class="btn add" aria-label="Keep in library">+</button>
-  </div>
-  <audio id="audio" controls preload="none"></audio>
-</footer>
+<div class="mini glass" id="mini" hidden>
+  <button class="mini-open" id="mini-open" aria-label="Open player">
+    <span class="mini-art"><img id="mini-art" alt=""></span>
+    <span class="mini-text"><span class="mini-t" id="mini-t"></span><span class="mini-s" id="mini-s"></span></span>
+  </button>
+  <button class="icon-btn" id="mini-play" aria-label="Play"><svg class="i fill"><use href="#i-play"/></svg></button>
+  <button class="icon-btn" id="mini-next" aria-label="Next"><svg class="i fill"><use href="#i-next"/></svg></button>
+  <span class="mini-progress"><i id="mini-bar"></i></span>
+</div>
 
+<div class="dock" id="dock">
+  <nav class="tabs glass" aria-label="Main">
+    <a class="tab" data-view="home" href="#home"><svg class="i"><use href="#i-home"/></svg><span>Home</span></a>
+    <a class="tab" data-view="kept" href="#kept"><svg class="i"><use href="#i-disc"/></svg><span>Kept</span></a>
+    <a class="tab" data-view="downloads" href="#downloads"><svg class="i"><use href="#i-download"/></svg><span>Downloads</span><span class="badge" id="tab-badge" hidden></span></a>
+  </nav>
+  <a class="fab glass" href="#search" aria-label="Search"><svg class="i"><use href="#i-search"/></svg></a>
+</div>
+
+<form class="searchbar" id="search-bar" role="search" autocomplete="off">
+  <a class="fab glass sm" href="#home" aria-label="Home"><svg class="i"><use href="#i-home"/></svg></a>
+  <label class="search-pill glass">
+    <svg class="i"><use href="#i-search"/></svg>
+    <input id="q" type="search" placeholder="Artists, songs, videos…" enterkeyhint="search" autocorrect="off" autocapitalize="off" spellcheck="false">
+    <button type="button" class="icon-btn sm" id="q-clear" aria-label="Clear" hidden><svg class="i"><use href="#i-x"/></svg></button>
+  </label>
+</form>
+
+<section class="np" id="np" aria-hidden="true" aria-label="Now playing">
+  <div class="np-bg"><img id="np-bg" alt=""></div>
+  <div class="np-inner">
+    <header class="np-top" id="np-grab">
+      <button class="icon-btn" id="np-close" aria-label="Close player"><svg class="i"><use href="#i-chev-down"/></svg></button>
+      <div class="np-eyebrow"><span>Now playing</span><strong id="np-from"></strong></div>
+      <a class="icon-btn" id="np-yt" target="_blank" rel="noopener" aria-label="Open on YouTube"><svg class="i"><use href="#i-external"/></svg></a>
+    </header>
+    <div class="np-art-wrap"><img class="np-art" id="np-art" alt=""></div>
+    <div class="np-title-row">
+      <div class="np-titles"><h2 id="np-t"></h2><p id="np-s"></p></div>
+      <button class="icon-btn" id="np-share" aria-label="Share"><svg class="i"><use href="#i-share"/></svg></button>
+      <button class="keep none lg" id="np-keep" data-keep="" aria-label="Keep in library"><svg class="i"><use href="#i-plus"/></svg></button>
+    </div>
+    <div class="np-progress">
+      <input type="range" id="np-seek" min="0" max="1000" value="0" step="1" aria-label="Seek">
+      <div class="np-times"><span id="np-cur">0:00</span><span class="qpill">YouTube · Opus</span><span id="np-rem">-0:00</span></div>
+    </div>
+    <div class="np-controls">
+      <button class="icon-btn mode" id="np-shuffle" aria-label="Shuffle"><svg class="i"><use href="#i-shuffle"/></svg></button>
+      <button class="icon-btn xl" id="np-prev" aria-label="Previous"><svg class="i fill"><use href="#i-prev"/></svg></button>
+      <button class="icon-btn xxl" id="np-play" aria-label="Play"><svg class="i fill"><use href="#i-play"/></svg></button>
+      <button class="icon-btn xl" id="np-next" aria-label="Next"><svg class="i fill"><use href="#i-next"/></svg></button>
+      <button class="icon-btn mode" id="np-repeat" aria-label="Repeat"><svg class="i"><use href="#i-repeat"/></svg><b>1</b></button>
+    </div>
+    <div class="np-device"><svg class="i"><use href="#i-device"/></svg><span>This device</span></div>
+    <div class="np-bottom">
+      <button class="round glass" id="np-keep2" data-keep="" aria-label="Keep in library"><svg class="i"><use href="#i-plus"/></svg></button>
+      <button class="round glass" id="np-share2" aria-label="Share"><svg class="i"><use href="#i-share"/></svg></button>
+      <a class="round glass" href="#downloads" id="np-dl" aria-label="Downloads"><svg class="i"><use href="#i-download"/></svg></a>
+    </div>
+  </div>
+</section>
+
+<div class="sheet-wrap" id="status-sheet" hidden>
+  <div class="scrim" data-close></div>
+  <div class="sheet" role="dialog" aria-label="Server status">
+    <div class="grabber"></div>
+    <h3>Server</h3>
+    <ul class="status-list" id="status-list"></ul>
+    <button class="btn-wide" data-close>Done</button>
+  </div>
+</div>
+
+<div class="toast glass" id="toast" role="status" aria-live="polite"></div>
+<audio id="audio" preload="none" playsinline></audio>
 <script src="/static/app.js"></script>
 </body>
 </html>

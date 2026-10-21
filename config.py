@@ -28,6 +28,7 @@ PORT = int(os.environ.get("REEF_PORT", "5274"))
 MUSIC_DIR = Path(os.environ.get("REEF_MUSIC_DIR") or _default_music_dir())
 DOWNLOAD_DIR = MUSIC_DIR / os.environ.get("REEF_SUBFOLDER", "Reef")
 TMP_DIR = Path(os.environ.get("REEF_TMP_DIR") or BASE_DIR / "tmp")
+HISTORY_FILE = BASE_DIR / "history.json"
 AUDIO_FORMAT = os.environ.get("REEF_AUDIO_FORMAT", "opus")
 SEARCH_LIMIT = int(os.environ.get("REEF_SEARCH_LIMIT", "10"))
 NAVIDROME_URL = os.environ.get("REEF_NAVIDROME_URL", "http://127.0.0.1:4533").rstrip("/")

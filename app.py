@@ -1,15 +1,18 @@
 import hmac
 import re
 
+import yt_dlp
 from flask import Flask, Response, abort, jsonify, render_template, request
 
 import config
 import downloader
+import history
 import navidrome
 import search
 import streamer
 
 VIDEO_ID = re.compile(r"^[A-Za-z0-9_-]{11}$")
+COVER_ID = re.compile(r"^[\w.-]{1,128}$")
 
 app = Flask(__name__)
 
@@ -31,7 +34,12 @@ def index():
 
 @app.get("/api/health")
 def health():
-    return jsonify({"reef": "ok", "navidrome": navidrome.ping(), "download_dir": str(config.DOWNLOAD_DIR)})
+    return jsonify({
+        "reef": "ok",
+        "navidrome": navidrome.ping(),
+        "download_dir": str(config.DOWNLOAD_DIR),
+        "ytdlp": yt_dlp.version.__version__,
+    })
 
 
 @app.get("/api/search")
@@ -40,9 +48,13 @@ def api_search():
     if not q:
         return jsonify([])
     try:
-        return jsonify(search.search(q))
+        results = search.search(q)
     except Exception as e:
         return jsonify({"error": str(e)[:300]}), 502
+    kept = history.ids()
+    for r in results:
+        r["kept"] = r["id"] in kept
+    return jsonify(results)
 
 
 @app.get("/api/stream/<video_id>")
@@ -74,6 +86,33 @@ def api_job_delete(job_id):
     if not downloader.remove(job_id):
         abort(404)
     return "", 204
+
+
+@app.get("/api/history")
+def api_history():
+    return jsonify(history.list_recent())
+
+
+@app.get("/api/library/recent")
+def api_library_recent():
+    try:
+        return jsonify(navidrome.newest_albums())
+    except Exception:
+        return jsonify([])
+
+
+@app.get("/api/cover/<cover_id>")
+def api_cover(cover_id):
+    if not COVER_ID.match(cover_id) or not navidrome.configured():
+        abort(404)
+    size = min(max(request.args.get("size", 300, type=int), 64), 1000)
+    try:
+        data, mime = navidrome.cover_art(cover_id, size)
+    except Exception:
+        abort(404)
+    if not mime.startswith("image/"):
+        abort(404)
+    return Response(data, content_type=mime, headers={"Cache-Control": "public, max-age=86400"})
 
 
 if __name__ == "__main__":
