@@ -4,6 +4,7 @@ import time
 import uuid
 
 import yt_dlp
+from yt_dlp.postprocessor.metadataparser import MetadataParserPP
 
 import navidrome
 from config import AUDIO_FORMAT, DOWNLOAD_DIR, TMP_DIR
@@ -62,11 +63,14 @@ def _options(job):
         "no_warnings": True,
         "noplaylist": True,
         "format": "bestaudio/best",
-        "outtmpl": {"default": "%(uploader)s - %(title)s.%(ext)s"},
+        "outtmpl": {"default": "%(title)s.%(ext)s"},
         "paths": {"home": str(DOWNLOAD_DIR), "temp": str(TMP_DIR)},
         "windowsfilenames": True,
         "writethumbnail": True,
         "postprocessors": [
+            # Blank the description so the whole YouTube blurb doesn't end up in the comment tag.
+            {"key": "MetadataParser", "when": "pre_process",
+             "actions": [(MetadataParserPP.Actions.INTERPRET, "", "(?P<description>)")]},
             {"key": "FFmpegExtractAudio", "preferredcodec": AUDIO_FORMAT, "preferredquality": "0"},
             {"key": "FFmpegMetadata", "add_metadata": True},
             {"key": "EmbedThumbnail"},
