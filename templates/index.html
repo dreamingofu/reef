@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Reef">
+<meta name="theme-color" content="#0b1220">
+<title>Reef</title>
+<link rel="manifest" href="/static/manifest.json">
+<link rel="icon" href="/static/icon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header>
+  <h1><span class="logo"></span>Reef</h1>
+  <span id="nd-status" class="pill">checking…</span>
+</header>
+
+<form id="search-form" role="search">
+  <input id="q" type="search" placeholder="Search YouTube…" autocomplete="off" enterkeyhint="search" autofocus>
+</form>
+
+<main>
+  <section id="downloads" hidden>
+    <h2>Downloads</h2>
+    <ul id="jobs"></ul>
+  </section>
+  <ul id="results">
+    <li class="msg">Search for a song, play it instantly, tap + to keep it in Navidrome.</li>
+  </ul>
+</main>
+
+<footer id="player" hidden>
+  <div class="np">
+    <img id="np-thumb" alt="">
+    <div class="meta">
+      <div id="np-title" class="title"></div>
+      <div id="np-channel" class="sub"></div>
+    </div>
+    <button id="np-add" class="btn add" aria-label="Keep in library">+</button>
+  </div>
+  <audio id="audio" controls preload="none"></audio>
+</footer>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

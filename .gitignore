@@ -1,0 +1,6 @@
+reef.env
+tmp/
+*.log
+*.pid
+__pycache__/
+.venv/
