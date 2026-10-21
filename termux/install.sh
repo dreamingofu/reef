@@ -39,7 +39,15 @@ if [ "$(settings get global settings_enable_monitor_phantom_procs 2>/dev/null)" 
 fi
 
 echo "[5/6] Config"
-if [ ! -f "$DIR/reef.env" ]; then
+SEED="$HOME/storage/shared/navidrome_setup/reef.env"
+if [ -f "$DIR/reef.env" ]; then
+    echo "Keeping existing $DIR/reef.env"
+elif [ -f "$SEED" ]; then
+    cp "$SEED" "$DIR/reef.env"
+    rm -f "$SEED"
+    chmod 600 "$DIR/reef.env"
+    echo "Config taken from $SEED"
+else
     read -rp "Navidrome admin username: " ND_USER
     read -rsp "Navidrome admin password: " ND_PASS
     echo
@@ -52,8 +60,6 @@ REEF_NAVIDROME_PASS=$ND_PASS
 REEF_PASSWORD=
 EOF
     chmod 600 "$DIR/reef.env"
-else
-    echo "Keeping existing $DIR/reef.env"
 fi
 
 echo "[6/6] Autostart + launch"
