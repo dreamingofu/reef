@@ -183,7 +183,7 @@ def test_generic_keep_tags_the_alias(monkeypatch, tmp_path):
     monkeypatch.setattr(downloader.sources, "parse", lambda tid: ("mc", "123"))
     monkeypatch.setattr(downloader.sources, "get", lambda key: Src())
     monkeypatch.setattr(downloader.streamer, "resolve", lambda tid: {"ext": "flac"})
-    monkeypatch.setattr(downloader, "_fetch", lambda job, entry, dest: dest.write_bytes(b"x"))
+    monkeypatch.setattr(downloader, "_fetch", lambda job, entry, dest, *a: dest.write_bytes(b"x"))
     monkeypatch.setattr(downloader, "_convert", lambda src, ext, out, fmt=None: out.write_bytes(b"y"))
     monkeypatch.setattr(downloader, "_cover_bytes", lambda src, native: (None, None))
     monkeypatch.setattr(downloader, "_length", lambda path: 200.0)

@@ -278,35 +278,129 @@ def _filename(title):
 
 _RETRY_SLEEPS = (2, 4, 8)
 _sleep = time.sleep  # tests patch this
+EXPIRY_MIN_S = 60     # a stream URL expiring sooner than this is re-resolved before an attempt starts
+PROGRESS_BYTES = 256 * 1024  # an attempt that got this much is progress: it costs no retry and resets the backoff
+FETCH_ATTEMPTS = 50          # attempts of one fetch in all, progress or not
+_CONTENT_RANGE = re.compile(r"^bytes\s+(\d+)-(\d+)/(\d+|\*)$")
 
 
-def _fetch(job, entry, dest):
-    """Download to `dest`, retrying dropped connections, timeouts and 5xx. Each attempt starts the file over."""
-    for delay in (*_RETRY_SLEEPS, None):
-        try:
-            return _fetch_once(job, entry, dest)
-        except (requests.ConnectionError, requests.Timeout, requests.exceptions.ChunkedEncodingError):
-            if delay is None:
-                raise
-        except requests.HTTPError as e:
-            if delay is None or e.response is None or e.response.status_code < 500:
-                raise
-        job["percent"] = 0
-        _sleep(delay)
+class _Restart(Exception):
+    """The server answered a resume with other bytes than asked for: start the file over."""
 
 
-def _fetch_once(job, entry, dest):
-    r = streamer.session.get(entry["url"], headers=entry.get("headers") or {}, stream=True, timeout=(10, 60))
+def _fake_drop():
+    """REEF_FAKE_DROP=<bytes>: the first attempt of every generic fetch drops the connection after that many bytes
+    (live check of the resume path, like REEF_FAKE_WALL for playback)."""
+    raw = os.environ.get("REEF_FAKE_DROP", "").strip()
+    return int(raw) if raw.isdigit() and int(raw) > 0 else None
+
+
+def _fresh_entry(entry, track_id):
+    """`entry`, or a re-resolved one when its URL expires within EXPIRY_MIN_S (streamer's entry expiry: the URL's
+    own `expire`, else the cache TTL). streamer.resolve hands out a new URL by itself then: an entry that close
+    to its `expire` is past its `expires`."""
+    if not track_id:
+        return entry
+    now = streamer._now()
+    expire, expires = entry.get("expire"), entry.get("expires")
+    if (expire and expire - now < EXPIRY_MIN_S) or (not expire and expires and expires <= now):
+        logger.info(f"keep id={track_id} stream URL expires in {int((expire or expires) - now)} s: re-resolving first")
+        return streamer.resolve(track_id)
+    return entry
+
+
+def _fetch(job, entry, dest, track_id=None):
+    """Download to `dest` through `<dest>.part`, retrying dropped connections, timeouts and 5xx with backoff
+    (_RETRY_SLEEPS: three retries). A retry asks for the rest (`Range: bytes=<size>-`) and starts the file over when
+    the server answers 200 instead of 206 (or a 206 for other bytes / another file size). An attempt that got at
+    least PROGRESS_BYTES doesn't count against the retries and resets the backoff (a flaky server that cuts a big
+    FLAC every few MB still finishes); FETCH_ATTEMPTS caps the attempts in all (a server that drips bytes). With
+    `track_id`, a URL about to expire is re-resolved before each attempt."""
+    part = dest.with_name(dest.name + ".part")
+    _unlink(part)
+    state = {"total": None, "drop": _fake_drop()}
+    steps = list(_RETRY_SLEEPS)
     try:
+        for attempt in range(1, FETCH_ATTEMPTS + 1):
+            entry = _fresh_entry(entry, track_id)
+            before = part.stat().st_size if part.exists() else 0
+            try:
+                _fetch_once(job, entry, part, state)
+                os.replace(part, dest)
+                return
+            except (requests.ConnectionError, requests.Timeout, requests.exceptions.ChunkedEncodingError) as e:
+                err = e
+            except requests.HTTPError as e:
+                if e.response is None or e.response.status_code < 500:
+                    raise
+                err = e
+            have = part.stat().st_size if part.exists() else 0
+            progressed = have - before >= PROGRESS_BYTES
+            if progressed:
+                steps = list(_RETRY_SLEEPS)
+            if not steps or attempt == FETCH_ATTEMPTS:
+                raise err
+            delay = steps[0] if progressed else steps.pop(0)
+            logger.info(f"keep fetch attempt={attempt} have={have} of {state['total']} progressed={int(progressed)} "
+                        f"error={type(err).__name__}: retrying in {delay} s")
+            _sleep(delay)
+    except BaseException:
+        _unlink(part)
+        raise
+
+
+def _content_range(value):
+    """(start, total or None) of a 206's Content-Range, None when it can't be read."""
+    m = _CONTENT_RANGE.match(str(value or "").strip())
+    return (int(m.group(1)), None if m.group(3) == "*" else int(m.group(3))) if m else None
+
+
+def _fetch_once(job, entry, part, state):
+    have = part.stat().st_size if part.exists() else 0
+    headers = dict(entry.get("headers") or {})
+    if have:
+        headers["Range"] = f"bytes={have}-"
+    r = streamer.session.get(entry["url"], headers=headers, stream=True, timeout=(10, 60))
+    try:
+        if have and r.status_code == 416:
+            if state["total"] == have:
+                return  # everything was there already (the drop came after the last byte)
+            r.close()  # the server can't serve the rest of what we have: start over
+            _unlink(part)
+            return _fetch_once(job, entry, part, state)
         r.raise_for_status()
-        total = int(r.headers.get("Content-Length") or 0)
-        done = 0
-        with open(dest, "wb") as f:
+        mode = "wb"
+        if have and r.status_code == 206:
+            got = _content_range(r.headers.get("Content-Range"))
+            if got and got[0] == have and (not state["total"] or got[1] in (None, state["total"])):
+                mode = "ab"
+                state["total"] = got[1] or state["total"]
+            else:  # other bytes, or another file behind a re-resolved URL: start over
+                logger.info(f"keep fetch resume refused (Content-Range {r.headers.get('Content-Range')!r}): restarting")
+                r.close()
+                _unlink(part)
+                return _fetch_once(job, entry, part, state)
+        else:
+            if have:
+                logger.info(f"keep fetch resume answered {r.status_code}, not 206: restarting from 0")
+            have = 0
+            length = int(r.headers.get("Content-Length") or 0)
+            state["total"] = length or None
+        total, done = state["total"], have
+        if mode == "wb":
+            job["percent"] = 0
+        drop, state["drop"] = state["drop"], None
+        with open(part, mode) as f:
             for chunk in r.iter_content(256 * 1024):
+                if drop is not None and done + len(chunk) > drop:
+                    f.write(chunk[:max(0, drop - done)])
+                    raise requests.exceptions.ChunkedEncodingError("REEF_FAKE_DROP: connection dropped")
                 f.write(chunk)
                 done += len(chunk)
                 if total:
                     job["percent"] = min(99, int(done * 100 / total))
+        if total and done < total and not r.headers.get("Content-Encoding"):  # closed early without an error
+            raise requests.exceptions.ChunkedEncodingError(f"connection closed at {done} of {total} bytes")
     finally:
         r.close()
 
@@ -432,7 +526,7 @@ def _run_generic(job, track_id=None, fmt=None, expect=None, extra=None):
     ext = _FORMATS.get(fmt or AUDIO_FORMAT, (fmt or AUDIO_FORMAT,))[0]
     out = TMP_DIR / f"{job['id']}.out.{ext}"
     try:
-        _fetch(job, entry, raw)
+        _fetch(job, entry, raw, tid)
         if expect:
             got = _length(raw)
             if not got or got < expect * PREVIEW_SHARE:

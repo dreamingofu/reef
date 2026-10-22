@@ -56,6 +56,9 @@ SCHEMA = {
                       "label": "YouTube Music visitor id",
                       "help": "The anonymous id personalisation uses. Paste one to keep a taste profile; clear it to "
                               "start over."},
+    "itunes_suggestions": {"type": "bool", "default": lambda: True, "label": "iTunes suggestions as a fallback",
+                           "help": "When YouTube Music's search suggestions are off or failing, ask Apple's iTunes "
+                                   "Search API instead (official, no account; it sees what you type)."},
     "charts_country": {"type": "text", "pattern": r"[A-Z]{2}", "upper": True, "default": lambda: config.CHARTS_COUNTRY,
                        "label": "Charts country",
                        "help": "Whose YouTube Music charts Home and Charts show: ZZ = global, else a country code."},

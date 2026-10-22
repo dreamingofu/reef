@@ -26,7 +26,7 @@ T0 = 1_760_000_000
 @pytest.fixture(autouse=True)
 def files(monkeypatch, tmp_path):
     monkeypatch.setattr(history, "HISTORY_FILE", tmp_path / "history.json")
-    for name in ("LISTENS", "LIKES", "PLAYLISTS", "SETTINGS", "DISLIKES", "BLOCKLIST", "LYRICS"):
+    for name in ("LISTENS", "LIKES", "PLAYLISTS", "SETTINGS", "DISLIKES", "BLOCKLIST", "LYRICS", "ALIASES", "MATCHES"):
         monkeypatch.setattr(config, f"{name}_FILE", tmp_path / f"{name.lower()}.json")
     monkeypatch.setattr(config, "BACKUP_DIR", tmp_path / "backups")
     monkeypatch.setattr(lyrics, "_cache", None)
@@ -65,7 +65,8 @@ def test_backup_content_and_allow_list(files):
     seed(files)
     doc = backup.build(now=T0)
     assert doc["format"] == "reef-backup" and doc["schemaVersion"] == 1 and doc["createdAt"].endswith("Z")
-    assert set(doc["sections"]) == {"history", "lyrics", "listens", "likes", "playlists", "dislikes", "blocklist", "settings"}
+    assert set(doc["sections"]) == {"history", "lyrics", "listens", "likes", "playlists", "dislikes", "blocklist", "settings",
+                                    "aliases", "matches"}
     assert doc["sections"]["settings"] == {"replaygain": False}  # never the token, URLs or per-device state
     raw = json.dumps(doc)
     assert TOKEN not in raw and "key.example" not in raw and "abcdef1" not in raw

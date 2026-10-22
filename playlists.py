@@ -1,11 +1,15 @@
 """Local playlists (`playlists.json`): [{id, name, description, tracks: [track], pinned, created_at, updated_at,
-cover_id, exported?}]. Tracks are store.clean_track dicts in play order; a playlist may hold any source's tracks.
+cover_id, exported?, import?}]. Tracks are store.clean_track dicts in play order; a playlist may hold any source's
+tracks, and placeholders of an import (importer.py) that aren't matched to a song yet: {id: "pq:<hex>", q: true,
+title, artist, channel, duration, album?, isrc?, key?, miss?, miss_at?} (`clean_entry`). The player looks those up
+by name (/api/match) before they play; nothing can be kept or exported until they are.
 
 Navidrome imports `.m3u` files it finds in the music folder, so `export` writes one into
 `<music>/Reef/Playlists/` with the kept tracks' files (paths relative to the playlist file, which is how
 Navidrome resolves them) and the server asks Navidrome to rescan.
 """
 import os
+import re
 import time
 import uuid
 from pathlib import Path
@@ -19,6 +23,7 @@ DESC_MAX = 500
 TRACKS_MAX = 5000
 PLAYLISTS_MAX = 500
 ID_LEN = 8
+PLACEHOLDER_ID = re.compile(r"^pq:[0-9a-f]{6,32}$")
 
 _file = store.JsonFile(lambda: config.PLAYLISTS_FILE, list)
 
@@ -28,10 +33,14 @@ def valid_id(pid):
 
 
 def summary(p):
-    """A list row: everything but the tracks, plus their count and total length (s)."""
+    """A list row: everything but the tracks, plus their count, total length (s), `unmatched` placeholders still to
+    look up and `not_found` ones nothing matched (each only when > 0)."""
     tracks = p.get("tracks") or []
+    unmatched = sum(1 for t in tracks if t.get("q") and not t.get("miss"))
+    not_found = sum(1 for t in tracks if t.get("q") and t.get("miss"))
     return {**{k: v for k, v in p.items() if k != "tracks"}, "count": len(tracks),
-            "duration": int(sum(t.get("duration") or 0 for t in tracks))}
+            "duration": int(sum(t.get("duration") or 0 for t in tracks)), **({"unmatched": unmatched} if unmatched else {}),
+            **({"not_found": not_found} if not_found else {})}
 
 
 def _copy(p):
@@ -40,7 +49,7 @@ def _copy(p):
 
 def _touch(p, now=None):
     p["updated_at"] = time.time() if now is None else now
-    p["cover_id"] = p["tracks"][0]["id"] if p["tracks"] else None
+    p["cover_id"] = next((t["id"] for t in p["tracks"] if not t.get("q")), None)  # a placeholder has no art
 
 
 def all_playlists():
@@ -79,17 +88,48 @@ def _name(value):
     return value.strip()[:NAME_MAX]
 
 
+def clean_placeholder(raw):
+    """A stored placeholder (see the module doc), or None when `raw` isn't one."""
+    if not isinstance(raw, dict) or raw.get("q") is not True or not isinstance(raw.get("id"), str) \
+            or not PLACEHOLDER_ID.match(raw["id"]) or not store.text(raw.get("title")):
+        return None
+    artist = store.text(raw.get("artist") or raw.get("channel"))
+    d = store.seconds(raw.get("duration"))
+    t = {"id": raw["id"], "q": True, "title": store.text(raw.get("title")), "artist": artist, "channel": artist,
+         "duration": round(d) if d else None}
+    if store.text(raw.get("album")):
+        t["album"] = store.text(raw.get("album"))
+    isrc = raw.get("isrc")
+    if isinstance(isrc, str) and re.fullmatch(r"[A-Z0-9]{12}", isrc):
+        t["isrc"] = isrc
+    key = raw.get("key")
+    if isinstance(key, str) and 0 < len(key) <= 200 and key.isprintable() and "/" not in key:
+        t["key"] = key
+    if raw.get("miss") is True:
+        t["miss"] = True
+        if store.seconds(raw.get("miss_at"), 1e11) is not None:
+            t["miss_at"] = raw["miss_at"]
+    return t
+
+
+def clean_entry(raw):
+    """A playlist entry: a clean track, or a clean placeholder; None for anything else."""
+    return clean_placeholder(raw) if isinstance(raw, dict) and raw.get("q") is True else store.clean_track(raw)
+
+
 def _tracks(raw):
     if not isinstance(raw, list):
         raise ValueError("tracks must be a list")
-    return [t for t in map(store.clean_track, raw) if t]
+    return [t for t in map(clean_entry, raw) if t]
 
 
-def create(name, tracks=None, description=""):
-    """A new playlist (raises ValueError for a bad name or too many playlists/tracks)."""
+def create(name, tracks=None, description="", extra=None):
+    """A new playlist (raises ValueError for a bad name or too many playlists/tracks). `extra`: more fields to
+    store on it (an import's {"import": {...}})."""
     now = time.time()
-    p = {"id": uuid.uuid4().hex[:ID_LEN], "name": _name(name), "description": store.text(description, DESC_MAX),
-         "tracks": _tracks([] if tracks is None else tracks)[:TRACKS_MAX], "pinned": False, "created_at": now}
+    p = {**(extra or {}), "id": uuid.uuid4().hex[:ID_LEN], "name": _name(name),
+         "description": store.text(description, DESC_MAX), "tracks": _tracks([] if tracks is None else tracks)[:TRACKS_MAX],
+         "pinned": False, "created_at": now}
     _touch(p, now)
     with _file.lock:
         items = _file.load()
@@ -177,6 +217,18 @@ def move(pid, src, dst):
         if not (0 <= src < n and 0 <= dst < n):
             raise IndexError(src)
         p["tracks"].insert(dst, p["tracks"].pop(src))
+
+    return _edit(pid, change)
+
+
+def replace_entries(pid, changes):
+    """Swap entries by id ({entry id: new entry}), wherever they are now: an import's background pass replaces
+    placeholders with the songs they matched while the user may be moving or removing rows. Entries that aren't
+    there any more are skipped. Returns the playlist, None if it doesn't exist."""
+    clean = {k: clean_entry(v) for k, v in changes.items()}
+
+    def change(p):
+        p["tracks"] = [clean.get(t["id"]) or t for t in p["tracks"]]
 
     return _edit(pid, change)
 

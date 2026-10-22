@@ -1,10 +1,14 @@
 """Backup and restore (production plan P1.12): one JSON file with everything Reef has learned about you.
 
     {"format": "reef-backup", "schemaVersion": 1, "createdAt": ISO-8601 UTC, "app": {"reef": short sha},
-     "sections": {"history", "lyrics", "listens", "likes", "playlists", "dislikes", "blocklist", "settings"}}
+     "sections": {"history", "lyrics", "listens", "likes", "playlists", "dislikes", "blocklist", "settings",
+                  "aliases", "matches"}}
 
 Settings are an allow-list of the values changed from the UI: never the ListenBrainz token, instance URLs (they
-may carry API keys) or anything device-specific. A file is written to `<name>.tmp`, read back and validated, and
+may carry API keys), the YouTube Music visitor id or anything device-specific. Lyrics carry the hits, the timing
+offsets (also offset-only entries: library tracks, songs whose lookup found nothing) and pinned records; misses
+are dropped. Matches carry the manual "Wrong song?" fixes only (automatic matches are a cache). Playlists keep
+an import's placeholders. A Reef before aliases / matches ignores those sections (same schemaVersion). A file is written to `<name>.tmp`, read back and validated, and
 only then renamed (snapshots) or served (downloads).
 
 Restore refuses another format or a newer schemaVersion, validates every section (a section of the wrong type
@@ -26,11 +30,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import blocklist
+import aliases
 import config
 import history
 import likes
 import listens
 import lyrics
+import matching
 import playlists
 import recommend
 import settings
@@ -47,7 +53,7 @@ AUTO_EVERY = 24 * 3600
 # Settings that travel with a backup: preferences, not secrets, URLs or per-device state.
 SETTINGS_KEYS = ("default_source", "ytmusic", "prefer_library", "autoplay_radio", "sponsorblock_keep", "replaygain",
                  "lrc_sidecar", "lyrics_providers", "scrobble_enabled", "keep_lossless", "sponsorblock_play",
-                 "replace_dead_tracks")
+                 "replace_dead_tracks", "yt_personalize", "charts_country", "itunes_suggestions")
 _NAME = re.compile(r"^(auto|pre-restore)-(\d{8}-\d{6})(?:-(\d+))?\.json$")
 
 
@@ -123,6 +129,27 @@ class _SettingsStore:
             return new
 
 
+class _MatchesStore:
+    """matches.json's manual fixes only: automatic matches are a cache, they stay as they are (an automatic entry
+    under a key a restored fix uses gives way to the fix)."""
+
+    def read(self):
+        f = matching._file
+        with f.lock:
+            return {k: copy.deepcopy(v) for k, v in f.load().items() if isinstance(v, dict) and v.get("manual")}
+
+    def transact(self, change):
+        f = matching._file
+        with f.lock:
+            data = dict(f.load())
+            mine = {k: copy.deepcopy(v) for k, v in data.items() if isinstance(v, dict) and v.get("manual")}
+            new = change(mine)
+            data = {k: v for k, v in data.items() if not (isinstance(v, dict) and v.get("manual")) and k not in new}
+            data.update(new)
+            f.save(data)
+            return new
+
+
 STORES = {
     "history": _JsonStore(lambda: history._file),
     "lyrics": _LyricsStore(),
@@ -132,8 +159,10 @@ STORES = {
     "dislikes": _JsonStore(lambda: recommend._dislikes),
     "blocklist": _BlocklistStore(),
     "settings": _SettingsStore(),
+    "aliases": _JsonStore(lambda: aliases._file),
+    "matches": _MatchesStore(),
 }
-SECTION_TYPES = {"lyrics": dict, "settings": dict}  # the rest are lists
+SECTION_TYPES = {"lyrics": dict, "settings": dict, "matches": dict}  # the rest are lists
 
 
 # ---------- item validation: a clean copy, or None to skip ----------
@@ -169,7 +198,7 @@ def _playlist_item(p):
     if not isinstance(p, dict) or not playlists.valid_id(p.get("id")) or not isinstance(p.get("name"), str):
         return None
     raw = p.get("tracks") if isinstance(p.get("tracks"), list) else []
-    tracks = [t for t in (store.clean_track(t) for t in raw) if t]
+    tracks = [t for t in (playlists.clean_entry(t) for t in raw) if t]  # an import's placeholders too
     return {**p, "tracks": tracks[:playlists.TRACKS_MAX]}
 
 
@@ -186,6 +215,40 @@ def _block_item(e):
             "at": e.get("at") if _num(e.get("at")) else time.time()}
 
 
+def _offset(v):
+    o = v.get("offset_ms")
+    return int(o) if _num(o) and o and abs(o) <= lyrics.OFFSET_MAX else None
+
+
+def _lyrics_item(v):
+    """A clean lyrics entry: a hit (with its source, word timing, pin, offset), an offset-only entry, or None (a
+    miss without an offset, or junk). Reef 1 hits (no "v") stay Reef 1 entries."""
+    at = v.get("at") if _num(v.get("at")) else 0
+    off = _offset(v)
+    has_text = any(isinstance(v.get(f), str) and v.get(f) for f in ("synced", "plain")) or v.get("instrumental") is True
+    if v.get("miss") or not has_text:
+        return {"v": lyrics.VERSION, "offset_ms": off, "at": at} if off else None
+    e = {"synced": v.get("synced") if isinstance(v.get("synced"), str) else None,
+         "plain": v.get("plain") if isinstance(v.get("plain"), str) else None,
+         "instrumental": v.get("instrumental") is True, "at": at}
+    if v.get("v") == lyrics.VERSION:
+        e["v"] = lyrics.VERSION
+        if isinstance(v.get("provider"), str) and len(v["provider"]) <= 40:
+            e["provider"] = v["provider"]
+        if isinstance(v.get("words"), list):
+            e["words"] = v["words"]
+        lrc = v.get("lrclib")
+        if isinstance(lrc, dict):
+            e["lrclib"] = {k: lrc.get(k) for k in ("synced", "plain", "instrumental")}
+        if v.get("retry") is True:
+            e["retry"] = True
+        if v.get("pinned") is True and isinstance(v.get("lrclib_id"), int) and not isinstance(v["lrclib_id"], bool):
+            e.update(pinned=True, lrclib_id=v["lrclib_id"], provider=lyrics.PINNED)
+    if off:
+        e["offset_ms"] = off
+    return e
+
+
 def _lyrics_items(d):
     out, bad = {}, 0
     for k, v in d.items():
@@ -193,13 +256,65 @@ def _lyrics_items(d):
         if not tid or not isinstance(v, dict):
             bad += 1
             continue
-        if v.get("miss"):
-            continue  # misses are dropped quietly: they're retried after a day anyway
-        if not any(isinstance(v.get(f), str) and v.get(f) for f in ("synced", "plain")) and not v.get("instrumental"):
+        e = _lyrics_item(v)
+        if e is None:
+            if not v.get("miss"):  # misses are dropped quietly: they're retried after a day anyway
+                bad += 1
+            continue
+        out[tid] = e
+    return out, bad
+
+
+def _lyrics_merge(have, new):
+    """Merge one lyrics entry: a pin beats a lookup, else the newer entry wins; an offset-only entry only brings
+    its offset; an offset the winner lacks is carried over unless the winner is a pin (a pin starts timing over)."""
+    if have is None or have.get("miss") and not new.get("offset_ms"):
+        return new
+    text = ("synced", "plain", "instrumental")
+    new_text, have_text = any(new.get(k) for k in text), any(have.get(k) for k in text) and not have.get("miss")
+    if not new_text:  # offset only
+        if new.get("offset_ms") and (not have.get("offset_ms") or _newer(have, new, "at")) and not have.get("pinned"):
+            return {**have, "offset_ms": new["offset_ms"]}
+        return have
+    if not have_text:
+        out = dict(new)
+        if have.get("offset_ms") and not out.get("offset_ms") and not out.get("pinned"):
+            out["offset_ms"] = have["offset_ms"]
+        return out
+    if bool(new.get("pinned")) != bool(have.get("pinned")):
+        win, lose = (new, have) if new.get("pinned") else (have, new)
+    else:
+        win, lose = (new, have) if _newer(have, new, "at") else (have, new)
+    if lose.get("offset_ms") and not win.get("offset_ms") and not win.get("pinned"):
+        return {**win, "offset_ms": lose["offset_ms"]}
+    return win
+
+
+def _alias_item(e):
+    if not aliases._valid(e):
+        return None
+    aid = e.get("id") if isinstance(e.get("id"), str) and aliases.CHANNEL_ID.match(e["id"]) else None
+    match = e.get("match").strip()[:aliases.NAME_MAX] if isinstance(e.get("match"), str) and e["match"].strip() else None
+    if not aid and not match:
+        return None
+    return {"id": aid, "match": match, "name": e["name"].strip()[:aliases.NAME_MAX],
+            "at": e.get("at") if _num(e.get("at")) else 0}
+
+
+def _alias_key(e):
+    return e.get("id") or "n:" + blocklist.key(e.get("match"))
+
+
+def _matches_items(d):
+    """Manual fixes only; anything else (automatic matches, junk) is skipped and counted."""
+    out, bad = {}, 0
+    for k, v in d.items():
+        clean = store.clean_track(v.get("track")) if isinstance(v, dict) else None
+        if not matching.valid_key(k) or not clean or v.get("manual") is not True or store.track_id(v.get("id")) != clean["id"]:
             bad += 1
             continue
-        out[tid] = {"synced": v.get("synced"), "plain": v.get("plain"), "instrumental": bool(v.get("instrumental")),
-                    "at": v.get("at") if _num(v.get("at")) else 0}
+        out[k] = {"id": clean["id"], "score": v.get("score") if _num(v.get("score")) else None, "manual": True,
+                  "at": v.get("at") if _num(v.get("at")) else 0, "track": clean}
     return out, bad
 
 
@@ -217,7 +332,7 @@ def _settings_items(d):
 
 
 ITEM = {"history": _history_item, "listens": _listen_item, "likes": _like_item, "playlists": _playlist_item,
-        "dislikes": _dislike_item, "blocklist": _block_item}
+        "dislikes": _dislike_item, "blocklist": _block_item, "aliases": _alias_item}
 
 
 def _clean_section(name, raw):
@@ -229,6 +344,8 @@ def _clean_section(name, raw):
         return _lyrics_items(raw)
     if name == "settings":
         return _settings_items(raw)
+    if name == "matches":
+        return _matches_items(raw)
     out = [c for c in (ITEM[name](e) for e in raw) if c is not None]
     return out, len(raw) - len(out)
 
@@ -268,7 +385,7 @@ def build(now=None):
     for name, st in STORES.items():
         data = st.read()
         if name == "lyrics":
-            data, _ = _lyrics_items(data)  # hits only: misses are retried after a day anyway
+            data, _ = _lyrics_items(data)  # hits and offsets: misses are retried after a day anyway
         sections[name] = data
     return {"format": FORMAT, "schemaVersion": SCHEMA_VERSION, "createdAt": _iso(now),
             "app": {"reef": _reef_sha()}, "sections": sections}
@@ -409,7 +526,14 @@ def _apply(name, mode, cur, new):
             return dict(new)
         out = dict(cur)
         for k, v in new.items():
-            if k not in out or out[k].get("miss") or _newer(out[k], v, "at"):
+            out[k] = _lyrics_merge(out.get(k) if isinstance(out.get(k), dict) else None, v)
+        return out
+    if name == "matches":
+        if mode == "replace":
+            return dict(new)
+        out = dict(cur)
+        for k, v in new.items():
+            if k not in out or _newer(out[k], v, "at"):
                 out[k] = v
         return out
     if name == "listens":
@@ -428,6 +552,8 @@ def _apply(name, mode, cur, new):
         rows = _merge_by(cur, new, lambda e: e.get("id"), "updated_at")
     elif name == "blocklist":
         rows = _merge_by(cur, new, lambda e: e.get("id") or "n:" + blocklist.key(e.get("name")), "at")
+    elif name == "aliases":
+        rows = _merge_by(cur, new, _alias_key, "at")
     else:
         raise BackupError(f"unknown section {name}")
     if name == "history" and mode == "replace":

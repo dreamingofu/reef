@@ -43,6 +43,7 @@
     health: null,
     settings: {}, // server-side settings (/api/settings `values`); missing keys mean the defaults
     blocked: null, // hidden artists from /api/blocklist (null until loaded)
+    playlists: null, // Reef playlists (/api/playlists summaries), null until loaded
     // Search sources from /api/sources; `source` is the chip picked for searching.
     sources: [{ key: "yt", name: "YouTube", can_keep: true, codec_label: "AAC" }],
     source: store.get("source", null),
@@ -75,7 +76,8 @@
   // hqdefault's black bars never show; square art at 200 is still sharp enough for rows and cards.
   const ART = { small: [200, 480], big: [720, 720], fallback: [200, 480], tile: [320, 320], mini: [160, 320], bg: [160, 160] };
   // encodeURIComponent turns "mc:123" into "mc%3A123", which Flask decodes back before routing.
-  const artUrl = (id, size) => `/api/art/${encodeURIComponent(id)}?size=${size}`;
+  // A placeholder (an import row not matched yet, "pq:…") has no art: the app icon.
+  const artUrl = (id, size) => (/^pq:/.test(id || "") ? "/static/icon.svg" : `/api/art/${encodeURIComponent(id)}?size=${size}`);
   const artSize = (id, kind) => ART[kind][keepState(id) === "kept" ? 1 : 0];
   // Only YouTube has a smaller second-choice thumbnail; other sources fall back to the app icon.
   const artFallback = (id) => (srcKey(id) === "yt" ? artUrl(id, artSize(id, "fallback")) : "/static/icon.svg");
@@ -867,9 +869,29 @@
     el.innerHTML = html;
   }
 
+  // Reef's own playlists (/api/playlists), listed on Kept until the Library hub; Import opens the import sheet.
+  async function loadPlaylists() {
+    try {
+      const list = await api("/api/playlists");
+      if (Array.isArray(list)) state.playlists = list;
+    } catch { /* keep the last list */ }
+    if (state.view === "kept") renderKept();
+  }
+  function playlistRows() {
+    const list = state.playlists || [];
+    return `<div class="shelf-head pl-head"><h2>Playlists</h2><button class="chip sm shelf-act" data-st="import">${icon("plus")}Import</button></div>
+      ${list.length ? `<ul class="rows">${list.map((p) => `<li class="row pl-row"><a class="pl-link" href="#local/${encodeURIComponent(p.id)}">
+          <span class="row-art">${p.cover_id ? art(p.cover_id) : `<span class="pl-ic">${icon("note")}</span>`}</span>
+          <span class="row-text"><span class="row-t">${esc(p.name)}</span><span class="row-s">${esc([songs(p.count), p.unmatched ? `${p.unmatched} to match` : "", p.not_found ? `${p.not_found} not found` : ""].filter(Boolean).join(" · "))}</span></span>
+          ${icon("chev-right")}</a></li>`).join("")}</ul>`
+        : `<p class="st-note">Import a CSV from Exportify, TuneMyMusic or Google Takeout to make one.</p>`}`;
+  }
+
   function renderKept() {
     const n = state.history.length;
     let html = `<h1 class="page-title">Kept</h1><p class="page-sub">${n} song${n === 1 ? "" : "s"} saved to Navidrome</p>`;
+    if (state.playlists) html += playlistRows();
+    if (state.playlists && n) html += `<h2 class="section-title">Songs</h2>`;
     if (!n) {
       html += emptyState("disc", "Nothing kept yet", "Search for a song and tap + to save it to your library.",
         `<a class="pill-btn" href="#search">${icon("search")}Search</a>`);
@@ -934,13 +956,14 @@
     playlist: (id) => `/api/playlist/${encodeURIComponent(id)}`,
     mood: (id) => `/api/mood?params=${encodeURIComponent(id)}`,
     moods: () => "/api/moods",
+    local: (id) => `/api/playlists/${encodeURIComponent(id)}`, // a Reef playlist (e.g. an import)
   };
 
   const pageData = () => detail.cache.get(detail.key)?.data || null;
   function pageTracks() {
     const d = pageData();
     if (!d) return [];
-    return (detail.kind === "artist" ? d.songs : detail.kind === "album" || detail.kind === "playlist" ? d.tracks : null) || [];
+    return (detail.kind === "artist" ? d.songs : ["album", "playlist", "local"].includes(detail.kind) ? d.tracks : null) || [];
   }
   function moodName(params) {
     const t = state.tiles.find((x) => x.params === params);
@@ -957,6 +980,7 @@
     if (kind === "mood") return d?.title || moodName(id) || "Mood";
     if (!d) return "";
     if (kind === "artist") return d.name || "Artist";
+    if (kind === "local") return d.name || "Playlist";
     return d.title || (kind === "album" ? "Album" : "Playlist");
   }
 
@@ -970,7 +994,9 @@
       let changed = true;
       try {
         const data = await api(PAGE_API[kind](id));
+        if (kind === "local") for (const t of data.tracks || []) if (!t.title) t.title = `YouTube video ${t.id}`; // a Takeout row not looked up yet
         noteKept(kind === "artist" ? data.songs : data.tracks);
+        if (kind === "local" && (data.import || (data.tracks || []).some(M.isPlaceholder))) loadImportStatus(id);
         if (kind === "artist") for (const r of [...(data.albums || []), ...(data.singles || [])]) if (r.type) releaseType.set(r.id, r.type);
         const old = detail.cache.get(key);
         changed = !old || JSON.stringify(old.data) !== JSON.stringify(data);
@@ -1058,7 +1084,7 @@
 
   async function keepAll() {
     const d = pageData();
-    if (!d || (detail.kind !== "album" && detail.kind !== "playlist")) return;
+    if (!d || !["album", "playlist", "local"].includes(detail.kind)) return;
     const s = keepAllState();
     if (s === "kept") { toast("Already in your library"); return; }
     if (s === "pending") { location.hash = "#downloads"; return; }
@@ -1184,7 +1210,62 @@
       </a>`).join("")}</div>` : emptyState("note", "No playlists", "YouTube Music has nothing here right now.")}`;
   }
 
-  const PAGES = { album: albumPage, artist: artistPage, playlist: playlistPage, mood: moodPage, moods: moodsPage };
+  // A Reef playlist (#local/<id>). An import's rows that aren't matched to a song yet are placeholders: they play
+  // (looked up on the way, match-core) but can't be kept; the server matches them in the background meanwhile.
+  const imp = { status: new Map(), timer: 0, busy: false, file: null, name: "", result: null };
+  function importLine(pid) {
+    const s = imp.status.get(pid);
+    if (!s || !s.total) return "";
+    const missing = s.missing?.length || 0;
+    const text = s.running
+      ? (s.rate_limited ? `YouTube Music asked to slow down · ${s.resolved} of ${s.total} matched` : `Matching songs… ${s.resolved} of ${s.total}`)
+      : `${s.resolved} of ${s.total} matched${missing ? ` · ${missing} not found` : ""}${s.error ? ` · ${s.error}` : ""}`;
+    const btn = s.running ? "" : s.pending ? `<button class="chip sm" data-import-resolve="${esc(pid)}">${icon("repeat")}Match ${s.pending} more</button>`
+      : missing ? `<button class="chip sm" data-import-resolve="${esc(pid)}" data-retry-missing>${icon("repeat")}Try missing again</button>` : "";
+    return `<div class="imp-line" role="status"><span>${s.running ? '<i class="spin"></i>' : ""}${esc(text)}</span>${btn}</div>`;
+  }
+  function localPage(p) {
+    const tracks = p.tracks || [];
+    const total = tracks.reduce((x, t) => x + (Number(t.duration) || 0), 0);
+    const real = tracks.filter((t) => !M.isPlaceholder(t));
+    const sub = (t) => (M.isPlaceholder(t) ? `${esc(t.artist || t.channel || "")}${t.artist || t.channel ? " · " : ""}${t.miss ? "Not found" : "Not matched yet"}` : null);
+    return `<div class="hero">${heroArt(null, real)}
+        <h1 class="hero-t" data-anchor>${esc(p.name || "Playlist")}</h1>
+        ${p.description ? `<p class="hero-a plain">${esc(p.description)}</p>` : ""}
+        <p class="hero-s">${esc([songs(tracks.length), fmtLen(total)].filter(Boolean).join(" · "))}</p>
+      </div>
+      <div id="imp-line">${importLine(p.id)}</div>
+      ${tracks.length ? `${pageActions()}${keepAllBtn()}
+        <ul class="rows d-rows">${tracks.map((t, i) => row(t, i, "page", sub(t))).join("")}</ul>`
+        : emptyState("note", "Empty playlist", "Nothing in this playlist yet.")}`;
+  }
+  // GET /api/import/<id>/status; polled every 2 s while the background pass runs, refreshing the page as songs match.
+  async function loadImportStatus(pid) {
+    clearTimeout(imp.timer);
+    let s;
+    try { s = await api(`/api/import/${encodeURIComponent(pid)}/status`); } catch { return; }
+    const old = imp.status.get(pid);
+    imp.status.set(pid, s);
+    const here = state.view === "detail" && detail.kind === "local" && detail.id === pid;
+    if (!here) return;
+    const line = $("#imp-line");
+    if (line) line.innerHTML = importLine(pid);
+    if (old && (old.resolved !== s.resolved || old.missing?.length !== s.missing?.length)) loadPage(detail.key, { force: true });
+    if (s.running) imp.timer = setTimeout(() => loadImportStatus(pid), 2000);
+  }
+  async function resolveImport(pid, retryMissing) {
+    try {
+      const s = await api(`/api/import/${encodeURIComponent(pid)}/resolve`, {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ retry_missing: !!retryMissing }),
+      });
+      imp.status.set(pid, s);
+    } catch (e) {
+      toast(`Couldn't start matching: ${e.message}`);
+    }
+    loadImportStatus(pid);
+  }
+
+  const PAGES = { album: albumPage, artist: artistPage, playlist: playlistPage, mood: moodPage, moods: moodsPage, local: localPage };
 
   function renderDetail() {
     const el = $("#view-detail");
@@ -1353,7 +1434,7 @@
   // #mood/<params>, #moods) show in #view-detail on top of the main view they were opened from, whose tab
   // and bottom bar stay. Every history entry carries {reef: depth, parent}: depth > 0 means Back has an
   // in-app page to return to, and each depth's scroll position comes back on back / forward (iOS edge swipe).
-  const DETAIL_RE = /^(album|artist|playlist|mood)\/(.+)$/;
+  const DETAIL_RE = /^(album|artist|playlist|mood|local)\/(.+)$/;
   let navDepth = 0, navReplace = false, routeKey = "";
   const scrollAt = new Map(); // history depth -> scrollY
   if ("scrollRestoration" in history) history.scrollRestoration = "manual";
@@ -1408,6 +1489,7 @@
     } else {
       if (r.view === "home" && state.homeTab === "library" && state.library === null) loadLibrary();
       if (r.view === "home" && homeDue()) loadHome();
+      if (r.view === "kept") loadPlaylists();
       RENDER[r.view]();
       if (changed) window.scrollTo(0, y);
     }
@@ -3023,6 +3105,7 @@
       + stLink("updates", "Updates", updatesSummary(), updateAvailable())
       + stLink("scrobble", "Scrobbling", scrobbleSummary())
       + stLink("backup", "Backup", backupSummary())
+      + stLink("import", "Import playlist", "CSV")
       + `<li class="st-link"><button data-open-hidden><span class="k">Hidden artists</span><span class="v">${n == null ? "" : n}${icon("chev-right")}</span></button></li>`
       + `<li class="st-link"><button data-yt-reset${ytResetting ? " disabled" : ""}><span class="k">Reset YouTube session</span><span class="v">${ytResetting ? "Resetting…" : icon("repeat")}</span></button></li>`
       + `<li class="st-link"><button data-copy-diag><span class="k">Copy diagnostics</span><span class="v">${icon("copy")}</span></button></li>`
@@ -3104,7 +3187,7 @@
     sources: null, sourcesBusy: false, version: null, versionBusy: false, upd: null, updTimer: 0, updDown: false,
     scrob: null, tokenBusy: false, backup: null, restoreMode: "merge", restoreFile: null, restoreBusy: false, restored: null,
   };
-  const SUBS = { sources: renderSourcesSheet, updates: renderUpdatesSheet, scrobble: renderScrobbleSheet, backup: renderBackupSheet };
+  const SUBS = { sources: renderSourcesSheet, updates: renderUpdatesSheet, scrobble: renderScrobbleSheet, backup: renderBackupSheet, import: renderImportSheet };
   const subOpen = (k) => !$(`#${k}-sheet`).hidden;
   const rerender = (k) => { if (subOpen(k)) SUBS[k](); if (!$("#status-sheet").hidden) renderStatus(); };
   const ON = (b) => (b ? " disabled" : "");
@@ -3372,6 +3455,42 @@
     loadBackupStatus();
   }
 
+  // Import: a CSV (Exportify / Spotify-style, TuneMyMusic, Google Takeout) -> POST /api/import -> a Reef playlist.
+  function renderImportSheet() {
+    const f = imp.file, r = imp.result;
+    $("#import-body").innerHTML = `<p class="st-note st-lead">A playlist exported as CSV (Exportify, TuneMyMusic, Google Takeout's
+        YouTube Music playlists) becomes a Reef playlist. Songs are found on YouTube Music in the background; you can
+        play it right away.</p>
+      <label class="st-file">${icon("note")}<span>${esc(f ? f.name : "Choose a CSV file")}</span>
+        <input type="file" id="import-file" accept=".csv,text/csv,text/comma-separated-values,text/plain"></label>
+      <input class="st-input imp-name" id="import-name" type="text" maxlength="100" placeholder="Playlist name (optional)" aria-label="Playlist name" value="${esc(imp.name)}">
+      <button class="btn-wide" data-st="import-go"${ON(!f || imp.busy)}>${imp.busy ? "Importing…" : "Import"}</button>
+      ${r ? `<p class="st-note ok">Imported “${esc(r.playlist.name)}”: ${esc(songs(r.rows))}${r.to_match ? `, ${r.to_match} to match` : ""}${r.skipped ? ` (${r.skipped} rows skipped)` : ""}.</p>
+        <a class="btn-wide alt" href="#local/${encodeURIComponent(r.playlist.id)}">${icon("note")}Open playlist</a>` : ""}`;
+  }
+  async function runImport() {
+    const f = imp.file;
+    if (!f || imp.busy) return;
+    imp.busy = true;
+    const name = imp.name.trim();
+    renderImportSheet();
+    const fd = new FormData();
+    fd.append("file", f);
+    if (name) fd.append("name", name);
+    try {
+      imp.result = await api("/api/import", { method: "POST", body: fd });
+      imp.file = null;
+      imp.name = "";
+      if (imp.result.status) imp.status.set(imp.result.playlist.id, imp.result.status);
+      toast(`Imported “${imp.result.playlist.name}”`);
+      loadPlaylists();
+    } catch (e) {
+      toast(`Couldn't import: ${e.message}`);
+    }
+    imp.busy = false;
+    renderImportSheet();
+  }
+
   function statusAction(a, el) {
     if (SUBS[a]) { openSub(a); return; }
     if (a === "back") { backToStatus(el.closest(".sheet-wrap")); return; }
@@ -3390,7 +3509,15 @@
     if (a === "clear-token") { if (confirm("Remove the ListenBrainz token? Listens stop being sent.")) saveToken(""); return; }
     if (a === "mode-merge" || a === "mode-replace") { st.restoreMode = a.slice(5); rerender("backup"); return; }
     if (a === "restore") restoreBackup();
+    if (a === "import-go") runImport();
   }
+  $("#import-body").addEventListener("input", (e) => { if (e.target.id === "import-name") imp.name = e.target.value; });
+  $("#import-body").addEventListener("change", (e) => {
+    if (e.target.id !== "import-file") return;
+    imp.file = e.target.files?.[0] || null;
+    imp.result = null;
+    renderImportSheet();
+  });
   $("#scrobble-body").addEventListener("submit", (e) => {
     e.preventDefault();
     const v = $("#lb-token").value.trim();
@@ -3467,9 +3594,10 @@
     const albumItem = ALBUM_ID.test(t.album_id || "") ? item("album", "disc", "Go to album", ` data-arg="${esc(t.album_id)}"`) : "";
     const ha = hideTarget(t);
     const hideItem = ha ? item("hide", "hide", as.length > 1 ? `Hide ${esc(ha.name)}` : "Hide artist") : "";
-    const dislikeItem = srcKey(t.id) !== "nd" ? item("dislike", "thumb-down", "Not interested") : "";
+    const ph = M.isPlaceholder(t); // an import row not matched yet: nothing to share, dislike or hide
+    const dislikeItem = srcKey(t.id) !== "nd" && !ph ? item("dislike", "thumb-down", "Not interested") : "";
     $("#act-menu").innerHTML = item("next", "play-next", "Play next") + item("queue", "queue-add", "Add to queue") + radioItem + keepItem
-      + artistItems + albumItem + item("share", "share", "Share") + dislikeItem + hideItem;
+      + artistItems + albumItem + (ph ? "" : item("share", "share", "Share")) + dislikeItem + hideItem;
   }
   function runAction(act, arg) {
     const a = actTarget;
@@ -3538,7 +3666,7 @@
 
   // ---------- events ----------
   document.addEventListener("click", (e) => {
-    const t = e.target.closest("[data-keep],[data-play],[data-search],[data-source],[data-home-tab],[data-filter],[data-dismiss],[data-play-all],[data-shuffle-all],[data-close],[data-clear-finished],[data-clear-searches],[data-more],[data-act],[data-q-jump],[data-q-remove],[data-q-clear],[data-q-mode],[data-sleep],[data-fill],[data-keep-all],[data-retry],[data-page-radio],[data-artist-hide],[data-unhide],[data-unhide-page],[data-open-hidden],[data-yt-reset],[data-copy-diag],[data-about],[data-mix],[data-st]");
+    const t = e.target.closest("[data-keep],[data-play],[data-search],[data-source],[data-home-tab],[data-filter],[data-dismiss],[data-play-all],[data-shuffle-all],[data-close],[data-clear-finished],[data-clear-searches],[data-more],[data-act],[data-q-jump],[data-q-remove],[data-q-clear],[data-q-mode],[data-sleep],[data-fill],[data-keep-all],[data-retry],[data-page-radio],[data-artist-hide],[data-unhide],[data-unhide-page],[data-open-hidden],[data-yt-reset],[data-copy-diag],[data-about],[data-mix],[data-st],[data-import-resolve]");
     if (!t) return;
     const d = t.dataset;
     if ("keep" in d) { e.preventDefault(); if (d.keep) keep(d.keep, d.list); return; }
@@ -3559,6 +3687,7 @@
     if ("ytReset" in d) { resetYouTube(); return; }
     if ("copyDiag" in d) { copyDiagnostics(); return; }
     if ("st" in d) { if (!t.disabled) statusAction(d.st, t); return; }
+    if ("importResolve" in d) { t.disabled = true; resolveImport(d.importResolve, "retryMissing" in d); return; }
     if ("about" in d) {
       detail.about = !detail.about;
       $("#about")?.classList.toggle("clamp", !detail.about);

@@ -27,6 +27,8 @@ import errors
 import health as source_health
 import history
 import home
+import importer
+import itunes
 import likes
 import listens
 import log
@@ -234,14 +236,18 @@ def api_search():
 
 @app.get("/api/suggest")
 def api_suggest():
-    """Search-box suggestions. Called per keystroke, so it never fails: errors are an empty list."""
+    """Search-box suggestions. Called per keystroke, so it never fails: errors are an empty list. YouTube Music
+    first; when it's off or failed, the iTunes Search API (setting `itunes_suggestions`)."""
     q = request.args.get("q", "").strip()[:HINT_MAX]
-    out = []
+    out, failed = [], False
     if q and ytmusic.enabled():
         try:
             out = ytmusic.suggestions(q)
         except Exception as e:
+            failed = True
             logger.warning(f"suggest failed: {str(e)[:160]!r}")
+    if q and (failed or not ytmusic.enabled()) and settings.get("itunes_suggestions"):
+        out = itunes.suggestions(q)
     resp = jsonify(out)
     resp.headers["Cache-Control"] = "private, max-age=600"
     return resp
@@ -415,15 +421,21 @@ def _match_query(body):
             "duration": _seconds(body.get("duration"))}
 
 
-def _find_song(query, accept=matching.ACCEPT, stop=matching.STOP, exclude=(), same_artist=False):
+def _find_song(query, accept=matching.ACCEPT, stop=matching.STOP, exclude=(), same_artist=False, loose=False,
+               search=None):
     """(track, score) of the YouTube Music song that best matches `query`, else None. When title + artist
-    finds nothing acceptable, the title alone gets a second search (the artist may be spelled another way)."""
+    finds nothing acceptable, the title alone gets a second search (the artist may be spelled another way).
+    `loose` (looking up a song by name: /api/match, imports) also accepts importer.loose_best's word-subset titles;
+    `search` replaces ytmusic.search (the import pass throttles its requests)."""
+    search = search or ytmusic.search
     texts = [matching.search_text(query)]
     if query.get("artist"):
         texts.append(matching.search_text({"title": query["title"]}))
     for text in texts:
-        found = matching.best(query, blocklist.filter_tracks(ytmusic.search(text, MATCH_LIMIT)), accept, stop, exclude,
-                              same_artist)
+        found_list = blocklist.filter_tracks(search(text, MATCH_LIMIT))
+        found = matching.best(query, found_list, accept, stop, exclude, same_artist)
+        if not found and loose:
+            found = importer.loose_best(query, found_list, exclude)
         if found:
             return found
     return None
@@ -453,7 +465,7 @@ def api_match():
     if not ytmusic.enabled():
         return _ytm_off()
     try:
-        found = _find_song(query)
+        found = _find_song(query, loose=True)
     except Exception as e:
         return jsonify({"error": str(e)[:300]}), 502
     if not found:
@@ -1049,9 +1061,12 @@ def api_playlist_m3u(pid):
 
 @app.get("/api/playlists/<pid>")
 def api_playlist_get(pid):
-    p = playlists.get(_pid_or_404(pid))
+    pid = _pid_or_404(pid)
+    p = playlists.get(pid)
     if not p:
         abort(404)
+    if any(importer.is_placeholder(t) for t in p["tracks"]) and importer.materialize(pid):
+        p = playlists.get(pid) or p  # placeholders the player (or a manual fix) matched meanwhile
     return _playlist_body(p)
 
 
@@ -1073,6 +1088,7 @@ def api_playlist_patch(pid):
 def api_playlist_delete(pid):
     if not playlists.delete(_pid_or_404(pid)):
         abort(404)
+    importer.cancel(pid)
     return "", 204
 
 
@@ -1133,6 +1149,94 @@ def api_playlist_export(pid):
     if out is None:
         abort(404)
     return jsonify({**out, "rescanned": navidrome.rescan()})
+
+
+# ---------- playlist import: CSV / Google Takeout (production plan P2 -> IL 4.4) ----------
+
+def _import_find(query):
+    """The import pass's lookup: /api/match's, with every YouTube Music request throttled."""
+    def search(text, limit):
+        importer.throttle.wait()
+        return ytmusic.search(text, limit)
+    return _find_song(query, loose=True, search=search)
+
+
+def _import_lookup(video_id):
+    """Title / artists / length for a Takeout row that only has the video id."""
+    importer.throttle.wait()
+    found = ytmusic.song(video_id)
+    return found if found and found.get("id") == video_id else None
+
+
+def _import_resolve(pid, retry_missing=False):
+    return importer.resolve(pid, _import_find, _import_lookup, home.rate_limited, home.retry_after,
+                            retry_missing=retry_missing)
+
+
+@app.post("/api/import")
+def api_import():
+    """A CSV as a multipart `file` (+ optional `name`, `resolve`), or JSON {text, filename?, name?, resolve?}
+    (the CSV <= 5 MB either way; a JSON body may be up to importer.REQUEST_MAX for its escaping) -> 201 {playlist (summary), kind: csv|takeout, rows, skipped, to_match, status}. Rows that aren't
+    YouTube ids become placeholders; `resolve` (default true) starts matching them in the background."""
+    request.max_content_length = importer.REQUEST_MAX  # per request: Flask >= 3.1 (requirements.txt)
+    too_big = jsonify({"error": "the file is larger than 5 MB"}), 413
+    if (request.content_length or 0) > importer.REQUEST_MAX:
+        return too_big
+    try:
+        if request.files.get("file"):
+            f = request.files["file"]
+            raw, filename = f.read(importer.MAX_BYTES + 1), f.filename or ""
+            name, want = request.form.get("name"), request.form.get("resolve", "1") not in ("0", "false")
+        else:
+            body = request.get_json(silent=True)
+            if not isinstance(body, dict) or not isinstance(body.get("text"), str):
+                return jsonify({"error": "send a CSV file, or JSON {text}"}), 400
+            raw, filename = body["text"], str(body.get("filename") or "")
+            name, want = body.get("name"), body.get("resolve") is not False
+            if len(raw.encode("utf-8", "replace")) > importer.MAX_BYTES:
+                return too_big
+    except RequestEntityTooLarge:
+        return too_big
+    if len(raw) > importer.MAX_BYTES:  # bytes of the file / UTF-8 bytes of the text: the same 5 MB either way
+        return too_big
+    try:
+        parsed = importer.parse(raw, filename)
+        p = importer.create(parsed, name if isinstance(name, str) else None)
+    except ValueError as e:  # importer.ImportFailed, or playlists' limits
+        return jsonify({"error": str(e)}), 400
+    meta = p.get("import") or {}
+    status = _import_resolve(p["id"]) if want and meta.get("total") and ytmusic.enabled() else importer.status(p["id"])
+    return jsonify({"playlist": playlists.summary(p), "kind": parsed["kind"], "rows": meta.get("rows"),
+                    "skipped": meta.get("skipped"), "to_match": meta.get("total"), "status": status}), 201
+
+
+@app.post("/api/import/<pid>/resolve")
+def api_import_resolve(pid):
+    """Match the playlist's placeholders in the background ({retry_missing?: true} asks again for the ones nothing
+    matched) -> 202 status; 502 when YouTube Music is off."""
+    pid = _pid_or_404(pid)
+    if playlists.get(pid) is None:
+        abort(404)
+    if not ytmusic.enabled():
+        return _ytm_off()
+    body = request.get_json(silent=True)
+    out = _import_resolve(pid, retry_missing=isinstance(body, dict) and body.get("retry_missing") is True)
+    if out is None:
+        abort(404)
+    return jsonify(out), 202
+
+
+@app.get("/api/import/<pid>/status")
+def api_import_status(pid):
+    """{total, resolved, pending, missing: [{id, title, artist, album?}], running, rate_limited, retry_at, error,
+    failed, tracks, started_at, finished_at}."""
+    pid = _pid_or_404(pid)
+    p = playlists.get(pid)
+    if p is None:
+        abort(404)
+    if any(importer.is_placeholder(t) and not t.get("miss") for t in p["tracks"]):
+        importer.materialize(pid)  # rows the player matched meanwhile count as resolved
+    return jsonify(importer.status(pid))
 
 
 # ---------- anonymous YouTube Music personalisation (production plan P1.2) ----------
@@ -1321,10 +1425,7 @@ def api_backup_status():
 @app.post("/api/restore")
 def api_restore():
     """A backup as a multipart `file` (+ `mode` field) or as the JSON body (?mode=); mode replace|merge."""
-    try:
-        request.max_content_length = backup.MAX_BYTES  # Flask >= 3.1; older: the app-wide 4 MB applies
-    except AttributeError:
-        pass
+    request.max_content_length = backup.MAX_BYTES  # per request: Flask >= 3.1 (requirements.txt)
     if (request.content_length or 0) > backup.MAX_BYTES:
         return jsonify({"error": "the backup is larger than 20 MB"}), 413
     mode = request.args.get("mode") or "merge"

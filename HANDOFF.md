@@ -1,6 +1,6 @@
 # Reef — handoff notes (resume on another machine)
 
-Last updated: 2026-10-22 (Round 15).
+Last updated: 2026-10-22 (Round 16).
 
 ## What's running
 
@@ -98,6 +98,8 @@ Pass the Navidrome password through the environment. Don't put it in a committed
   YouTube Music, BetterLyrics TTML, the text checks): Round 14.
 - `personal.py` (opt-in anonymous YouTube Music personalisation), `charts.py` (YouTube Music charts),
   `aliases.py` (artist display names): Round 15.
+- `importer.py` (CSV / Google Takeout playlist import + background matching), `itunes.py` (iTunes suggestions
+  fallback): Round 16.
 - `log.py`: logging setup (stderr + `logs/reef.log` rotated 1 MB × 5 + a 300-line in-memory tail), `redact()` for
   signed-URL params / Subsonic tokens / cookies. Modules log through `logging.getLogger(__name__)`, no print().
 - `termux/reef-run.sh`: restart loop with backoff; `termux/reef-boot.sh` (Termux:Boot) (re)starts it.
@@ -676,6 +678,93 @@ original names.
    few songs for a day, then compare `/api/home` `ytm:quick-picks` with a fresh install's.
 2. Watch `logs/reef.log` for `personal play … videostats=204` and that nothing appears with the setting off.
 3. `/api/charts?country=<yours>`: whether a Top 100 Songs section is found for the phone's country.
+
+## Round 16 (2026-10-22): playlist import, resumable Monochrome keeps, iTunes suggestions, backup coverage (production plan P2)
+
+New setting `itunes_suggestions` (default on, fallback only). No new files on disk (import state is in
+`playlists.json`; a run's progress is in memory). Deliberately **not** done from the P2 table: Spotify embed import
+(against Spotify's terms), JioSaavn (legally questionable), the fast InnerTube path (breaks with PO tokens), loudness
+at play time (a Web Audio GainNode can break iOS background playback).
+
+- **Import** (`importer.py`, `POST /api/import`). Columns found by normalised name (lowercase, no punctuation):
+  title (`Track Name`, `title`, `song`, `track`, `name`, …), artist (`Artist Name(s)`, `artist(s)`, `creator`, Takeout's
+  `Artist Name 1..n`; older Exportify's `A;B` → `A, B`), album, duration (`… (ms)` columns in ms, `3:45`, seconds,
+  numbers ≥ 20000 read as ms), ISRC, a playlist-name column (TuneMyMusic), a video id. Delimiter sniffed (`, ; tab`),
+  BOM / UTF-16 / Latin-1 tolerated. **Takeout by row shape**: a `Video ID` column (header found within the first 20
+  rows, so the older playlist CSVs with a metadata preamble work), or header-less rows that are only an 11-char id +
+  timestamp; name from the file name minus `-videos.csv` / `.csv`. Video-id rows become real tracks (an untitled one
+  gets its title from `ytmusic.song`, else shows its id); every other row a placeholder `{id: "pq:<12 hex>", q: true,
+  title, artist, channel, duration, album?, isrc?, key: matching.key_for(title, artist), miss?, miss_at?}`
+  (`playlists.clean_entry`; `POST /api/playlists` and `/tracks` accept them too, cover_id skips them, `.m3u` comments
+  them out). The playlist stores `import: {kind, rows, skipped, total (rows left to match), at}`.
+- **Matching**: `app._find_song(loose=True)` = matching.best (same thresholds, title floor) then
+  `importer.loose_best`: accent-folded **word-subset** titles (one side's normalised words ⊆ the other's), artist
+  Dice ≥ 0.5, same version words, within 10 s when both lengths are known (else ≤ 3 words apart), raw ≥ 0.35 —
+  "Kiss from a Rose (From Batman Forever)" for "Kiss from a Rose". `/api/match` uses it too (not `/api/replace`).
+- **Background pass** (`POST /api/import/<id>/resolve`, also started by the import unless `resolve` is false): one
+  thread per playlist, rows in order, matches.json first (a manual fix or a row the player matched costs no request),
+  every YouTube Music request through `importer.throttle` (≥ 300 ms apart, shared by all runs). Found → the placeholder
+  is swapped **by id** (`playlists.replace_entries`, so moves/removals meanwhile are safe) and remembered in
+  matches.json; nothing → `miss: true` (listed in status). A 429 pauses `max(60 s, Retry-After)` (≤ 15 min) and the run
+  carries on; 3 in a row stop it (`error`), as do 5 other failures in a row (a failed row is retried by the next run).
+  `retry_missing` clears the misses first. Deleting the playlist cancels the run. GET of the playlist and of the
+  status swap placeholders that already have a cached match (the player's lazy `/api/match` lookups) — no network.
+- **UI**: Kept now lists Reef playlists (`/api/playlists`, "N to match · M not found") with an **Import** chip; Server sheet →
+  **Import playlist** sub-sheet (file + optional name → "Imported …: N songs, M to match" + Open playlist). Page
+  `#local/<id>` (Play / Shuffle / Keep all, rows; placeholders dimmed with the app icon, "Not matched yet" / "Not
+  found", no + and only Play next / Add to queue in ⋯), a status line polled every 2 s while matching ("Matching
+  songs… 7 of 10", "Match N more", "Try missing again") that reloads the rows as they match. Placeholders play
+  through match-core as before; `artUrl` gives `pq:` ids the app icon (the mini player asked `/api/art/pq:…` → 404).
+- **Resumable generic keeps** (`downloader._fetch`): downloads to `<raw>.part`; a retry (2/4/8 s backoff, three
+  retries, as before — but an attempt that got ≥ 256 KiB costs no retry and resets the backoff; 50 attempts at most)
+  sends `Range: bytes=<size>-` and appends on a matching 206 (`Content-Range` start = size, same total),
+  starts over on a 200, on a 206 for other bytes or another total, and on a 416 unless the file is already whole; a
+  body shorter than its Content-Length counts as a drop. Before each attempt a URL whose `expire` is < 60 s away (or,
+  without one, whose streamer cache TTL ran out) is re-resolved (`streamer.resolve` re-extracts by itself then).
+  Test hook `REEF_FAKE_DROP=<bytes>`: the first attempt of each generic fetch drops after that many bytes.
+- **iTunes suggestions** (`itunes.py`): `/api/suggest` asks `itunes.apple.com/search?term=&media=music&entity=song,
+  musicArtist&limit=10` when YouTube Music is off or its call raised (an empty YT Music answer stays empty). Songs →
+  "Artist - Song", artists → name (music videos and collections skipped), deduped case/space-insensitively, ≤ 8;
+  3 s timeout; cached 10 min (ytmusic's `_TTLCache`); a failure answers [] and pauses iTunes 60 s.
+- **Backup**: new sections `aliases` (merge by channel id / name key, newer `at` wins) and `matches` (**manual
+  fixes only**; restore never touches automatic entries except one under a key a restored fix takes; merge: newer
+  `at` wins). Lyrics now carry v2 entries whole (provider, packed words, `lrclib`, `retry`, pins with `lrclib_id`),
+  timing offsets, offset-only entries (library tracks) and misses that carry an offset (as offset-only); plain misses
+  are still dropped. Lyrics merge: a pin beats a lookup, else newer `at`; an offset-only entry brings only its offset
+  (newer wins); an offset the winner lacks is carried over unless the winner is a pin. Playlists keep placeholders.
+  `SETTINGS_KEYS` += `yt_personalize`, `charts_country`, `itunes_suggestions` (never `yt_visitor_id`, tokens, URLs).
+  `dislikes` was already a section. Same `schemaVersion` 1: an older Reef ignores the new sections.
+
+### API shapes
+
+- `POST /api/import` multipart `file` (+ `name`, `resolve=0|1`) or JSON `{text, filename?, name?, resolve?}`: the CSV
+  ≤ 5 MB either way (413 above); the request body may be up to 20 MB (`importer.REQUEST_MAX`: JSON escaping of a
+  quoted, non-ASCII CSV grows it ~1.3x+; a 4.5 MB Exportify-style CSV is a 5.8 MB JSON body). Per-request
+  `max_content_length` (here and in `/api/restore`) needs **Flask ≥ 3.1**, now the floor in requirements.txt (the
+  phone's `update.sh` pip step upgrades it); the rest of the app keeps 4 MB → 201 `{playlist: summary, kind: csv|takeout, rows, skipped, to_match, status}`; 400 `{error}` (no
+  usable columns / rows). Playlist summaries gain `unmatched` (placeholders still to look up) and `not_found` (misses), each when > 0; playlists may carry `import`.
+- `POST /api/import/<id>/resolve {retry_missing?}` → 202 status; 404; 502 YouTube Music off.
+- `GET /api/import/<id>/status` → `{total, resolved, pending, missing: [{id, title, artist, album?}], running,
+  rate_limited, retry_at, error, failed, tracks, started_at, finished_at}`.
+- Backup `sections` += `aliases: [{id, match, name, at}]`, `matches: {key: {id, score, manual: true, at, track}}`.
+
+### Measured on the Mac (live, port 5311, scratch data)
+
+Exportify-style CSV of 10 songs (incl. "Bohemian Rhapsody - Remastered 2011", "Corazón Partío") → 10/10 matched in
+~7 s; a row "Qwzzlxtr Florbnag Vemp" → listed in `missing`. Takeout `Road Mix-videos.csv` (preamble + Video ID rows)
+→ "Road Mix", 3 tracks titled via YT Music. `/api/suggest?q=daft punk` with `ytmusic` off → 8 iTunes strings (0.59 s
+cold, 21 ms cached). Live Monochrome FLAC (40.6 MB) through `_fetch` with `REEF_FAKE_DROP=1500000`: the injected drop
+plus a real one (tracks.monochrome.st cut a plain GET at 11 MB) resumed, sha256 identical to a ranged reference
+copy; a server keep with the hook (drop at 2 MB) completed. Backup → change alias / undislike / offset / manual
+match → restore (replace) brought all four back. WebKit 390×844: Kept playlists, the import sheet, an imported page,
+"Match 3 more" → polling to "2 of 3 matched · 1 not found"; Play on an unmatched playlist resolved the placeholders
+through /api/match (playback itself hit YouTube's bot wall on this Mac's IP at the time — unrelated to this round).
+
+### To check on the phone
+
+1. Server → Import playlist with an Exportify CSV from iPhone Files; open it from Kept while it matches.
+2. Keep a Monochrome track over cellular; `logs/reef.log` shows `keep fetch have=… retrying` lines when it resumes.
+3. Turn YouTube Music off in Settings and type in search: suggestions still come (from iTunes).
 
 ## Production plan (2026-10-21)
 

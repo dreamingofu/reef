@@ -114,7 +114,7 @@ def keep_env(monkeypatch, tmp_path):
     monkeypatch.setattr(downloader.streamer, "resolve", lambda tid: {"url": "http://mc/" + tid, "ext": "flac"})
     env = {"yt_runs": yt_runs, "tmp": tmp_path, "file_seconds": 12}
 
-    def fake_fetch(job, entry, dest):
+    def fake_fetch(job, entry, dest, *a):
         _flac(dest, env["file_seconds"])
     monkeypatch.setattr(downloader, "_fetch", fake_fetch)
 
