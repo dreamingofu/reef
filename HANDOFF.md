@@ -797,6 +797,37 @@ Settings / Stats / Recap screens. Prerequisite: serve Reef over HTTPS with `tail
   hash pick, Range/206) and drops YouTube prefetches. Only when `REEF_HOST` is loopback (or `REEF_TEST_AUDIO_I_KNOW=1`);
   startup logs "TEST AUDIO MODE"; Now Playing's pill says "Test audio". Use it for all UI checks on the Mac.
 
+### UI remake step 2: Player core (2026-10-22, uncommitted on `dreamingofu/codebase-overview-and-risk`)
+
+- `player-core` (`PC` in `static/app.js`, node check `scratchpad/u2/player_core_check.js`): axis lock + the 24 px
+  left-edge exclusion, rubber band, velocity, swipe / pull-up / close decisions, settle curve, seek fraction, ring
+  offset, double-tap seek, neighbours, reorder / undo-remove, queue stats, marquee timing. `drag()` in app.js wires
+  pointer events to it (followed on `window` once pressed; a drag swallows its click).
+- **Mini player** (§3.1-3.2): 64 px card docked 4 px above the nav (28/12 corners, max 420), progress ring around
+  round art + equaliser while playing, title marquee, white play + tonal next. Swipe sideways (layer behind shows the
+  neighbour or "Nothing up next"), up/tap opens Now Playing, pull down pauses and hides it until something plays.
+- **Now Playing** (§4): background styles Ambient / Immersive / Tint / Pure black (pref `reef.npbg`; picker sheet with
+  live previews from ⋯ → Player background or the server sheet; the "Pure black" colours theme forces black), two
+  cross-fading art layers (static blur of the 64 px copy). Top bar ⌄ · NOW PLAYING / "Playing from …" (taps back to
+  that page; `fromRoute` saved in the session) · ⋯ (track menu: + Add to playlist…, Open on YouTube, Player
+  background). Art track prev | current | next: swipe to skip (30% / flick), double-tap halves ±5 s (+5 per tap),
+  blur-fill for non-square art, codec badge for FLAC. Like | Keep capsule (Like = `/api/likes`, long-press = add to
+  a Reef playlist); long-press title/artist copies "Artist – Title". Div seek bar (14→22 px, thumb, stop dot, bold
+  elapsed while scrubbing, arrow keys). Stretchy transport (skips fire 180 ms after the tap). Action row AirPlay
+  (only with `webkitShowPlaybackTargetPicker` + an available target) · Lyrics | Shuffle | Repeat | Queue | Sleep (minutes
+  left) · ⋯. The old bottom row, header YouTube link and share button are gone (both in ⋯ now).
+- **Up next** (§4.7, §7): the old queue sheet is now a pull-up inside Now Playing (peek "Up next · title"; drag/flick,
+  Queue button, ⌄, Escape, or pull the list down at its top). History dimmed above, current row on the tonal colour,
+  "Next from …", "Autoplay suggestions". Swipe left = Play next, right = Remove + Undo toast; handle drags to reorder
+  within its block. Header: Shuffle · Clear · Save as playlist (prompt for a name) · Autoplay switch.
+- Not done (later steps): mini→full morph / FLIP (§3.3), squiggly seek, long-press transport preview, separate
+  "Next in queue" section for Play-next items (needs a flag on queue entries), wide layout.
+- **Check on the iPhone** (WebKit headless can't tell): gesture feel vs Safari's back swipe (left 24 px) and the
+  Home Screen app; that the list pull-down at the top beats iOS's own scroll; swipe-to-skip / delayed skip while
+  *paused* still starts playback (relies on WebKit forwarding the tap to a ≤ 1 s timer); blur + two-layer cross-fade
+  cost on long sessions; locked-screen playback, mediaSession and the sleep timer unchanged; AirPlay button appears and
+  opens the picker; Safari-tab height (~550 px on a 375 × 667 phone) leaves a usable art size.
+
 ## Ideas / next steps
 
 - Check round 2 on the iPhone: Now Playing on the small screen, tile artwork, source chips, FLAC playback over cellular.

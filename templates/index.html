@@ -63,6 +63,9 @@
   <symbol id="i-fill" viewBox="0 0 24 24"><path d="M17.5 17.5 7 7m0 8V7h8"/></symbol>
   <symbol id="i-library" viewBox="0 0 24 24"><path d="M5 4.5v15M9.5 4.5v15M14 5.2l4.6 14.1"/></symbol>
   <symbol id="i-wifi-off" viewBox="0 0 24 24"><path d="M4.5 4.5l15 15M8.6 13.4a5 5 0 0 1 4.6-1.2M5.3 10.1a9.6 9.6 0 0 1 3.4-2M12 6.2c2.9 0 5.6 1.1 7.6 3.1M12 18.5h.01"/></symbol>
+  <symbol id="i-airplay" viewBox="0 0 24 24"><path d="M7 17.5H5.5a2 2 0 0 1-2-2v-9a2 2 0 0 1 2-2h13a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H17"/><path fill="currentColor" stroke-linejoin="round" d="m12 14.2 4.3 5.3H7.7z"/></symbol>
+  <symbol id="i-grip" viewBox="0 0 24 24"><path d="M5 9h14M5 15h14"/></symbol>
+  <symbol id="i-image" viewBox="0 0 24 24"><rect x="3.5" y="4.5" width="17" height="15" rx="2.5"/><circle cx="9" cy="10" r="1.8"/><path d="m4 17.5 5-4.6 3.4 3 3-2.6 4.6 4"/></symbol>
   <symbol id="i-logo" viewBox="0 0 32 32"><circle cx="16" cy="16" r="15" fill="url(#g-logo)" stroke="none"/><path d="M10.5 12v8M16 8.5v15M21.5 13v6" stroke="#fff" stroke-width="2.6" stroke-linecap="round" fill="none"/></symbol>
 </svg>
 
@@ -88,14 +91,20 @@
   <section class="view" id="view-detail" hidden></section>
 </main>
 
-<div class="mini cover-tint" id="mini" hidden>
-  <button class="mini-open" id="mini-open" aria-label="Open player">
-    <span class="mini-art"><img id="mini-art" alt=""></span>
-    <span class="mini-text"><span class="mini-t" id="mini-t"></span><span class="mini-s" id="mini-s"></span></span>
-  </button>
-  <button class="icon-btn" id="mini-play" aria-label="Play"><svg class="i fill"><use href="#i-play"/></svg></button>
-  <button class="icon-btn" id="mini-next" aria-label="Next"><svg class="i fill"><use href="#i-next"/></svg></button>
-  <span class="mini-progress"><i id="mini-bar"></i></span>
+<!-- mini player (UI_REMAKE_PLAN §3.1-3.2): a card over a peek layer that shows the neighbour while it's swiped -->
+<div class="mini-wrap" id="mini" hidden>
+  <div class="mini-peek" id="mini-peek" aria-hidden="true"></div>
+  <div class="mini cover-tint" id="mini-card">
+    <button class="mini-open" id="mini-open" aria-label="Open player">
+      <span class="mini-ring">
+        <svg class="ring" viewBox="0 0 52 52" aria-hidden="true"><circle class="ring-bg" cx="26" cy="26" r="24.75"/><circle class="ring-fg" id="mini-ring" cx="26" cy="26" r="24.75"/></svg>
+        <span class="mini-art"><img id="mini-art" alt=""><span class="mini-eq" aria-hidden="true"><i></i><i></i><i></i></span></span>
+      </span>
+      <span class="mini-text"><span class="mini-t mq" id="mini-t"></span><span class="mini-s" id="mini-s"></span></span>
+    </button>
+    <button class="mini-btn mini-play" id="mini-play" aria-label="Play"><svg class="i fill"><use href="#i-play"/></svg></button>
+    <button class="mini-btn mini-next" id="mini-next" aria-label="Next"><svg class="i fill"><use href="#i-next"/></svg></button>
+  </div>
 </div>
 
 <div class="dock" id="dock">
@@ -116,42 +125,78 @@
 </form>
 
 <section class="np cover-tint" id="np" aria-hidden="true" aria-label="Now playing">
-  <div class="np-bg"><img id="np-bg" alt=""></div>
+  <!-- background styles (§4.1): two cross-fading layers of the art (a static blur of the 64 px copy + the big art) -->
+  <div class="npbg" id="npbg" data-bg="ambient" aria-hidden="true">
+    <div class="npbg-layer on"><img class="npbg-blur" alt=""><img class="npbg-big" alt=""></div>
+    <div class="npbg-layer"><img class="npbg-blur" alt=""><img class="npbg-big" alt=""></div>
+  </div>
   <div class="np-inner">
     <header class="np-top" id="np-grab">
       <button class="icon-btn" id="np-close" aria-label="Close player"><svg class="i"><use href="#i-chev-down"/></svg></button>
-      <div class="np-eyebrow"><span>Now playing</span><strong id="np-from"></strong></div>
-      <a class="icon-btn" id="np-yt" target="_blank" rel="noopener" aria-label="Open on YouTube"><svg class="i"><use href="#i-external"/></svg></a>
+      <button class="np-eyebrow" id="np-from-btn"><span>Now playing</span><strong id="np-from"></strong></button>
+      <button class="icon-btn" id="np-more" aria-label="More for this song"><svg class="i"><use href="#i-more"/></svg></button>
     </header>
-    <div class="np-art-wrap"><img class="np-art" id="np-art" alt=""></div>
+    <div class="np-art-wrap" id="np-art-wrap">
+      <div class="np-art-track" id="np-art-track">
+        <div class="np-slot prev"><div class="np-art-box"><img alt="" data-slot="prev"></div></div>
+        <div class="np-slot cur">
+          <div class="np-art-box" id="np-art-box">
+            <img class="np-art-fill" id="np-art-fill" alt="">
+            <img class="np-art" id="np-art" alt="">
+            <span class="np-qbadge" id="np-qbadge" hidden></span>
+          </div>
+        </div>
+        <div class="np-slot next"><div class="np-art-box"><img alt="" data-slot="next"></div></div>
+      </div>
+      <span class="np-tapseek" id="np-tapseek" aria-hidden="true"></span>
+    </div>
     <div class="np-lyrics-wrap">
       <div class="np-lyrics" id="np-lyrics" role="region" aria-label="Lyrics"></div>
       <button class="lyr-more" id="lyr-more" aria-label="Lyrics timing and source" aria-expanded="false" aria-controls="lyr-pop"><svg class="i"><use href="#i-more"/></svg></button>
       <div class="lyr-pop" id="lyr-pop" role="group" aria-label="Lyrics options" hidden></div>
     </div>
     <div class="np-title-row">
-      <div class="np-titles"><h2 id="np-t"></h2><button class="np-s" id="np-s"></button></div>
-      <button class="icon-btn" id="np-share" aria-label="Share"><svg class="i"><use href="#i-share"/></svg></button>
-      <button class="keep none lg" id="np-keep" data-keep="" aria-label="Keep in library"><svg class="i"><use href="#i-plus"/></svg></button>
+      <div class="np-titles"><h2 class="mq" id="np-t"></h2><button class="np-s" id="np-s"></button></div>
+      <div class="np-cap">
+        <button class="cap-btn like-cap" id="np-like" aria-pressed="false" aria-label="Like"><svg class="i"><use href="#i-heart"/></svg></button>
+        <button class="cap-btn keep-cap none" id="np-keep" data-keep="" aria-label="Keep in library"><svg class="i"><use href="#i-plus"/></svg></button>
+      </div>
     </div>
-    <div class="np-progress">
-      <input type="range" id="np-seek" min="0" max="1000" value="0" step="1" aria-label="Seek">
-      <div class="np-times"><span id="np-cur">0:00</span><span class="qpill" id="np-src">YouTube · AAC</span><span id="np-rem">-0:00</span></div>
+    <div class="seek" id="np-seek" role="slider" tabindex="0" aria-label="Seek" aria-valuemin="0" aria-valuemax="0" aria-valuenow="0" aria-valuetext="0:00">
+      <span class="seek-played"></span><span class="seek-thumb"></span><span class="seek-rest"><i class="seek-stop"></i></span>
     </div>
-    <div class="np-controls">
-      <button class="icon-btn mode" id="np-shuffle" aria-label="Shuffle"><svg class="i"><use href="#i-shuffle"/></svg></button>
-      <button class="icon-btn xl" id="np-prev" aria-label="Previous"><svg class="i fill"><use href="#i-prev"/></svg></button>
-      <button class="icon-btn xxl" id="np-play" aria-label="Play"><svg class="i fill"><use href="#i-play"/></svg></button>
-      <button class="icon-btn xl" id="np-next" aria-label="Next"><svg class="i fill"><use href="#i-next"/></svg></button>
-      <button class="icon-btn mode" id="np-repeat" aria-label="Repeat"><svg class="i"><use href="#i-repeat"/></svg><b>1</b></button>
+    <div class="np-times"><span id="np-cur">0:00</span><span class="qpill" id="np-src">YouTube · AAC</span><span id="np-rem">-0:00</span></div>
+    <div class="np-transport" id="np-transport">
+      <button class="tp tp-side" id="np-prev" aria-label="Previous"><svg class="i fill"><use href="#i-prev"/></svg></button>
+      <button class="tp tp-play" id="np-play" aria-label="Play"><svg class="i fill"><use href="#i-play"/></svg></button>
+      <button class="tp tp-side" id="np-next" aria-label="Next"><svg class="i fill"><use href="#i-next"/></svg></button>
     </div>
-    <div class="np-device"><svg class="i"><use href="#i-device"/></svg><span>This device</span></div>
-    <div class="np-bottom">
-      <button class="round glass" id="np-lyr" aria-pressed="false" aria-label="Lyrics"><svg class="i"><use href="#i-lyrics"/></svg></button>
-      <button class="round glass" id="np-keep2" data-keep="" aria-label="Keep in library"><svg class="i"><use href="#i-plus"/></svg></button>
-      <button class="round glass" id="np-queue" aria-label="Up next"><svg class="i"><use href="#i-queue"/></svg></button>
-      <button class="round glass" id="np-sleep" aria-label="Sleep timer"><svg class="i"><use href="#i-moon"/></svg><span class="badge" id="np-sleep-badge" hidden></span></button>
-      <a class="round glass" href="#library" id="np-dl" aria-label="Downloads in Library"><svg class="i"><use href="#i-download"/></svg></a>
+    <div class="np-actions">
+      <button class="np-round" id="np-airplay" aria-label="AirPlay" hidden><svg class="i"><use href="#i-airplay"/></svg></button>
+      <div class="np-toggles">
+        <button class="tg" id="np-lyr" aria-pressed="false" aria-label="Lyrics"><svg class="i"><use href="#i-lyrics"/></svg></button>
+        <button class="tg" id="np-shuffle" aria-pressed="false" aria-label="Shuffle"><svg class="i"><use href="#i-shuffle"/></svg></button>
+        <button class="tg" id="np-repeat" aria-pressed="false" aria-label="Repeat"><svg class="i"><use href="#i-repeat"/></svg><b>1</b></button>
+        <button class="tg" id="np-queue" aria-label="Up next"><svg class="i"><use href="#i-queue"/></svg></button>
+        <button class="tg" id="np-sleep" aria-pressed="false" aria-label="Sleep timer"><svg class="i"><use href="#i-moon"/></svg><span class="tg-num" id="np-sleep-badge" hidden></span></button>
+      </div>
+      <button class="np-round" id="np-more2" aria-label="More for this song"><svg class="i"><use href="#i-more"/></svg></button>
+    </div>
+    <div class="np-peek-space" aria-hidden="true"></div>
+  </div>
+  <!-- Up next (§4.7, §7): rests as the 60 px peek strip at the bottom, pulls up over the player -->
+  <div class="qsheet" id="qsheet" role="dialog" aria-label="Up next">
+    <button class="qs-peek" id="qs-peek" aria-label="Show up next"><span class="grabber"></span><span class="qs-peek-t" id="qs-peek-t"></span></button>
+    <div class="qs-full" id="qs-full">
+      <div class="qs-top" id="qs-grab">
+        <div class="grabber"></div>
+        <div class="qs-head">
+          <div class="qs-titles"><h3>Up next</h3><p class="qs-from" id="qs-from"></p><p class="qs-stats num" id="qs-stats"></p></div>
+          <button class="icon-btn" id="qs-close" aria-label="Close up next"><svg class="i"><use href="#i-chev-down"/></svg></button>
+        </div>
+        <div class="qs-btns" id="q-modes"></div>
+      </div>
+      <div class="qs-body" id="q-body"></div>
     </div>
   </div>
 </section>
@@ -227,14 +272,13 @@
   </div>
 </div>
 
-<div class="sheet-wrap" id="queue-sheet" hidden>
+<div class="sheet-wrap" id="bg-sheet" hidden>
   <div class="scrim" data-close></div>
-  <div class="sheet tall" role="dialog" aria-label="Up next">
-    <div class="sheet-top">
-      <div class="grabber"></div>
-      <div class="head-row q-head"><h3>Up next</h3><div class="q-modes" id="q-modes"></div></div>
-    </div>
-    <div class="q-body" id="q-body"></div>
+  <div class="sheet" role="dialog" aria-label="Player background">
+    <div class="sheet-top"><div class="grabber"></div><h3>Player background</h3></div>
+    <div class="bg-grid" id="bg-grid" role="radiogroup" aria-label="Player background"></div>
+    <p class="st-note" id="bg-note"></p>
+    <button class="btn-wide" data-close>Done</button>
   </div>
 </div>
 

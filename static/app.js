@@ -41,6 +41,7 @@
     queue: [],
     index: -1,
     from: "",
+    fromRoute: "", // where "Playing from …" leads: the hash of the page / view the queue came from ("" = nowhere)
     shuffle: false,
     original: null, // play order before shuffling (snapshot restored when shuffle goes off)
     repeat: "off",
@@ -637,6 +638,7 @@
     // A bounded {id: palette} cache: `id` moves to the end (newest); the oldest go past `max`. Returns a new object.
     function remember(cache, id, p, max = 150) {
       const out = {};
+      if (!(max > 0)) return out; // nothing may be kept, not even the new one
       const keys = Object.keys(cache && typeof cache === "object" ? cache : {}).filter((k) => k !== id);
       for (const k of keys.slice(Math.max(0, keys.length - (max - 1)))) out[k] = cache[k];
       out[id] = p;
@@ -646,6 +648,150 @@
     return { DEFAULT, BLACK, MIN_CONTRAST, rgbToHsl, hslToRgb, hex, fromHex, luminance, contrast, buckets, derive, vars, remember };
   })();
   // ==== palette-core:end ====
+
+  // ---------- player core ----------
+  // Gesture, geometry and timing maths for the mini player, Now Playing and the Up next sheet (UI_REMAKE_PLAN §3.2,
+  // §4.3-4.7, §7): pure functions, no DOM, no state. Unit-checked from node by slicing between these sentinels.
+  // ==== player-core:start ====
+  const PC = (() => {
+    const EDGE = 24; // px: a horizontal drag starting this close to the left edge is Safari's back swipe (§0)
+    const SLOP = 10; // px a pointer moves before a drag picks its axis
+    const BGS = ["ambient", "immersive", "tint", "black"]; // Now Playing background styles (§4.1)
+    const clamp = (x, a, b) => Math.min(b, Math.max(a, x));
+    const sign = (x) => (x > 0 ? 1 : x < 0 ? -1 : 0);
+    // The axis a drag follows once it has moved `slop` px: "x", "y", null (not yet) or "none" (not ours: a
+    // horizontal drag from the left edge zone, or an axis the surface doesn't take).
+    function axisOf(dx, dy, { slop = SLOP, x0 = Infinity, edge = EDGE, allowX = true, allowY = true } = {}) {
+      if (Math.hypot(dx, dy) < slop) return null;
+      if (Math.abs(dx) > Math.abs(dy)) return allowX && x0 >= edge ? "x" : "none";
+      return allowY ? "y" : "none";
+    }
+    // Rubber band: the first `free` px of a drag move at most `cap` px, then 1:1 (mini player 100 -> 30, rows 60 -> 20).
+    function rubber(d, free = 100, cap = 30) {
+      const a = Math.abs(d);
+      return sign(d) * (a <= free ? a * (cap / free) : cap + (a - free));
+    }
+    // A drag towards nothing (no neighbour) moves `k` of the finger's distance.
+    const resist = (d, k = 0.3) => d * k;
+    // px/s from pointer samples [{t (ms), x, y}], measured over the last `win` ms before the newest one.
+    function velocity(samples, win = 100) {
+      const n = samples ? samples.length : 0;
+      if (n < 2) return { vx: 0, vy: 0 };
+      const last = samples[n - 1];
+      let first = samples[n - 2];
+      for (let i = n - 2; i >= 0 && last.t - samples[i].t <= win; i--) first = samples[i];
+      const dt = (last.t - first.t) / 1000;
+      return dt > 0 ? { vx: (last.x - first.x) / dt, vy: (last.y - first.y) / dt } : { vx: 0, vy: 0 };
+    }
+    // Release of a horizontal swipe: the direction it commits to (-1 left, 1 right) or 0 (spring back). Past `frac` of
+    // `width`, or a flick of `vmin` px/s in the direction it was dragged.
+    function swipeCommit(dx, vx, width, { frac = 1 / 3, vmin = 1000, minDx = 8 } = {}) {
+      if (width > 0 && Math.abs(dx) >= frac * width) return sign(dx);
+      if (Math.abs(vx) >= vmin && sign(vx) === sign(dx) && Math.abs(dx) >= minDx) return sign(vx);
+      return 0;
+    }
+    // Release of a vertical drag on the mini player: "open" (swiped up), "dismiss" (pulled down > 32 px or 800 px/s), null.
+    function miniVertical(dy, vy, { up = 24, vUp = 500, down = 32, vDown = 800 } = {}) {
+      if (dy <= -up || (vy <= -vUp && dy < 0)) return "open";
+      if (dy >= down || (vy >= vDown && dy > 0)) return "dismiss";
+      return null;
+    }
+    // Now Playing pulled down by its top bar or the art: close past `dist` px, or on a downward flick.
+    const npClose = (dy, vy, { dist = 110, vmin = 800 } = {}) => dy >= dist || (vy >= vmin && dy > 16);
+    // The Up next pull-up's drag threshold: clamp(5% of the height, 14, 56) px.
+    const pullThreshold = (h) => clamp(0.05 * h, 14, 56);
+    // Release of the Up next sheet. `open`: where the drag started; `dist`: px dragged (negative = up); `vy`: px/s; `h`:
+    // the player's height. A flick up (< -520 px/s) opens, a flick down (> 450 px/s) closes; else it opens once dragged
+    // up past the threshold, and closes once dragged down past max(threshold, a quarter of the height). -> open?
+    function pullSettle(open, dist, vy, h) {
+      if (vy < -520) return true;
+      if (vy > 450) return false;
+      return open ? !(dist > Math.max(pullThreshold(h), 0.25 * h)) : -dist > pullThreshold(h);
+    }
+    // Pull-up progress f (0 = peek, 1 = open) -> the player under it: opacity 1 - f/.4, art scale 1 - .1f, the
+    // sheet's top radius 28 -> 0.
+    function pullLook(f) {
+      f = clamp(Number(f) || 0, 0, 1);
+      return { fade: clamp(1 - f / 0.4, 0, 1), scale: 1 - 0.1 * f, radius: 28 * (1 - f) };
+    }
+    // A no-bounce settle (critically damped spring): progress 0..1 at `t` ms of a move that lasts `ms`.
+    function settle(t, ms = 380) {
+      if (!(t > 0)) return 0;
+      if (t >= ms) return 1;
+      const k = 7, x = (k * t) / ms;
+      return Math.min(1, (1 - (1 + x) * Math.exp(-x)) / (1 - (1 + k) * Math.exp(-k)));
+    }
+    // Seek bar: pointer x -> fraction of the bar [0, 1].
+    const seekFrac = (x, left, width) => (width > 0 ? clamp((x - left) / width, 0, 1) : 0);
+    // The progress ring's stroke-dashoffset at progress `p` for a circle of circumference `c` (c = empty, 0 = full).
+    const ringOffset = (p, c) => c * (1 - clamp(Number(p) || 0, 0, 1));
+    // Double-tap seek on the art (§4.3): a second tap on the same half within `double` ms seeks `step` s; each further
+    // tap there within `chain` ms of the last one adds `step`. `side`: -1 left half, 1 right half.
+    // -> {at, side, total (s so far in this run), seek (signed s to move now; 0 = nothing yet)}
+    function tapSeek(prev, now, side, { double = 350, chain = 1000, step = 5 } = {}) {
+      if (prev && prev.side === side) {
+        if (prev.total > 0 && now - prev.at <= chain) return { at: now, side, total: prev.total + step, seek: side * step };
+        if (!(prev.total > 0) && now - prev.at <= double) return { at: now, side, total: step, seek: side * step };
+      }
+      return { at: now, side, total: 0, seek: 0 };
+    }
+    // The current track's neighbours for swipes and peeks: queue indexes (-1 = none). Like Q.nextIndex, repeat-all
+    // wraps to the start; previous never wraps.
+    function neighbours(len, index, repeat = "off") {
+      if (!(len > 0) || !(index >= 0) || index >= len) return { prev: -1, next: -1 };
+      const next = index + 1 < len ? index + 1 : repeat === "all" && len > 1 ? 0 : -1;
+      return { prev: index > 0 ? index - 1 : -1, next };
+    }
+    // Move the entry at `from` to `to` (drag to reorder). -> {queue, index}: the current track stays current.
+    function moveTrack(queue, index, from, to) {
+      const n = queue.length;
+      if (!(from >= 0 && from < n && to >= 0 && to < n) || from === to) return { queue: queue.slice(), index };
+      const q = queue.slice();
+      const [t] = q.splice(from, 1);
+      q.splice(to, 0, t);
+      let i = index;
+      if (from === index) i = to;
+      else if (from < index && to >= index) i = index - 1;
+      else if (from > index && to <= index) i = index + 1;
+      return { queue: q, index: i };
+    }
+    // Where a dragged row lands: `from` moved by `dy` px over rows `rowH` apart, kept inside [lo, hi].
+    const dropIndex = (from, dy, rowH, lo, hi) => (rowH > 0 ? clamp(from + Math.round(dy / rowH), lo, hi) : from);
+    // Undo a removal: put `track` back where it was relative to the current track. `rel` = its old index minus the old
+    // current index (> 0 upcoming, < 0 history). Nothing happens when it's in the queue again. -> {queue, index}
+    function reinsert(queue, index, track, rel) {
+      if (!track || !track.id || queue.some((t) => t && t.id === track.id) || !rel) return { queue: queue.slice(), index };
+      const q = queue.slice();
+      const at = clamp(rel > 0 ? index + rel : index + rel + 1, 0, q.length);
+      q.splice(at, 0, track);
+      return { queue: q, index: at <= index ? index + 1 : index };
+    }
+    // The queue header's numbers: how many songs, and their known length in seconds.
+    function queueStats(queue) {
+      let secs = 0;
+      for (const t of queue || []) if (Number(t?.duration) > 0) secs += Number(t.duration);
+      return { count: (queue || []).length, seconds: Math.round(secs) };
+    }
+    const bgStyle = (v) => (BGS.includes(v) ? v : "ambient");
+    // Delayed moves (a skip after the squish, a swipe after its slide) act only on what was playing when they were
+    // asked for: `then` and `now` are {token (the play token), id (the current track's id)}. Any track change in
+    // between (another skip, a song ending, recovery moving on, a placeholder swap) drops the move.
+    const sameTrack = (then, now) => !!then && !!now && then.id != null && then.token === now.token && then.id === now.id;
+    // The queue index of the track `id` now (a target picked before the queue changed), or -1.
+    const indexOfId = (queue, id) => (id == null ? -1 : (queue || []).findIndex((t) => t && t.id === id));
+    // A title wider than its box scrolls as a seamless loop (the text twice, `gap` apart): wait `delay`, move one
+    // text-plus-gap at `speed` px/s. null = it fits.
+    function marquee(textW, boxW, { delay = 3000, speed = 30, gap = 40 } = {}) {
+      if (!(textW - boxW > 1)) return null;
+      const dist = Math.ceil(textW + gap);
+      const travel = Math.round((dist / speed) * 1000);
+      return { dist, delay, travel, total: delay + travel };
+    }
+    return { EDGE, SLOP, BGS, clamp, axisOf, rubber, resist, velocity, swipeCommit, miniVertical, npClose, pullThreshold,
+      pullSettle, pullLook, settle, seekFrac, ringOffset, tapSeek, neighbours, moveTrack, dropIndex, reinsert, queueStats,
+      bgStyle, marquee, sameTrack, indexOfId };
+  })();
+  // ==== player-core:end ====
 
   const navidromeUrl = (path) => `${location.protocol}//${location.hostname}:4533${path}`;
   const cur = () => state.queue[state.index];
@@ -678,12 +824,17 @@
   const keptIds = new Set();
   // Kept tracks Navidrome has scanned: track id -> Navidrome song id, from server lists (`nd_id`) and history.
   const ndIds = new Map();
+  // Liked track ids (/api/likes, and `liked` on every server list): Now Playing's Like button.
+  const likedIds = new Set();
   function noteKept(tracks) {
     for (const t of tracks || []) {
-      if (!t || !t.id || typeof t.kept !== "boolean") continue;
+      if (!t || !t.id) continue;
+      if (typeof t.liked === "boolean") { if (t.liked) likedIds.add(t.id); else likedIds.delete(t.id); }
+      if (typeof t.kept !== "boolean") continue;
       if (t.kept) keptIds.add(t.id); else keptIds.delete(t.id);
       if (t.kept && t.nd_id) ndIds.set(t.id, t.nd_id); else if (!t.kept) ndIds.delete(t.id);
     }
+    if (cur()) paintLike();
   }
   function keepState(id) {
     if (!id) return "none";
@@ -2012,6 +2163,7 @@
     }
     queueGen++;
     state.from = fromLabel(listName);
+    state.fromRoute = fromRoute(listName);
     prefetch([cur() && playId(cur())]);
     load();
   }
@@ -2019,6 +2171,12 @@
   // "Now playing from …": a pasted playlist and a browse page show their own name.
   const fromLabel = (listName) => (listName === "page" ? pageTitle()
     : listName === "results" && state.link?.kind === "playlist" ? state.link.title || "Playlist" : FROM[listName] || "");
+  // "Playing from search" / "Playing from Discovery" ("" when the queue has no source).
+  const playingFrom = () => (state.from ? `Playing from ${state.from.replace(/^From /, "")}` : "");
+  // The page a list lives on, for "Playing from …" in Now Playing and Up next (a tap goes back there).
+  const HOME_LISTS = ["quick", "on_repeat", "jump_back", "liked", "recent"];
+  const fromRoute = (listName) => (listName === "page" ? (state.view === "detail" ? location.hash : "")
+    : listName === "results" ? "#search" : listName === "history" ? "#library" : HOME_LISTS.includes(listName) ? "#home" : "");
 
   function rememberPlay(t) {
     store.set("plays", [slim(t), ...store.get("plays", []).filter((p) => p.id !== t.id)].slice(0, 12));
@@ -2317,6 +2475,7 @@
     const gen = ++queueGen;
     autoplay.used.add(t.id); // its radio is the queue now; autoplay continues from the last track
     state.from = "Radio";
+    state.fromRoute = "";
     if (state.shuffle) { state.shuffle = false; state.original = null; }
     if (cur()?.id !== t.id) {
       state.queue = [t]; state.index = 0;
@@ -2345,6 +2504,7 @@
       state.queue = [t]; state.index = 0; state.original = state.shuffle ? [t] : null;
       queueGen++;
       state.from = fromLabel(listName);
+      state.fromRoute = fromRoute(listName);
       load();
       return;
     }
@@ -2364,13 +2524,6 @@
     if (!(i >= 0 && i < state.queue.length) || i === state.index) return;
     state.index = i;
     load();
-  }
-
-  function removeFromQueue(i) {
-    if (i === state.index) return; // the sheet only offers upcoming tracks
-    const r = Q.removeAt(state.queue, state.index, i);
-    state.queue = r.queue; state.index = r.index;
-    queueChanged();
   }
 
   function clearUpcoming() {
@@ -2452,7 +2605,9 @@
     pal.theme = theme;
     store.set("theme", theme);
     applyPalette();
+    applyBg();
     if (!$("#status-sheet").hidden) renderStatus();
+    if (!$("#bg-sheet").hidden) renderBgPicker();
   }
   const themePicker = () => `<li class="st-theme"><span class="k">Player colours</span>
       <div class="seg" role="radiogroup" aria-label="Player colours">${Object.entries(THEMES).map(([k, label]) =>
@@ -2470,50 +2625,52 @@
   }
 
   let shownId = null; // the track the player last painted (cross-fade + palette only when it changes)
+  let miniGone = false; // the mini player was pulled down (§3.2): hidden until something plays again
   function updatePlayer() {
     const t = cur();
     const mini = $("#mini");
-    if (!t) { mini.hidden = true; document.body.classList.remove("has-mini"); shownId = null; applyPalette(null); return; }
-    mini.hidden = false;
-    document.body.classList.add("has-mini");
+    if (!t) { mini.hidden = true; document.body.classList.remove("has-mini"); shownId = null; applyPalette(null); paintUpNext(); return; }
+    mini.hidden = miniGone;
+    document.body.classList.toggle("has-mini", !miniGone);
     const changed = shownId !== t.id;
     shownId = t.id;
     $("#mini-art").src = artUrl(t.id, artSize(t.id, "mini"));
-    $("#mini-t").textContent = t.title;
     $("#mini-s").textContent = t.channel;
 
     const artImg = $("#np-art");
     if (artImg.dataset.id !== t.id) {
       artImg.dataset.id = t.id;
       artImg.dataset.fallback = artFallback(t.id);
+      $("#np-art-box").classList.remove("wide");
       artImg.src = artUrl(t.id, artSize(t.id, "big"));
-      $("#np-bg").src = artUrl(t.id, artSize(t.id, "bg"));
+      $("#np-art-fill").src = artUrl(t.id, artSize(t.id, "bg"));
+      setNpBg(t);
     }
     if (changed) {
       crossFade($("#mini-art"), $(".mini-text"), artImg, $(".np-titles"));
       applyPalette(t);
+      setMarquee($("#mini-t"), t.title, MQ_MINI);
+      setMarquee($("#np-t"), t.title, MQ_NP);
     }
-    $("#np-t").textContent = t.title;
     $("#np-s").textContent = t.channel;
     $("#np-s").disabled = !linkable(t).length; // tapping the artist opens their page
-    $("#np-from").textContent = state.from;
-    const yt = srcKey(t.id) === "yt";
-    $("#np-yt").style.visibility = yt ? "" : "hidden"; // keeps the header centered
-    if (yt) $("#np-yt").href = `https://www.youtube.com/watch?v=${encodeURIComponent(t.id)}`;
+    $("#np-from").textContent = playingFrom();
+    $("#np-from-btn").disabled = !state.fromRoute;
     const codec = codecLabel(t);
     const testAudio = !!state.health?.test_audio && srcKey(t.id) === "yt"; // REEF_TEST_AUDIO: a local file, not YouTube
     $("#np-src").textContent = testAudio ? "Test audio" : srcInfo(srcKey(t.id)).name + (codec ? ` · ${codec}` : "");
     $("#np-src").classList.toggle("test", testAudio);
+    // Quality badge on the art (§4.2): only when it says something (a lossless source, or a codec the server named).
+    const q = !testAudio && (t.codec || (srcKey(t.id) === "mc" ? codec : "")) ? codec : "";
+    $("#np-qbadge").textContent = q;
+    $("#np-qbadge").hidden = !q;
     $("#np-keep").dataset.keep = t.id;
-    $("#np-keep2").dataset.keep = t.id;
     const keepable = canKeep(t.id) || keepState(t.id) === "kept";
     $("#np-keep").hidden = !keepable;
-    $("#np-keep2").hidden = !keepable;
+    paintLike();
     refreshKeepButtons();
-    const s = keepState(t.id);
-    $("#np-keep2").classList.toggle("kept", s === "kept");
-    $("#np-keep2").classList.toggle("pending", s === "pending");
     updateModes();
+    paintUpNext();
   }
 
   function updatePlayState() {
@@ -2528,10 +2685,14 @@
   }
 
   function updateModes() {
-    $("#np-shuffle").classList.toggle("on", state.shuffle);
+    const sh = $("#np-shuffle");
+    sh.classList.toggle("on", state.shuffle);
+    sh.setAttribute("aria-pressed", String(state.shuffle));
     const r = $("#np-repeat");
     r.classList.toggle("on", state.repeat !== "off");
     r.classList.toggle("one", state.repeat === "one");
+    r.setAttribute("aria-pressed", String(state.repeat !== "off"));
+    r.setAttribute("aria-label", { off: "Repeat", all: "Repeat all", one: "Repeat one" }[state.repeat] || "Repeat");
     // "End of track" sleep needs `ended` to fire, which a looping element never does.
     audio.loop = state.repeat === "one" && sleep.mode !== "end";
     renderQueueModes();
@@ -2557,20 +2718,24 @@
     for (const id of ["#mini-play", "#np-play"]) $(id).setAttribute("aria-busy", on ? "true" : "false");
   }
 
-  let seeking = false;
+  let seeking = false; // the seek bar is being dragged: timeupdate leaves it alone
   function duration() {
     return isFinite(audio.duration) && audio.duration > 0 ? audio.duration : (cur()?.duration || 0);
   }
+  const RING_C = 2 * Math.PI * 24.75; // the mini player's progress ring (r = 24.75 in a 52 px box, §3.1)
+  const ringEl = $("#mini-ring"), seekEl = $("#np-seek"), curEl = $("#np-cur"), remEl = $("#np-rem");
   function setProgress(t, d) {
-    const p = d ? Math.min(100, (t / d) * 100) : 0;
-    $("#mini-bar").style.width = p + "%";
-    if (!seeking) {
-      const seek = $("#np-seek");
-      seek.value = Math.round(p * 10);
-      seek.style.setProperty("--p", p + "%");
-      $("#np-cur").textContent = fmt(t);
-      $("#np-rem").textContent = "-" + fmt(Math.max(0, d - t));
-    }
+    const f = d ? Math.min(1, Math.max(0, t / d)) : 0;
+    ringEl.style.strokeDashoffset = PC.ringOffset(f, RING_C);
+    if (!seeking) paintSeek(f, t, d);
+  }
+  function paintSeek(f, t, d) {
+    seekEl.style.setProperty("--p", f);
+    curEl.textContent = fmt(t);
+    remEl.textContent = "-" + fmt(Math.max(0, d - t));
+    seekEl.setAttribute("aria-valuemax", String(Math.round(d)));
+    seekEl.setAttribute("aria-valuenow", String(Math.round(t)));
+    seekEl.setAttribute("aria-valuetext", `${fmt(t)} of ${fmt(d)}`);
   }
 
   // ---------- listen log ----------
@@ -2640,7 +2805,7 @@
     posSavedAt = Date.now();
     store.set("session", {
       v: 1, rev: ++sessionRev,
-      queue: state.queue.map(qslim), index: state.index, from: state.from,
+      queue: state.queue.map(qslim), index: state.index, from: state.from, fromRoute: state.fromRoute,
       shuffle: state.shuffle, original: state.shuffle && state.original ? state.original.map(qslim) : null,
       repeat: state.repeat, position: Math.round(position * 10) / 10, savedAt: Date.now(),
     });
@@ -2656,6 +2821,7 @@
     state.queue = s.queue.map(qslim);
     state.index = index;
     state.from = typeof s.from === "string" ? s.from : "";
+    state.fromRoute = typeof s.fromRoute === "string" && /^#[^\s]{1,300}$/.test(s.fromRoute) ? s.fromRoute : "";
     state.repeat = ["off", "all", "one"].includes(s.repeat) ? s.repeat : "off";
     state.shuffle = !!s.shuffle;
     state.original = state.shuffle && Array.isArray(s.original) ? s.original.filter(validTrack).map(qslim) : null;
@@ -2734,10 +2900,12 @@
   function renderSleepBadge() {
     const b = $("#np-sleep"), badge = $("#np-sleep-badge");
     b.classList.toggle("on", sleep.mode !== "off");
-    const txt = sleep.mode === "time" ? String(sleepLeft()) : "";
+    b.setAttribute("aria-pressed", String(sleep.mode !== "off"));
+    const txt = sleep.mode === "time" ? `${sleepLeft()}m` : ""; // the remaining minutes replace the moon (§4.6)
     if (badge.textContent !== txt) badge.textContent = txt;
     badge.hidden = !txt;
-    b.setAttribute("aria-label", sleep.mode === "time" ? `Sleep timer: ${txt} min left`
+    b.classList.toggle("has-num", !!txt);
+    b.setAttribute("aria-label", sleep.mode === "time" ? `Sleep timer: ${sleepLeft()} min left`
       : sleep.mode === "end" ? "Sleep timer: end of track" : "Sleep timer");
     if (!$("#sleep-sheet").hidden) renderSleep();
   }
@@ -2999,7 +3167,11 @@
   });
   audio.addEventListener("loadedmetadata", () => { applySeek(); setProgress(playPos(), duration()); });
   audio.addEventListener("canplay", () => { applySeek(); if (audio.paused) setLoading(false); });
-  audio.addEventListener("play", () => { rec.want = true; updatePlayState(); });
+  audio.addEventListener("play", () => {
+    rec.want = true;
+    updatePlayState();
+    if (miniGone) { miniGone = false; updatePlayer(); } // pulled away earlier: playing brings it back
+  });
   audio.addEventListener("pause", () => { rec.want = false; updatePlayState(); if (cur()) saveSession(); });
   audio.addEventListener("ended", () => {
     updatePlayState();
@@ -3037,22 +3209,6 @@
     if (lis) reportListen(false);
   });
 
-  const seek = $("#np-seek");
-  seek.addEventListener("input", () => {
-    seeking = true;
-    const p = seek.value / 10;
-    seek.style.setProperty("--p", p + "%");
-    const d = duration();
-    $("#np-cur").textContent = fmt((p / 100) * d);
-    $("#np-rem").textContent = "-" + fmt(d - (p / 100) * d);
-  });
-  seek.addEventListener("change", () => {
-    const d = duration();
-    seeking = false;
-    if (!d) return;
-    seekTo((seek.value / 1000) * d);
-  });
-
   if ("mediaSession" in navigator) {
     const ms = navigator.mediaSession;
     const set = (a, f) => { try { ms.setActionHandler(a, f); } catch { /* unsupported action */ } };
@@ -3066,40 +3222,540 @@
   }
 
   // ---------- now playing sheet ----------
+  const npEl = $("#np");
   function openNP() {
     if (!cur()) return;
-    const np = $("#np");
-    np.classList.add("open");
-    np.setAttribute("aria-hidden", "false");
+    npEl.classList.add("open");
+    npEl.setAttribute("aria-hidden", "false");
     syncLock();
+    paintUpNext(); // the neighbours' art loads only while the player is open
+    fitMarquee($("#np-t"));
     if (lyr.on) showLyrics();
   }
   function closeNP() {
-    const np = $("#np");
-    np.classList.remove("open");
-    np.style.transform = "";
-    np.setAttribute("aria-hidden", "true");
+    closeQ(true);
+    npEl.classList.remove("open", "dragging");
+    npEl.style.transform = "";
+    npEl.setAttribute("aria-hidden", "true");
     syncLock();
   }
   // Page scroll stays locked while the player or any sheet is up.
   const syncLock = () => document.documentElement.classList.toggle("lock", npOpen() || $$(".sheet-wrap.open").length > 0);
 
-  (function swipeToClose() {
-    const np = $("#np");
-    let y0 = null, dy = 0;
-    for (const zone of [$("#np-grab"), $(".np-art-wrap")]) {
-      zone.addEventListener("touchstart", (e) => { y0 = e.touches[0].clientY; dy = 0; np.style.transition = "none"; }, { passive: true });
-      zone.addEventListener("touchmove", (e) => {
-        if (y0 == null) return;
-        dy = Math.max(0, e.touches[0].clientY - y0);
-        np.style.transform = `translateY(${dy}px)`;
-      }, { passive: true });
-      zone.addEventListener("touchend", () => {
-        np.style.transition = "";
-        if (dy > 110) closeNP(); else np.style.transform = "";
-        y0 = null;
-      });
+  // ---------- gestures (§0: pointer events, touch-action none on the surface, the 24 px left edge left to Safari) ----------
+  const reducedMotion = () => !!window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
+  // A drag swallows the click the browser may still send after it (on `el`, or on an ancestor when the pointer was
+  // released elsewhere; without `el`, any click in the next 400 ms).
+  function swallowClick(el = null) {
+    const stop = (e) => {
+      if (el && !(el.contains(e.target) || e.target.contains?.(el))) return;
+      e.stopPropagation();
+      e.preventDefault();
+    };
+    window.addEventListener("click", stop, { capture: true, once: true });
+    setTimeout(() => window.removeEventListener("click", stop, { capture: true }), 400);
+  }
+  // Pointer drags on `el`. opts: x / y (false = that axis isn't this surface's), ignore(e) (pointerdowns to leave alone),
+  // onStart(g) once the axis is known, onMove(g), onEnd(g, cancelled), onTap(e, g) for a press that never moved.
+  // g = {x0, y0, dx, dy, vx, vy, axis: "x" | "y", target}.
+  function drag(el, opts) {
+    let g = null;
+    const samples = [];
+    // Once pressed, the pointer is followed on the window: it may leave `el` (implicit capture holds for touch on iOS,
+    // but not for every mouse or pen), and the surface may move under it.
+    const move = (e) => {
+      if (!g || e.pointerId !== g.id) return;
+      g.dx = e.clientX - g.x0;
+      g.dy = e.clientY - g.y0;
+      samples.push({ t: e.timeStamp, x: e.clientX, y: e.clientY });
+      if (samples.length > 24) samples.shift();
+      if (g.axis == null) {
+        const axis = PC.axisOf(g.dx, g.dy, { x0: g.x0, allowX: opts.x !== false, allowY: opts.y !== false });
+        if (!axis) return;
+        g.axis = axis;
+        if (axis === "none") return;
+        try { el.setPointerCapture(e.pointerId); } catch { /* followed on the window anyway */ }
+        opts.onStart?.(g);
+      }
+      if (g.axis !== "none") opts.onMove?.(g);
+    };
+    const end = (e) => {
+      if (!g || e.pointerId !== g.id) return;
+      const done = g, cancelled = e.type === "pointercancel";
+      g = null;
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", end);
+      window.removeEventListener("pointercancel", end);
+      Object.assign(done, PC.velocity(samples));
+      if (done.axis && done.axis !== "none") { swallowClick(el); opts.onEnd?.(done, cancelled); }
+      else if (!done.axis && !cancelled) opts.onTap?.(e, done);
+    };
+    el.addEventListener("pointerdown", (e) => {
+      if (g || (e.pointerType === "mouse" && e.button !== 0) || opts.ignore?.(e)) return;
+      g = { id: e.pointerId, x0: e.clientX, y0: e.clientY, dx: 0, dy: 0, vx: 0, vy: 0, axis: null, target: e.target };
+      samples.length = 0;
+      samples.push({ t: e.timeStamp, x: e.clientX, y: e.clientY });
+      window.addEventListener("pointermove", move);
+      window.addEventListener("pointerup", end);
+      window.addEventListener("pointercancel", end);
+    });
+  }
+  // Long press (550 ms) -> fn, run inside the pointerup so it still counts as the user's gesture (clipboard).
+  function longPress(el, fn, ms = 550) {
+    let timer = 0, fired = false, x0 = 0, y0 = 0;
+    const clear = () => { clearTimeout(timer); el.classList.remove("held"); };
+    el.addEventListener("pointerdown", (e) => {
+      fired = false; x0 = e.clientX; y0 = e.clientY;
+      clearTimeout(timer);
+      timer = setTimeout(() => { fired = true; el.classList.add("held"); }, ms);
+    });
+    el.addEventListener("pointermove", (e) => { if (Math.hypot(e.clientX - x0, e.clientY - y0) > 10) clearTimeout(timer); });
+    el.addEventListener("pointerup", (e) => { clear(); if (fired) { fired = false; swallowClick(); fn(e); } });
+    el.addEventListener("pointercancel", () => { clear(); fired = false; });
+    el.addEventListener("contextmenu", (e) => e.preventDefault());
+  }
+  // Moves that fire after a short animation. A timer set inside a tap still counts as that tap on WebKit (<= 1 s).
+  const SKIP_DELAY = 180; // §4.5: the squish shows before the track changes
+  // What's playing now, for PC.sameTrack: a move asked for at a tap / swipe runs later only if this hasn't changed.
+  const playSnap = () => ({ token: rec.token, id: cur()?.id ?? null });
+  // Run `fn` after `ms` (now with reduced motion or ms = 0), unless the track changed meanwhile.
+  function later(ms, fn) {
+    const snap = playSnap();
+    const run = () => { if (PC.sameTrack(snap, playSnap())) fn(); };
+    if (ms > 0) setTimeout(run, ms); else run();
+  }
+  // Go to the neighbour a swipe picked: next() for the next one, else the previous track by its id (indexes go stale).
+  function goNeighbour(dir, targetId) {
+    if (dir < 0) { next(); return true; }
+    const i = PC.indexOfId(state.queue, targetId);
+    if (i < 0 || i === state.index) return false;
+    state.index = i;
+    load();
+    return true;
+  }
+
+  // Now Playing pulled down by its top bar (or the art, vertically): it follows the finger, then closes or settles.
+  const npPull = {
+    move(dy) { npEl.classList.add("dragging"); npEl.style.transform = `translate3d(0, ${Math.max(0, dy)}px, 0)`; },
+    end(g, cancelled) {
+      npEl.classList.remove("dragging");
+      if (!cancelled && PC.npClose(g.dy, g.vy)) closeNP(); else npEl.style.transform = "";
+    },
+  };
+  drag($("#np-grab"), { x: false, onMove: (g) => npPull.move(g.dy), onEnd: npPull.end });
+
+  // ---------- Now Playing art (§4.3): swipe to skip, double-tap seek ----------
+  // The art sits between its neighbours (±width); a swipe past 30% (or a flick) slides to one and plays it, else it
+  // springs back. With no neighbour that way it moves at 30% of the finger. Immersive moves its full-bleed art instead.
+  (function artGestures() {
+    const wrap = $("#np-art-wrap"), track = $("#np-art-track"), bubble = $("#np-tapseek");
+    let tap = null, busy = false;
+    const setX = (x, anim = "none") => {
+      track.style.transition = anim;
+      track.style.transform = x ? `translate3d(${x}px, 0, 0)` : "";
+      npEl.style.setProperty("--imm-t", anim);
+      npEl.style.setProperty("--imm-x", `${x}px`);
+    };
+    drag(wrap, {
+      onMove(g) {
+        if (g.axis === "y") { npPull.move(g.dy); return; }
+        if (busy) return;
+        const nb = PC.neighbours(state.queue.length, state.index, state.repeat);
+        setX((g.dx < 0 ? nb.next : nb.prev) >= 0 ? g.dx : PC.resist(g.dx));
+      },
+      onEnd(g, cancelled) {
+        if (g.axis === "y") { npPull.end(g, cancelled); return; }
+        if (busy) return;
+        const w = wrap.clientWidth;
+        const nb = PC.neighbours(state.queue.length, state.index, state.repeat);
+        const dir = cancelled ? 0 : PC.swipeCommit(g.dx, g.vx, w, { frac: 0.3, vmin: 800 });
+        const target = dir < 0 ? nb.next : dir > 0 ? nb.prev : -1;
+        if (target < 0) { setX(0, reducedMotion() ? "none" : "transform 340ms var(--ease-spring)"); return; }
+        busy = true;
+        const out = reducedMotion() ? 0 : 200;
+        const snap = playSnap(), targetId = state.queue[target]?.id;
+        setX(dir * w, out ? `transform ${out}ms var(--ease-out)` : "none");
+        setTimeout(() => {
+          // The track changed during the slide (it ended, another skip, recovery): drop the swipe, spring back.
+          if (!PC.sameTrack(snap, playSnap()) || !goNeighbour(dir, targetId)) {
+            setX(0, reducedMotion() ? "none" : "transform 340ms var(--ease-spring)");
+            busy = false;
+            return;
+          }
+          // The new art is the neighbour that just slid in (already loaded): drop the offset once it can paint.
+          let done = false;
+          const reset = () => { if (done) return; done = true; setX(0); busy = false; };
+          const img = $("#np-art");
+          if (img.decode) img.decode().then(reset, reset);
+          setTimeout(reset, 250);
+        }, out);
+      },
+      onTap(e) {
+        if (busy || !cur()) return;
+        const r = wrap.getBoundingClientRect();
+        const side = e.clientX < r.left + r.width / 2 ? -1 : 1;
+        tap = PC.tapSeek(tap, performance.now(), side);
+        if (!tap.seek) return;
+        const d = duration();
+        seekTo(PC.clamp(playPos() + tap.seek, 0, d ? Math.max(0, d - 0.5) : Infinity));
+        bubble.textContent = `${side > 0 ? "+" : "−"}${tap.total}s`;
+        bubble.dataset.side = side > 0 ? "r" : "l";
+        bubble.classList.remove("show");
+        void bubble.offsetWidth;
+        bubble.classList.add("show");
+      },
+    });
+    // Non-square YouTube art: fitted whole over a blurred copy of itself (§4.2 blur-fill).
+    $("#np-art").addEventListener("load", (e) => {
+      const img = e.target, w = img.naturalWidth, h = img.naturalHeight;
+      $("#np-art-box").classList.toggle("wide", h > 0 && Math.abs(w / h - 1) > 0.05);
+    });
+  })();
+
+  // ---------- neighbours + Up next peek ----------
+  // "Up next · <title>" on the peek strip, the art either side of the current one (only while the player is open:
+  // a closed player fetches nothing), and the mini player's peek layer when it's swiped.
+  function paintUpNext() {
+    const nb = PC.neighbours(state.queue.length, state.index, state.repeat);
+    const nx = cur() ? state.queue[nb.next] : null;
+    $("#qs-peek-t").innerHTML = nx ? `Up next · <b>${esc(nx.title)}</b>`
+      : autoplay.inflight && autoplay.on ? "Up next · finding similar songs…" : "Nothing up next";
+    $("#qs-peek").setAttribute("aria-label", nx ? `Up next: ${nx.title}. Show the queue` : "Show the queue");
+    if (!npOpen()) return;
+    for (const [slot, i] of [["prev", nb.prev], ["next", nb.next]]) {
+      const img = $(`#np-art-track img[data-slot="${slot}"]`);
+      const t = cur() ? state.queue[i] : null;
+      const src = t ? artUrl(t.id, artSize(t.id, "big")) : "";
+      if (img.dataset.src !== src) {
+        img.dataset.src = src;
+        if (t) { img.dataset.fallback = artFallback(t.id); img.src = src; } else img.removeAttribute("src");
+      }
+      img.closest(".np-slot").classList.toggle("empty", !t);
     }
+  }
+
+  // ---------- title marquee (§3.1, §4.2) ----------
+  // A title wider than its box scrolls as a seamless loop after a pause; the text stays put with reduced motion.
+  const MQ_MINI = { delay: 2500 }, MQ_NP = { delay: 3000 };
+  function setMarquee(el, text, opts) {
+    el.dataset.text = text;
+    el._mqOpts = opts;
+    el.setAttribute("aria-label", text);
+    el.innerHTML = `<span class="mq-in"><span class="mq-a">${esc(text)}</span></span>`;
+    el._mq?.cancel();
+    el._mq = null;
+    requestAnimationFrame(() => fitMarquee(el));
+  }
+  function fitMarquee(el) {
+    const inner = el.firstElementChild, a = inner?.firstElementChild;
+    if (!a) return;
+    el._mq?.cancel();
+    el._mq = null;
+    el.classList.remove("mq-on");
+    inner.querySelector(".mq-b")?.remove();
+    const m = reducedMotion() || !inner.animate ? null : PC.marquee(a.offsetWidth, el.clientWidth, el._mqOpts || {});
+    if (!m) return;
+    el.classList.add("mq-on");
+    inner.insertAdjacentHTML("beforeend", `<span class="mq-a mq-b" aria-hidden="true">${esc(el.dataset.text || "")}</span>`);
+    el._mq = inner.animate([
+      { transform: "translateX(0)", offset: 0 },
+      { transform: "translateX(0)", offset: m.delay / m.total },
+      { transform: `translateX(${-m.dist}px)`, offset: 1 },
+    ], { duration: m.total, iterations: Infinity, easing: "linear" });
+  }
+  let mqTimer = 0;
+  window.addEventListener("resize", () => {
+    clearTimeout(mqTimer);
+    mqTimer = setTimeout(() => { fitMarquee($("#mini-t")); fitMarquee($("#np-t")); }, 200);
+  });
+
+  // ---------- background styles (§4.1) ----------
+  // Ambient (default) / Immersive / Tint / Pure black, a UI pref ("reef.npbg"). Two layers hold the art (a static blur of
+  // the 64 px copy + the big art); a new track loads into the hidden one, which then cross-fades in (§0: no animated blur).
+  // The "Pure black" player colours (theme) show every style as black.
+  const BG_LABEL = { ambient: "Ambient", immersive: "Immersive", tint: "Tint", black: "Pure black" };
+  const npBg = { style: PC.bgStyle(store.get("npbg", "ambient")), front: 0, id: null, timer: 0 };
+  function applyBg() {
+    const eff = pal.theme === "black" ? "black" : npBg.style;
+    npEl.dataset.bg = eff;
+    $("#npbg").dataset.bg = eff;
+  }
+  function setNpBg(t) {
+    if (!t || npBg.id === t.id) return;
+    npBg.id = t.id;
+    const layers = $$("#npbg .npbg-layer");
+    const back = layers[1 - npBg.front];
+    const blur = $(".npbg-blur", back), big = $(".npbg-big", back), id = t.id;
+    let done = false;
+    const swap = () => {
+      if (done || npBg.id !== id) return;
+      done = true;
+      clearTimeout(npBg.timer);
+      layers[npBg.front].classList.remove("on");
+      back.classList.add("on");
+      npBg.front = 1 - npBg.front;
+    };
+    blur.onload = swap;
+    blur.onerror = swap;
+    big.dataset.fallback = artFallback(id);
+    blur.src = artUrl(id, artSize(id, "bg"));
+    big.src = artUrl(id, artSize(id, "big")); // the same URL as the art: one fetch
+    clearTimeout(npBg.timer);
+    npBg.timer = setTimeout(swap, 1200);
+    if (blur.complete && blur.naturalWidth) swap();
+  }
+  function setBgStyle(v) {
+    npBg.style = PC.bgStyle(v);
+    store.set("npbg", npBg.style);
+    applyBg();
+    renderBgPicker();
+    if (!$("#status-sheet").hidden) renderStatus();
+  }
+  // The picker previews each style with the song that's playing (the player behind the sheet changes live too).
+  function renderBgPicker() {
+    const t = cur();
+    const small = t ? artUrl(t.id, artSize(t.id, "bg")) : "", big = t ? artUrl(t.id, artSize(t.id, "big")) : "";
+    $("#bg-grid").innerHTML = PC.BGS.map((k) => `<button class="bgp${k === npBg.style ? " on" : ""}" role="radio" aria-checked="${k === npBg.style}" data-npbg="${k}">
+        <span class="bgp-view"><span class="npbg" data-bg="${k}"><span class="npbg-layer on">${t
+          ? `<img class="npbg-blur" src="${small}" alt=""><img class="npbg-big" src="${big}" alt="">` : ""}</span></span>
+          <span class="bgp-ui">${k === "immersive" ? "" : `<span class="bgp-art">${t ? `<img src="${big}" alt="">` : ""}</span>`}<i></i><i></i></span></span>
+        <span class="bgp-l">${BG_LABEL[k]}</span></button>`).join("");
+    $("#bg-note").textContent = pal.theme === "black"
+      ? "Player colours are set to Pure black (Server sheet), which shows every style as black."
+      : "Shown with the song that's playing. Saved on this device.";
+  }
+  function openBgPicker() { renderBgPicker(); openSheet("#bg-sheet"); }
+
+  // ---------- like + playlists ----------
+  function paintLike() {
+    const t = cur(), b = $("#np-like");
+    const on = !!t && likedIds.has(t.id);
+    b.classList.toggle("on", on);
+    b.setAttribute("aria-pressed", String(on));
+    b.setAttribute("aria-label", on ? "Liked" : "Like");
+    b.hidden = !t || M.isPlaceholder(t);
+    $(".np-cap").classList.toggle("solo", b.hidden || $("#np-keep").hidden);
+  }
+  async function loadLikes() {
+    try {
+      const list = await api("/api/likes");
+      if (!Array.isArray(list)) return;
+      likedIds.clear();
+      for (const t of list) if (t && t.id) likedIds.add(t.id);
+      paintLike();
+    } catch { /* the button stays as it was */ }
+  }
+  async function toggleLike(t = cur()) {
+    if (!t || M.isPlaceholder(t)) return;
+    const on = !likedIds.has(t.id);
+    if (on) likedIds.add(t.id); else likedIds.delete(t.id);
+    paintLike();
+    try {
+      if (on) {
+        await api(`/api/likes/${encodeURIComponent(t.id)}`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(slim(t)) });
+      } else {
+        await api(`/api/likes/${encodeURIComponent(t.id)}`, { method: "DELETE" });
+      }
+      toast(on ? "Added to Liked songs" : "Removed from Liked songs");
+    } catch (e) {
+      if (!on && e.status === 404) return; // it wasn't liked on the server either
+      if (on) likedIds.delete(t.id); else likedIds.add(t.id);
+      paintLike();
+      toast(`Couldn't save that: ${e.message}`);
+    }
+  }
+  // Long-press Like (or ⋯ → Add to playlist): pick one of Reef's playlists, or make a new one.
+  async function openPlaylistPicker(t) {
+    if (!t || M.isPlaceholder(t)) return;
+    actTarget = { t: slim(t), list: "player", picker: true };
+    renderActions();
+    openSheet("#act-sheet");
+    if (state.playlists === null) { await loadPlaylists(); if (actTarget?.picker) renderActions(); }
+  }
+  async function addToPlaylist(t, pid) {
+    const p = (state.playlists || []).find((x) => x.id === pid);
+    try {
+      const r = await api(`/api/playlists/${encodeURIComponent(pid)}/tracks`, {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ tracks: [slim(t)], dedupe: true }),
+      });
+      toast(r.added ? `Added to “${r.name || p?.name || "playlist"}”` : `Already in “${r.name || p?.name || "playlist"}”`);
+      loadPlaylists();
+    } catch (e) {
+      toast(`Couldn't add it: ${e.message}`);
+    }
+  }
+  async function newPlaylist(tracks, suggested = "") {
+    const name = (window.prompt("Playlist name", suggested) || "").trim();
+    if (!name) return;
+    try {
+      const p = await api("/api/playlists", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name, tracks }) });
+      toast(`Saved “${p.name}” · ${songs(p.tracks?.length ?? tracks.length)}`);
+      loadPlaylists();
+    } catch (e) {
+      toast(`Couldn't save it: ${e.message}`);
+    }
+  }
+  function saveQueueAsPlaylist() {
+    const tracks = state.queue.filter((t) => !M.isPlaceholder(t)).map(slim);
+    if (!tracks.length) { toast("Nothing to save yet"); return; }
+    newPlaylist(tracks, state.from && state.from !== "From search" ? state.from : "My queue");
+  }
+  // Long-press the title or artist: copy "Artist – Title" (§4.2).
+  async function copyTrackName() {
+    const t = cur();
+    if (!t) return;
+    const text = `${t.channel ? `${t.channel} – ` : ""}${t.title}`;
+    let ok = false;
+    if (navigator.clipboard && window.isSecureContext) { try { await navigator.clipboard.writeText(text); ok = true; } catch { ok = false; } }
+    if (!ok) ok = copyFallback(text);
+    toast(ok ? `Copied “${text}”` : "Couldn't copy");
+  }
+
+  // ---------- mini player gestures (§3.2) ----------
+  // Sideways: the first 100 px move at most 30 (then 1:1); past a third of the width or a 1000 px/s flick the card leaves
+  // and comes back with the next / previous song, which the layer behind it shows meanwhile ("Nothing up next" when
+  // there's none, and it springs back). Up (or a tap) opens Now Playing; pulled down > 32 px (or a flick) it pauses
+  // and goes away until something plays again.
+  (function miniGestures() {
+    const wrap = $("#mini"), card = $("#mini-card"), peek = $("#mini-peek");
+    let dirShown = 0;
+    function paintPeek(dir) {
+      dirShown = dir;
+      const nb = PC.neighbours(state.queue.length, state.index, state.repeat);
+      const t = state.queue[dir > 0 ? nb.next : nb.prev];
+      peek.dataset.dir = dir > 0 ? "next" : "prev";
+      peek.innerHTML = t ? `<span class="mp-art"><img src="${artUrl(t.id, artSize(t.id, "mini"))}" alt=""></span>
+        <span class="mp-text"><small>${dir > 0 ? "Up next" : "Previous"}</small><b>${esc(t.title)}</b></span>`
+        : `<span class="mp-text"><b>${dir > 0 ? "Nothing up next" : "Nothing before this"}</b></span>`;
+    }
+    const reset = (anim = true) => {
+      card.style.transition = anim && !reducedMotion() ? "" : "none";
+      card.style.transform = "";
+      card.style.opacity = "";
+      wrap.classList.remove("peeking");
+      dirShown = 0;
+    };
+    drag(card, {
+      onStart(g) { card.classList.add("dragging"); if (g.axis === "x") wrap.classList.add("peeking"); },
+      onMove(g) {
+        if (g.axis === "x") {
+          const dir = g.dx < 0 ? 1 : -1; // dragged left: the next song
+          if (dir !== dirShown) paintPeek(dir);
+          card.style.transform = `translate3d(${PC.rubber(g.dx)}px, 0, 0)`;
+        } else {
+          card.style.transform = `translate3d(0, ${g.dy < 0 ? PC.rubber(g.dy, 60, 20) : g.dy}px, 0)`;
+          card.style.opacity = g.dy > 0 ? String(1 - Math.min(0.6, g.dy / 160)) : "";
+        }
+      },
+      onEnd(g, cancelled) {
+        card.classList.remove("dragging");
+        if (g.axis === "y") {
+          const v = cancelled ? null : PC.miniVertical(g.dy, g.vy);
+          if (v === "dismiss") { dismissMini(); return; }
+          reset();
+          if (v === "open") openNP();
+          return;
+        }
+        const w = card.offsetWidth;
+        const dir = cancelled ? 0 : PC.swipeCommit(g.dx, g.vx, w, { frac: 1 / 3, vmin: 1000 });
+        const nb = PC.neighbours(state.queue.length, state.index, state.repeat);
+        const target = dir < 0 ? nb.next : dir > 0 ? nb.prev : -1;
+        if (target < 0) { reset(); return; }
+        const out = reducedMotion() ? 0 : 200;
+        const snap = playSnap(), targetId = state.queue[target]?.id;
+        card.style.transition = out ? `transform ${out}ms var(--ease-out), opacity ${out}ms` : "none";
+        card.style.transform = `translate3d(${dir * (w + 24)}px, 0, 0)`;
+        card.style.opacity = "0";
+        setTimeout(() => {
+          if (PC.sameTrack(snap, playSnap())) goNeighbour(dir, targetId); // else: the track changed meanwhile, just come back
+          // back in with the new song: from a little to the other side, fading in
+          card.style.transition = "none";
+          card.style.transform = reducedMotion() ? "" : `translate3d(${-dir * 36}px, 0, 0)`;
+          void card.offsetWidth;
+          reset();
+        }, out);
+      },
+    });
+    function dismissMini() {
+      const out = reducedMotion() ? 0 : 220;
+      card.style.transition = out ? `transform ${out}ms var(--ease-out), opacity ${out}ms` : "none";
+      card.style.transform = "translate3d(0, 90px, 0)";
+      card.style.opacity = "0";
+      audio.pause();
+      setTimeout(() => {
+        miniGone = true;
+        updatePlayer();
+        reset(false);
+        requestAnimationFrame(() => { card.style.transition = ""; });
+      }, out);
+    }
+  })();
+
+  // ---------- transport (§4.5) ----------
+  // Pressing a pill stretches it and squeezes the others (CSS, on data-press); prev/next act 180 ms after the tap.
+  (function transport() {
+    const row = $("#np-transport");
+    let t0 = 0, timer = 0;
+    row.addEventListener("pointerdown", (e) => {
+      const b = e.target.closest(".tp");
+      if (!b || reducedMotion()) return;
+      clearTimeout(timer);
+      t0 = performance.now();
+      row.dataset.press = b.id.slice(3); // play | prev | next
+    });
+    const up = () => {
+      if (!row.dataset.press) return;
+      clearTimeout(timer);
+      timer = setTimeout(() => { delete row.dataset.press; }, Math.max(0, SKIP_DELAY - (performance.now() - t0)) + 60);
+    };
+    for (const ev of ["pointerup", "pointercancel", "pointerleave"]) row.addEventListener(ev, up);
+  })();
+
+  // AirPlay (§0, §4.6): only where Safari offers the picker, and only while a target is around.
+  (function airplay() {
+    const b = $("#np-airplay");
+    if (typeof audio.webkitShowPlaybackTargetPicker !== "function") return;
+    b.hidden = false;
+    audio.addEventListener("webkitplaybacktargetavailabilitychanged", (e) => { b.hidden = e.availability !== "available"; });
+    audio.addEventListener("webkitcurrentplaybacktargetiswirelesschanged", () => b.classList.toggle("on", !!audio.webkitCurrentPlaybackTargetIsWireless));
+    b.addEventListener("click", () => { try { audio.webkitShowPlaybackTargetPicker(); } catch { /* no picker right now */ } });
+  })();
+
+  // ---------- seek bar (§4.4) ----------
+  // A div slider: press anywhere on it and drag; the times follow (elapsed in bold) and the seek happens on release.
+  (function seekBar() {
+    let id = null, f = 0;
+    const at = (e) => { const r = seekEl.getBoundingClientRect(); return PC.seekFrac(e.clientX, r.left, r.width); };
+    const show = () => { const d = duration(); paintSeek(f, f * d, d); };
+    const move = (e) => { if (e.pointerId === id) { f = at(e); show(); } };
+    const end = (e) => {
+      if (e.pointerId !== id) return;
+      id = null;
+      seeking = false;
+      seekEl.classList.remove("drag");
+      for (const [t, fn] of [["pointermove", move], ["pointerup", end], ["pointercancel", end]]) window.removeEventListener(t, fn);
+      const d = duration();
+      if (e.type === "pointerup" && d) seekTo(Math.min(f * d, Math.max(0, d - 0.25))); else setProgress(playPos(), d);
+    };
+    seekEl.addEventListener("pointerdown", (e) => {
+      if (id != null || !cur() || !duration() || (e.pointerType === "mouse" && e.button !== 0)) return;
+      id = e.pointerId;
+      seeking = true;
+      seekEl.classList.add("drag");
+      try { seekEl.setPointerCapture(id); } catch { /* followed on the window anyway */ }
+      for (const [t, fn] of [["pointermove", move], ["pointerup", end], ["pointercancel", end]]) window.addEventListener(t, fn);
+      f = at(e);
+      show();
+    });
+    seekEl.addEventListener("keydown", (e) => {
+      const d = duration();
+      if (!d || !cur()) return;
+      const step = { ArrowLeft: -5, ArrowDown: -5, ArrowRight: 5, ArrowUp: 5 }[e.key];
+      const to = step ? playPos() + step : e.key === "Home" ? 0 : e.key === "End" ? d - 1 : null;
+      if (to == null) return;
+      e.preventDefault();
+      seekTo(PC.clamp(to, 0, Math.max(0, d - 0.5)));
+    });
   })();
 
   // ---------- lyrics ----------
@@ -3227,6 +3883,7 @@
     store.set("lyricsOn", on);
     $("#np").classList.toggle("show-lyrics", on);
     $("#np-lyr").setAttribute("aria-pressed", String(on));
+    $("#np-lyr").classList.toggle("on", on);
     if (!on) showLyrTools(false);
     if (on) showLyrics();
   }
@@ -3428,7 +4085,9 @@
       ["Web player", navidromeUrl("/app"), ""],
     ];
     const n = state.blocked?.length;
-    $("#status-list").innerHTML = themePicker() + rows.map(([k, v, c]) => `<li><span class="k">${esc(k)}</span><span class="v ${c}">${esc(v)}</span></li>`).join("")
+    $("#status-list").innerHTML = themePicker()
+      + `<li class="st-link"><button data-open-bg><span class="k">Player background</span><span class="v">${esc(BG_LABEL[npBg.style])}${icon("chev-right")}</span></button></li>`
+      + rows.map(([k, v, c]) => `<li><span class="k">${esc(k)}</span><span class="v ${c}">${esc(v)}</span></li>`).join("")
       + stLink("sources", "Sources", sourcesSummary())
       + stLink("updates", "Updates", updatesSummary(), updateAvailable())
       + stLink("scrobble", "Scrobbling", scrobbleSummary())
@@ -3911,6 +4570,12 @@
     $("#act-head").innerHTML = `<span class="row-art">${art(t.id)}</span>
       <span class="row-text"><span class="row-t">${esc(t.title)}</span><span class="row-s">${xBadge(t)}${esc(t.channel)}${srcBadge(t)}</span></span>`;
     const item = (act, ic, label, extra = "") => `<button class="menu-item" data-act="${act}"${extra}>${icon(ic)}<span class="menu-l">${label}</span></button>`;
+    if (actTarget.picker) { // Add to playlist: Reef's playlists, newest first as the server lists them
+      const pls = state.playlists;
+      $("#act-menu").innerHTML = item("pl-new", "plus", "New playlist…") + (pls === null ? `<p class="st-note">Loading playlists…</p>`
+        : pls.map((p) => item("pl-add", "note", esc(p.name), ` data-arg="${esc(p.id)}"`)).join(""));
+      return;
+    }
     const keepItem = ks === "kept" ? item("keep", "check", "In your library", " disabled")
       : ks === "pending" ? item("keep", "download", "Keeping…")
       : canKeep(t.id) ? item("keep", "plus", "Keep in library") : "";
@@ -3924,8 +4589,13 @@
     const hideItem = ha ? item("hide", "hide", as.length > 1 ? `Hide ${esc(ha.name)}` : "Hide artist") : "";
     const ph = M.isPlaceholder(t); // an import row not matched yet: nothing to share, dislike or hide
     const dislikeItem = srcKey(t.id) !== "nd" && !ph ? item("dislike", "thumb-down", "Not interested") : "";
-    $("#act-menu").innerHTML = item("next", "play-next", "Play next") + item("queue", "queue-add", "Add to queue") + radioItem + keepItem
-      + artistItems + albumItem + (ph ? "" : item("share", "share", "Share")) + dislikeItem + hideItem;
+    const playing = cur()?.id === t.id; // the song that's playing: no Play next / Add to queue
+    const inPlayer = playing && actTarget.list === "player";
+    const ytItem = inPlayer && srcKey(t.id) === "yt" ? item("youtube", "external", "Open on YouTube") : "";
+    const bgItem = inPlayer ? item("npbg", "image", "Player background") : "";
+    $("#act-menu").innerHTML = (playing ? "" : item("next", "play-next", "Play next") + item("queue", "queue-add", "Add to queue"))
+      + radioItem + keepItem + (ph ? "" : item("playlist", "queue-add", "Add to playlist…"))
+      + artistItems + albumItem + (ph ? "" : item("share", "share", "Share")) + ytItem + dislikeItem + hideItem + bgItem;
   }
   function runAction(act, arg) {
     const a = actTarget;
@@ -3939,62 +4609,301 @@
     else if (act === "album" && arg) openRoute(`#album/${encodeURIComponent(arg)}`);
     else if (act === "hide") hideArtist(hideTarget(a.t));
     else if (act === "dislike") notInterested(a.t);
+    else if (act === "playlist") openPlaylistPicker(a.t);
+    else if (act === "pl-add" && arg) addToPlaylist(a.t, arg);
+    else if (act === "pl-new") newPlaylist([a.t]);
+    else if (act === "npbg") openBgPicker();
+    else if (act === "youtube") window.open(`https://www.youtube.com/watch?v=${encodeURIComponent(a.t.id)}`, "_blank", "noopener");
   }
 
-  // ---------- queue sheet ----------
-  function openQueue() {
-    openSheet("#queue-sheet");
-    renderQueue();
-    renderQueueModes();
-    $("#q-body").scrollTop = 0;
+  // ---------- Up next (§4.7, §7) ----------
+  // The sheet rests as the 60 px peek strip at the bottom of Now Playing and pulls up over it: f = 0 (peek) .. 1 (open)
+  // drives its position, the player's fade (1 - f/.4), the art's scale (1 - .1f) and the sheet's top radius (28 -> 0).
+  // A drag on its top (or on the list, once scrolled to the top) moves it; a flick or the threshold decides (PC.pullSettle).
+  const qsheet = $("#qsheet"), qBody = $("#q-body");
+  const qs = { f: 0, open: false, anim: 0, busy: false, pending: false };
+  const qUp = () => npEl.classList.contains("q-up");
+  const qRange = () => Math.max(1, npEl.clientHeight - $(".np-peek-space").offsetHeight);
+  function setQF(f) {
+    qs.f = PC.clamp(f, 0, 1);
+    const look = PC.pullLook(qs.f);
+    qsheet.style.transform = qs.f > 0 ? `translate3d(0, ${(1 - qs.f) * qRange()}px, 0)` : "";
+    qsheet.style.setProperty("--q-radius", `${look.radius}px`);
+    qsheet.style.setProperty("--q-f", String(qs.f));
+    npEl.style.setProperty("--q-fade", String(look.fade));
+    npEl.style.setProperty("--q-scale", String(look.scale));
   }
+  function finishQ(open) {
+    qs.open = open;
+    npEl.classList.toggle("q-open", open);
+    npEl.classList.toggle("q-up", open);
+    $("#np-queue").classList.toggle("on", open);
+    qsheet.setAttribute("aria-modal", String(open));
+    if (!open) setQF(0);
+    if (open && qs.pending) renderQueue();
+  }
+  function animQ(open) {
+    cancelAnimationFrame(qs.anim);
+    const from = qs.f, to = open ? 1 : 0;
+    if (reducedMotion() || from === to) {
+      setQF(to);
+      finishQ(open);
+      if (open && reducedMotion() && from === 0 && qsheet.animate) qsheet.animate([{ opacity: 0 }, { opacity: 1 }], { duration: 200 });
+      return;
+    }
+    const t0 = performance.now();
+    const step = (now) => {
+      const k = PC.settle(now - t0, 380);
+      setQF(from + (to - from) * k);
+      if (k < 1) qs.anim = requestAnimationFrame(step); else finishQ(open);
+    };
+    qs.anim = requestAnimationFrame(step);
+  }
+  // Paint the full sheet before it shows (the first pull, the Queue button).
+  function prepQ() {
+    if (qUp()) return;
+    npEl.classList.add("q-up");
+    renderQueue(true);
+    scrollQueueToCurrent();
+  }
+  function openQ() { if (!cur()) return; prepQ(); animQ(true); }
+  function closeQ(instant) {
+    if (!qUp() && !qs.f) return;
+    if (instant) { cancelAnimationFrame(qs.anim); finishQ(false); return; }
+    animQ(false);
+  }
+  // Opening puts the current song 1.5 rows from the top, so a bit of what played before shows above it.
+  function scrollQueueToCurrent() {
+    const row = $(".qrow.cur", qBody);
+    qBody.scrollTop = row ? Math.max(0, row.offsetTop - 1.5 * row.offsetHeight) : 0;
+  }
+  const openQueue = openQ;
+
+  for (const zone of [$("#qs-peek"), $("#qs-grab")]) {
+    let f0 = 0;
+    drag(zone, {
+      x: false,
+      onStart() { cancelAnimationFrame(qs.anim); f0 = qs.f; prepQ(); },
+      onMove(g) { setQF(f0 - g.dy / qRange()); },
+      onEnd(g, cancelled) { animQ(cancelled ? f0 >= 1 : PC.pullSettle(f0 >= 1, g.dy, g.vy, npEl.clientHeight)); },
+    });
+  }
+  $("#qs-peek").addEventListener("click", openQ);
+  $("#qs-close").addEventListener("click", () => closeQ());
+
+  // The list, scrolled to its top, pulled further down collapses the sheet (touch events: the list scrolls natively).
+  (function listPull() {
+    let p = null;
+    qBody.addEventListener("touchstart", (e) => {
+      p = qs.open && e.touches.length === 1 && qBody.scrollTop <= 0 ? { y: e.touches[0].clientY, pull: false, s: [] } : null;
+    }, { passive: true });
+    qBody.addEventListener("touchmove", (e) => {
+      if (!p || qs.busy) return;
+      const y = e.touches[0].clientY, dy = y - p.y;
+      p.s.push({ t: e.timeStamp, x: 0, y });
+      if (p.s.length > 24) p.s.shift();
+      if (!p.pull) {
+        if (dy < 0 || qBody.scrollTop > 0) { p = null; return; } // scrolling the list
+        e.preventDefault(); // at the top, going down: ours (before Safari starts a scroll it won't give back)
+        if (dy < 8) return;
+        p.pull = true;
+        p.y = y;
+        cancelAnimationFrame(qs.anim);
+      }
+      e.preventDefault();
+      setQF(1 - Math.max(0, y - p.y) / qRange());
+    }, { passive: false });
+    const end = (cancelled) => {
+      if (p?.pull) {
+        const v = PC.velocity(p.s);
+        animQ(cancelled || PC.pullSettle(true, (1 - qs.f) * qRange(), v.vy, npEl.clientHeight));
+      }
+      p = null;
+    };
+    qBody.addEventListener("touchend", () => end(false));
+    qBody.addEventListener("touchcancel", () => end(true));
+  })();
+
   function renderQueueModes() {
     const el = $("#q-modes");
-    if (!el || $("#queue-sheet").hidden) return;
-    const rep = { off: "Repeat", all: "Repeat all", one: "Repeat one" }[state.repeat];
+    if (!el || !qUp()) return;
+    const any = state.queue.length - state.index - 1 > 0;
     el.innerHTML = `<button class="chip sm${state.shuffle ? " on" : ""}" data-q-mode="shuffle" aria-pressed="${state.shuffle}">${icon("shuffle")}Shuffle</button>
-      <button class="chip sm${state.repeat !== "off" ? " on" : ""}" data-q-mode="repeat" aria-pressed="${state.repeat !== "off"}">${icon("repeat")}${rep}</button>
-      <button class="chip sm${autoplay.on ? " on" : ""}" data-q-mode="autoplay" aria-pressed="${autoplay.on}">${icon("infinity")}Autoplay</button>`;
+      <button class="chip sm" data-q-clear${any ? "" : " disabled"}>${icon("x")}Clear</button>
+      <button class="chip sm" data-q-save>${icon("queue-add")}Save as playlist</button>
+      <label class="qs-auto"><span class="qs-auto-l">${icon("infinity")}<span>Autoplay<small>Endless radio when the queue ends</small></span></span>
+        <input type="checkbox" class="sw" data-q-auto${autoplay.on ? " checked" : ""} aria-label="Autoplay"></label>`;
   }
-  function qRow(t, i, now) {
-    const sub = `<span class="row-s">${trackSub(t)}</span>`;
-    return now
-      ? `<li class="row playing" data-track="${esc(t.id)}"><span class="row-main"><span class="row-art">${art(t.id)}${eqIfPlaying(t.id)}</span>
-          <span class="row-text"><span class="row-t">${esc(t.title)}</span>${sub}</span></span></li>`
-      : `<li class="row trk q-row"><span class="row-art">${art(t.id)}</span>
-          <span class="row-text"><button class="row-hit" data-q-jump="${i}" aria-label="Play ${esc(t.title)}"><span class="row-t">${esc(t.title)}</span></button>${sub}</span>
-          <button class="icon-btn sm" data-q-remove="${i}" aria-label="Remove ${esc(t.title)} from queue">${icon("x")}</button></li>`;
+  $("#q-modes").addEventListener("change", (e) => { if (e.target.matches("[data-q-auto]")) setAutoplay(e.target.checked); });
+
+  // Rows (§7): the current one rounder on the cover's tonal colour with the equaliser, the rest on black .55; what played
+  // before sits above it, dimmed. Swipe left = Play next, right = Remove (with Undo); the handle drags to reorder.
+  function qRow(t, i, kind) {
+    const title = esc(t.title);
+    return `<li class="qrow ${kind}" data-qi="${i}" data-track="${esc(t.id)}">
+      ${kind === "cur" ? "" : `<span class="qrow-under" aria-hidden="true"><span class="qu-next">${icon("play-next")}Play next</span><span class="qu-rm">Remove${icon("x")}</span></span>`}
+      <span class="qrow-fg"><span class="row-art">${art(t.id)}${kind === "cur" ? `<span class="eq"><i></i><i></i><i></i></span>` : ""}</span>
+        <span class="row-text">${kind === "cur" ? `<span class="row-t">${title}</span>` : `<button class="row-hit" data-q-jump="${i}" aria-label="Play ${title}"><span class="row-t">${title}</span></button>`}<span class="row-s">${trackSub(t)}</span></span>
+        ${kind === "up" ? `<button class="qrow-grip" data-q-grip aria-label="Drag to reorder ${title}">${icon("grip")}</button>` : ""}</span></li>`;
   }
-  function renderQueue() {
-    if ($("#queue-sheet").hidden) return;
+  function renderQueue(force) {
+    paintUpNext();
+    if (!force && !qUp()) return;
+    if (qs.busy) { qs.pending = true; return; } // a row is being swiped or dragged: paint once it lets go
+    qs.pending = false;
     const t = cur();
-    if (!t) { $("#q-body").innerHTML = emptyState("note", "Nothing playing", "Play a song to start a queue."); return; }
+    const stats = PC.queueStats(state.queue);
+    $("#qs-from").textContent = playingFrom();
+    $("#qs-stats").textContent = t ? [songs(stats.count), fmtLen(stats.seconds)].filter(Boolean).join(" · ") : "";
+    renderQueueModes();
+    if (!t) { qBody.innerHTML = emptyState("note", "Nothing playing", "Play a song to start a queue."); return; }
     const { manual, auto, at } = Q.upcomingParts(state.queue, state.index);
-    const any = manual.length + auto.length;
+    const hist = state.queue.slice(0, state.index);
     const empty = state.repeat === "all" && state.queue.length > 1 ? "Repeat is on: the queue starts over after this."
-      : autoplay.on && state.repeat === "off" && autoplay.inflight ? "Autoplay is finding similar tracks…"
+      : autoplay.on && state.repeat === "off" && autoplay.inflight ? "Autoplay is finding similar songs…"
       : "Nothing queued. Use ⋯ on a song to add it.";
-    $("#q-body").innerHTML = `<h4 class="q-label">Now playing</h4><ul class="rows">${qRow(t, state.index, true)}</ul>
-      <div class="head-row q-up"><h4 class="q-label">Up next${manual.length ? ` · ${manual.length}` : ""}</h4>${any ? `<button class="link-btn" data-q-clear>Clear</button>` : ""}</div>
-      ${manual.length ? `<ul class="rows">${manual.map((x, k) => qRow(x, state.index + 1 + k)).join("")}</ul>`
-        : auto.length ? "" : `<p class="q-empty">${empty}</p>`}
-      ${auto.length ? `<h4 class="q-auto">${icon("infinity")}Autoplay · similar tracks</h4>
-        <ul class="rows">${auto.map((x, k) => qRow(x, at + k)).join("")}</ul>` : ""}`;
+    const top = qBody.scrollTop;
+    qBody.innerHTML = (hist.length ? `<ul class="qlist hist">${hist.map((x, k) => qRow(x, k, "hist")).join("")}</ul>` : "")
+      + `<h4 class="q-label">Now playing</h4><ul class="qlist">${qRow(t, state.index, "cur")}</ul>`
+      + (manual.length || !auto.length ? `<h4 class="q-label">${state.from ? `Next from ${esc(state.from.replace(/^From /, ""))}` : "Next in queue"}</h4>` : "")
+      + (manual.length ? `<ul class="qlist" data-block="manual">${manual.map((x, k) => qRow(x, state.index + 1 + k, "up")).join("")}</ul>`
+        : auto.length ? "" : `<p class="q-empty">${empty}</p>`)
+      + (auto.length ? `<h4 class="q-label q-auto">${icon("infinity")}Autoplay suggestions</h4>
+        <ul class="qlist" data-block="auto">${auto.map((x, k) => qRow(x, at + k, "up")).join("")}</ul>` : "");
+    qBody.scrollTop = top;
+  }
+
+  // Swipe a row: the first 60 px move at most 20 (then 1:1); past 40% (or a flick) left = Play next, right = Remove.
+  drag(qBody, {
+    y: false,
+    ignore: (e) => !e.target.closest(".qrow:not(.cur)") || !!e.target.closest("[data-q-grip]"),
+    onStart(g) { qs.busy = true; g.row = g.target.closest(".qrow"); g.row.classList.add("swiping"); },
+    onMove(g) {
+      g.row.dataset.dir = g.dx < 0 ? "next" : "rm";
+      $(".qrow-fg", g.row).style.transform = `translate3d(${PC.rubber(g.dx, 60, 20)}px, 0, 0)`;
+    },
+    onEnd(g, cancelled) {
+      const row = g.row, fg = $(".qrow-fg", row), id = row.dataset.track;
+      row.classList.remove("swiping");
+      const dir = cancelled ? 0 : PC.swipeCommit(g.dx, g.vx, row.offsetWidth, { frac: 0.4, vmin: 1200 });
+      const settle = () => { qs.busy = false; if (qs.pending) renderQueue(); };
+      if (dir > 0 && !reducedMotion()) {
+        fg.style.transform = `translate3d(${row.offsetWidth}px, 0, 0)`;
+        setTimeout(() => { qs.busy = false; removeWithUndo(id); }, 180);
+        return;
+      }
+      fg.style.transform = "";
+      if (dir > 0) { qs.busy = false; removeWithUndo(id); return; }
+      setTimeout(() => { delete row.dataset.dir; settle(); if (dir < 0) playNextFrom(id); }, dir < 0 ? 200 : 300);
+    },
+  });
+
+  // Drag a row by its handle to reorder it within its block (what you queued, or the autoplay block). The lifted row
+  // follows the finger with a shadow, the others make room; near the list's edges it scrolls.
+  drag(qBody, {
+    ignore: (e) => !e.target.closest("[data-q-grip]"),
+    onStart(g) {
+      const row = g.target.closest(".qrow"), list = row.parentElement, rows = [...list.children];
+      qs.busy = true;
+      Object.assign(g, {
+        row, list, rows, from: Number(row.dataset.qi), to: Number(row.dataset.qi),
+        lo: Number(rows[0].dataset.qi), hi: Number(rows[rows.length - 1].dataset.qi),
+        rowH: rows.length > 1 ? rows[1].offsetTop - rows[0].offsetTop : row.offsetHeight + 6, scroll0: qBody.scrollTop, raf: 0,
+      });
+      row.classList.add("lifted");
+      list.classList.add("sorting");
+      const loop = () => { // edge auto-scroll while the finger rests near the top or bottom
+        const r = qBody.getBoundingClientRect(), y = g.y0 + g.dy;
+        const v = y < r.top + 56 ? -8 : y > r.bottom - 56 ? 8 : 0;
+        if (v) { qBody.scrollTop += v; place(g); }
+        g.raf = requestAnimationFrame(loop);
+      };
+      g.raf = requestAnimationFrame(loop);
+    },
+    onMove(g) { place(g); },
+    onEnd(g, cancelled) {
+      cancelAnimationFrame(g.raf);
+      for (const r of g.rows) r.style.transform = "";
+      g.row.classList.remove("lifted");
+      g.list.classList.remove("sorting");
+      qs.busy = false;
+      if (!cancelled && g.to !== g.from && state.queue[g.from]?.id === g.row.dataset.track) {
+        const r = PC.moveTrack(state.queue, state.index, g.from, g.to);
+        state.queue = r.queue; state.index = r.index;
+        queueChanged();
+      } else if (qs.pending) renderQueue();
+    },
+  });
+  function place(g) {
+    const dy = g.dy + (qBody.scrollTop - g.scroll0);
+    g.to = PC.dropIndex(g.from, dy, g.rowH, g.lo, g.hi);
+    g.row.style.transform = `translate3d(0, ${dy}px, 0)`;
+    for (const r of g.rows) {
+      if (r === g.row) continue;
+      const k = Number(r.dataset.qi);
+      const shift = g.from < k && k <= g.to ? -g.rowH : g.to <= k && k < g.from ? g.rowH : 0;
+      r.style.transform = shift ? `translate3d(0, ${shift}px, 0)` : "";
+    }
+  }
+
+  // Remove with Undo: the song goes back where it was, relative to the current one (PC.reinsert).
+  // `at`: the track's id (a row acting after its animation: the queue may have shifted) or its queue index.
+  const qIndex = (at) => (typeof at === "string" ? state.queue.findIndex((x) => x.id === at) : at);
+  function removeWithUndo(at) {
+    const i = qIndex(at), t = state.queue[i];
+    if (!t || i === state.index) return;
+    const rel = i - state.index;
+    const r = Q.removeAt(state.queue, state.index, i);
+    state.queue = r.queue; state.index = r.index;
+    queueChanged();
+    toast(`Removed “${t.title}”`, { action: "Undo", onAction: () => {
+      const u = PC.reinsert(state.queue, state.index, t, rel);
+      if (u.queue.length === state.queue.length) return;
+      state.queue = u.queue; state.index = u.index;
+      queueChanged();
+    } });
+  }
+  // Play next from the queue itself (also a song that already played: it moves, ids stay unique). An autoplay song
+  // moved up becomes one you queued.
+  function playNextFrom(at) {
+    const i = qIndex(at), t = state.queue[i];
+    if (!t || i === state.index) return;
+    const plain = { ...t };
+    delete plain.auto;
+    let q = state.queue, idx = state.index;
+    if (i < idx) { const r = Q.removeAt(q, idx, i); q = r.queue; idx = r.index; } // an upcoming copy is moved by playNext
+    const r = Q.playNext(q, idx, plain, state.shuffle ? state.original : null);
+    state.queue = r.queue; state.index = idx;
+    if (state.shuffle) state.original = r.original;
+    queueChanged();
+    toast(`Playing next: “${t.title}”`);
   }
 
   // ---------- toast ----------
-  let toastTimer;
-  function toast(msg) {
+  // toast(msg) or toast(msg, {action: "Undo", onAction}) with a button (5 s).
+  let toastTimer, toastAct = null;
+  function toast(msg, { action = "", onAction = null } = {}) {
     const el = $("#toast");
+    toastAct = action && onAction ? onAction : null;
     el.textContent = msg;
+    if (toastAct) el.insertAdjacentHTML("beforeend", `<button class="toast-act" type="button">${esc(action)}</button>`);
+    el.classList.toggle("has-act", !!toastAct);
     el.classList.add("show");
     clearTimeout(toastTimer);
-    toastTimer = setTimeout(() => el.classList.remove("show"), Math.max(2600, String(msg).length * 55)); // long hints stay longer
+    toastTimer = setTimeout(() => { el.classList.remove("show"); toastAct = null; },
+      toastAct ? 5000 : Math.max(2600, String(msg).length * 55)); // long hints stay longer
   }
+  $("#toast").addEventListener("click", (e) => {
+    if (!e.target.closest(".toast-act") || !toastAct) return;
+    const f = toastAct;
+    toastAct = null;
+    $("#toast").classList.remove("show");
+    f();
+  });
 
   // ---------- events ----------
   document.addEventListener("click", (e) => {
-    const t = e.target.closest("[data-keep],[data-play],[data-search],[data-source],[data-retry-search],[data-retry-home],[data-retry-history],[data-retry-playlists],[data-retry-library],[data-set-theme],[data-filter],[data-dismiss],[data-play-all],[data-shuffle-all],[data-close],[data-clear-finished],[data-clear-searches],[data-more],[data-act],[data-q-jump],[data-q-remove],[data-q-clear],[data-q-mode],[data-sleep],[data-fill],[data-keep-all],[data-retry],[data-page-radio],[data-artist-hide],[data-unhide],[data-unhide-page],[data-open-hidden],[data-yt-reset],[data-copy-diag],[data-about],[data-mix],[data-st],[data-import-resolve]");
+    const t = e.target.closest("[data-keep],[data-play],[data-search],[data-source],[data-retry-search],[data-retry-home],[data-retry-history],[data-retry-playlists],[data-retry-library],[data-set-theme],[data-filter],[data-dismiss],[data-play-all],[data-shuffle-all],[data-close],[data-clear-finished],[data-clear-searches],[data-more],[data-act],[data-q-jump],[data-q-remove],[data-q-clear],[data-q-mode],[data-q-save],[data-npbg],[data-open-bg],[data-sleep],[data-fill],[data-keep-all],[data-retry],[data-page-radio],[data-artist-hide],[data-unhide],[data-unhide-page],[data-open-hidden],[data-yt-reset],[data-copy-diag],[data-about],[data-mix],[data-st],[data-import-resolve]");
     if (!t) return;
     const d = t.dataset;
     if ("keep" in d) { e.preventDefault(); if (d.keep) keep(d.keep, d.list); return; }
@@ -4030,12 +4939,15 @@
       return;
     }
     if ("qJump" in d) { jumpTo(Number(d.qJump)); return; }
-    if ("qRemove" in d) { removeFromQueue(Number(d.qRemove)); return; }
+    if ("qRemove" in d) { removeWithUndo(Number(d.qRemove)); return; }
     if ("qClear" in d) { clearUpcoming(); return; }
+    if ("qSave" in d) { saveQueueAsPlaylist(); return; }
     if ("qMode" in d) {
       if (d.qMode === "shuffle") toggleShuffle(); else if (d.qMode === "autoplay") setAutoplay(!autoplay.on); else cycleRepeat();
       return;
     }
+    if ("npbg" in d) { setBgStyle(d.npbg); return; }
+    if ("openBg" in d) { openBgPicker(); return; }
     if ("fill" in d) {
       const q = $("#q");
       q.value = d.fill + " ";
@@ -4101,15 +5013,20 @@
   $("#mini-next").addEventListener("click", next);
   $("#np-close").addEventListener("click", closeNP);
   $("#np-play").addEventListener("click", togglePlay);
-  $("#np-next").addEventListener("click", next);
-  $("#np-prev").addEventListener("click", prev);
-  $("#np-share").addEventListener("click", () => share());
-  $("#np-queue").addEventListener("click", openQueue);
+  // Skips wait for the squish (§4.5), unless motion is reduced.
+  $("#np-next").addEventListener("click", () => later(reducedMotion() ? 0 : SKIP_DELAY, next));
+  $("#np-prev").addEventListener("click", () => later(reducedMotion() ? 0 : SKIP_DELAY, prev));
+  $("#np-queue").addEventListener("click", () => (qs.open ? closeQ() : openQueue()));
   $("#np-sleep").addEventListener("click", () => { renderSleep(); openSheet("#sleep-sheet"); });
-  $("#np-dl").addEventListener("click", closeNP);
   $("#np-lyr").addEventListener("click", () => setLyricsOn(!lyr.on));
   $("#np-shuffle").addEventListener("click", toggleShuffle);
   $("#np-repeat").addEventListener("click", cycleRepeat);
+  $("#np-like").addEventListener("click", () => toggleLike());
+  longPress($("#np-like"), () => openPlaylistPicker(cur()));
+  for (const id of ["#np-more", "#np-more2"]) $(id).addEventListener("click", () => { if (cur()) openActions(cur().id, "player", state.index); });
+  $("#np-from-btn").addEventListener("click", () => { if (state.fromRoute) openRoute(state.fromRoute); });
+  longPress($("#np-t"), copyTrackName);
+  longPress($("#np-s"), copyTrackName);
   $("#status-btn").addEventListener("click", openStatus);
   $("#top-back").addEventListener("click", goBack);
   $("#np-s").addEventListener("click", () => {
@@ -4119,6 +5036,7 @@
   document.addEventListener("keydown", (e) => {
     if (e.key !== "Escape") return;
     if (topSheet()) closeSheet(topSheet());
+    else if (qs.open) closeQ();
     else if ($("#np").classList.contains("open")) closeNP();
   });
 
@@ -4136,6 +5054,7 @@
   // ---------- boot ----------
   state.view = "";
   applyPalette(null);
+  applyBg();
   restoreSession();
   // Share target / deep links: /?link=<url>#search or /?q=<text>#search. Drop the query string first.
   const bootArgs = new URLSearchParams(location.search);
@@ -4150,6 +5069,7 @@
   loadSettings();
   loadHealth();
   loadHistory();
+  loadLikes();
   loadTiles();
   pollJobs();
 })();
