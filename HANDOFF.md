@@ -125,6 +125,14 @@ result card, Songs rows with **+**, and filter chips. Design tokens are at the t
 - Not yet confirmed on a real iPhone: sleep timer firing while locked, sheet drag-to-close.
 - Next per the plan: Phase 4, YouTube Music via `ytmusicapi` (search with artist/album, suggestions, radio/autoplay).
 
+## Production plan (2026-10-21)
+
+`docs/PRODUCTION_PLAN.md`: what's left for production readiness, from a read of seven more apps (Metrolist, ArchiveTune,
+Flow, Meld, Gyawun, Musify, BloomeeTunes) plus an audit of Reef. P0 = player error recovery, stream URL lifetime and
+client gating, mid-stream resume, typed failures, failover cooldowns, waitress + supervisor + logs, CI.
+On-device test of `580a39e` (2026-10-21): 44 offline tests pass in Termux; yt-dlp default client resolves audio-only
+m4a in 1.2 s (`android_vr` gives muxed format 18; `ios`, `web_safari`, `tv`, `mweb` fail), so leave `REEF_YT_CLIENT` empty.
+
 ## Ideas / next steps
 
 - Check round 2 on the iPhone: Now Playing on the small screen, tile artwork, source chips, FLAC playback over cellular.
