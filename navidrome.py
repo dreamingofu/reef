@@ -5,6 +5,7 @@ import secrets
 import requests
 from requests.adapters import HTTPAdapter
 
+import errors
 from config import NAVIDROME_PASS, NAVIDROME_URL, NAVIDROME_USER
 
 
@@ -39,7 +40,7 @@ def ping():
         body = _call("ping")
         return {"ok": True, "version": body.get("serverVersion", "")}
     except Exception as e:
-        return {"ok": False, "error": str(e)}
+        return {"ok": False, "error": errors.message(e)}  # requests' text carries the URL with the token + salt
 
 
 def rescan():

@@ -132,3 +132,23 @@ def test_diagnostics_reports_effective_values(client, monkeypatch):
     cfg = client.get("/api/diagnostics").get_json()["config"]
     assert cfg["lrc_sidecar"] is True and cfg["prefer_library"] is False
     assert cfg["settings_overridden"] == ["lrc_sidecar", "prefer_library"]
+
+
+LONG_USERINFO = "demo:" + "synthetic-pass" * 10 + "@example.invalid/api?api_key=synthetic-token"
+
+
+@pytest.mark.parametrize("url", [f"ftp://{LONG_USERINFO}", f"https://{LONG_USERINFO.replace('example.invalid', 'example.invalid:99999')}"])
+def test_invalid_url_error_never_echoes_userinfo(client, sfile, url):
+    """The message cuts the URL; the userinfo is masked first, so the cut can't keep part of a password."""
+    with pytest.raises(ValueError) as caught:
+        settings.update({"tracks_api": [url]})
+    assert "synthetic" not in str(caught.value) and "demo:" not in str(caught.value)
+    r = client.patch("/api/settings", json={"tracks_api": [url]})
+    assert r.status_code == 400 and "URL" in r.get_json()["error"]
+    assert "synthetic" not in r.get_data(as_text=True) and not sfile.exists()
+
+
+def test_credentialed_urls_are_still_accepted_and_stored_raw(sfile):
+    url = "https://demo:synthetic-pass@example.invalid/api?api_key=synthetic-token"
+    settings.update({"tracks_api": [url]})
+    assert settings.get("tracks_api") == [url]

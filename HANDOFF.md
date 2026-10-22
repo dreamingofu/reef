@@ -1,6 +1,7 @@
 # Reef — handoff notes (resume on another machine)
 
-Last updated: 2026-10-22 (Round 16, UI remake step 5, audit batches 1 and 2 accepted and committed locally).
+Last updated: 2026-10-22 (Round 16, UI remake step 5, audit batches 1, 2 and 3 accepted by the root and committed
+locally; batch 3 = credentials / API / CSRF).
 
 ## CURRENT supervision (read first; 2026-10-22, written for a session rotation)
 
@@ -12,17 +13,19 @@ Last updated: 2026-10-22 (Round 16, UI remake step 5, audit batches 1 and 2 acce
 - **Commits on `dreamingofu/codebase-overview-and-risk`** (local only, none pushed):
   - U5 `bd5014d`.
   - Batch 1 `8fc8de93c619e1e674ade79fd5e2fe8eead4a698`.
-  - Batch 2: the commit that adds this text (see `git log`).
+  - Batch 2 `2ba24bbd0434e2b932cd44e7baf9c62628118d23` (accepted clean base of batch 3).
+  - Batch 3: the commit that adds this text (see `git log`).
 - **Who's working**:
-  - Root coordinator: `term_a1a35e94-ec0d-4c97-a320-2c6a2a95c78d`, sole supervisor of Run `run_644fd9908c5b`
-    generation 2 until an explicit replacement RELEASE.
-  - Claude writer `term_62492f92-3dea-4cc5-ac14-f76f76a4bdb7`:
-    - The batch 2 repair Task `task_dd2cff493c45` / `ctx_29078306d082` is settled, succeeded.
-    - This milestone Task `task_3035a994e8c6` / `ctx_2386ceabed08` owned only this file and the local batch 2 commit.
-    - After that commit it **relinquishes checkout writer ownership** and idles. The root rotates Claude from this
-      handoff; the old tab is kept, with no duplicate writers.
-  - Earlier settled writer Tasks: `task_a93a61d0b573` (batch 1) and `task_e630e35fb597` (batch 2's first version).
-  - No browser or server is running.
+  - Root coordinator: `term_3c425302-cae4-4be9-97c0-cb65b1ba1535`, sole supervisor of Run `run_644fd9908c5b`
+    generation 3 (replaced generation 2's `term_a1a35e94-ec0d-4c97-a320-2c6a2a95c78d`).
+  - Claude writer (sole checkout writer): `term_8969653d-0e79-47c1-8e88-3ce3b86a64c6`.
+    - Settled batch 3 Tasks: `task_f48c451fcebe` / `ctx_5ea180eba2eb` (implementation) and `task_4434847b17e2` /
+      `ctx_8c5e9a8b2d1c` (long-userinfo repair).
+    - This milestone Task `task_e17f105b79e5` / `ctx_65bb1c6ba326` owned only this file and the local batch 3
+      commit, no other work. Afterwards Claude idles in the same tab awaiting the next bounded Task.
+  - Old Claude `term_62492f92-3dea-4cc5-ac14-f76f76a4bdb7` relinquished writer ownership and stays idle (settled Tasks
+    `task_a93a61d0b573` batch 1, `task_e630e35fb597` / `task_dd2cff493c45` batch 2, `task_3035a994e8c6` milestone).
+  - No browser or server is running (the root closed its scratch WebKit browser and QA server).
 - **Audit**: `/tmp/reef-codebase-audit-20261022.md`, report plus a superseding ADDENDUM. Don't redo the survey.
   - Root-confirmed findings:
     - F1 / F5 / F6 / F7 / F11 (synthetic repros);
@@ -45,29 +48,52 @@ Last updated: 2026-10-22 (Round 16, UI remake step 5, audit batches 1 and 2 acce
     correct 1 s audio, the 4 s original kept);
   - `/tmp/reef-codex-refactor-20261022/file-ownership.py` (alias ownership, the export `.tmp` link target, the lyrics
     sidecar link target).
+- **Batch 3 (credentials / API / CSRF: F2, F4, F6 app half, F7, F11)**: **accepted by the root** after its independent
+  final diff review (no blockers), committed locally. Changed: `log.py`, `errors.py`, `navidrome.py`, `app.py`, `tests/test_errors.py`, `tests/test_service.py`,
+  new `tests/test_request_guard.py`, and `sources/failover.py` only for its log line (`why` redacted before the
+  80-char cut, per root review); raw cooling keys / identity unchanged, masking is at presentation (log formatter,
+  `redact_obj` keys, health / diagnostics).
+  - `log.redact`: URL userinfo (to its last `@`), `api_key/key/token/access_token/password/auth` (whole names, any
+    case) on top of the googlevideo / Subsonic params; idempotent (an existing mask isn't re-masked).
+    `redact_obj` masks dict keys. `errors.message(e, limit)` = redact then cut; `errors.payload` classifies the raw
+    text, then uses it. `navidrome.ping`, `/api/health`, `/api/health/sources`, the playlist export 500 and every
+    `str(e)` presentation / log line in app.py go through it.
+  - `refuse_cross_site` before_request (after the password check): non-GET/HEAD/OPTIONS refused (403) when
+    Sec-Fetch-Site isn't same-origin/none, or Origin is present and isn't exactly this request's (scheme, host,
+    port): `null`, malformed, userinfo / path, other port or scheme all refuse. Own scheme = socket scheme, or
+    X-Forwarded-Proto only from a loopback peer (Tailscale Serve); X-Forwarded-Host / -For never read; auth policy
+    unchanged. No Origin and no fetch metadata (curl, scripts, update.sh, tests) pass.
+  - `_json_object()` for the `get_json(silent=True) or {}` routes (blocklist, prefetch, download, download/batch,
+    playlists create / tracks / move, match fix); likes / dislikes / update keep their own 400 for non-objects;
+    sendBeacon force-parse, multipart restore / import and optional bodies unchanged. `_seconds` catches
+    `OverflowError`.
+  - Checks by Claude: 71 new regressions failed on a `git archive` export of `2ba24bb` and pass now; full suite 1130
+    passed / 1 deselected; Ruff and diff check clean; root matrix `guard-root3.py` 19 cases, 0 failures.
+  - Follow-up repair Task `task_4434847b17e2` / `ctx_8c5e9a8b2d1c` (root-reproduced long-userinfo leaks): `settings._url`
+    masks the URL before its 60-char cut (validation and stored raw URLs unchanged); `health._row` and the crashed-check
+    text mask before their 200 / 100-char cuts. 4 new regressions (tests/test_settings.py, tests/test_health.py, incl.
+    `/api/health/sources` and the PATCH 400) failed before and pass now, plus a stored-raw credentialed URL check.
+  - Root acceptance checks:
+    - focused `tests/test_request_guard.py`, `test_errors`, `test_service`, `test_health`, `test_settings`,
+      `test_failover`, `test_backup`, `test_listens`, `test_import`, `test_library`, `test_lyrics`, `test_personal`,
+      `test_matching` → 484 passed;
+    - full `.venv/bin/python -m pytest -q` → 1135 passed / 1 deselected; `.venv/bin/ruff check .` and
+      `git diff --check` clean;
+    - `/tmp/reef-codex-refactor-20261022/guard-root3.py` → 19 cases, 0 failures;
+    - `credentials-root3.py` → seven presentations, 0 leaks, raw failover identity preserved, plus a real requests
+      error against a closed loopback port;
+    - isolated WebKit `api-browser-root3.js`: like 201, text/plain listen 201, personal 200, multipart restore 200,
+      import 201, no-body like 201, malformed array download 400, real cross-origin restore POST 403 (screenshot
+      `api-browser-root3.png`).
+  - Not proven: on-device Safari, real services, an actual Tailscale Serve deployment.
 - **Next work for a fresh root / Claude** (none implemented yet; one bounded batch each, regressions first, no guessed
   rewrites):
-  1. **Credentials / API / CSRF.**
-     - Redaction (F4/F11):
-       - `log.redact`: mask URL userinfo and common query secrets (`api_key`, `key`, `token`, `access_token`,
-         `password`, `auth`);
-       - `log.redact_obj`: redact dict keys too;
-       - `errors.payload` and `navidrome.ping`: sanitise messages;
-       - redact `/api/health`;
-       - give raw exception text from app.py the same safe presentation.
-       - Keep the raw internal failover keys / identity; sanitise only what is presented.
-     - F2: a global guard for unsafe methods on Origin / Sec-Fetch-Site. It must keep direct access and HTTPS
-       Tailscale Serve working as same-origin (Serve keeps the Host header and sets `X-Forwarded-Proto: https`). It
-       must not trust forwarded headers a tailnet peer could forge, and it must not change the socket-based trust or
-       requests without an Origin (CLI, scripts, update.sh).
-     - F6: `app._seconds` must treat an `OverflowError` from huge ints as an invalid / absent duration.
-     - F7: one robust JSON-object helper, keeping sendBeacon, uploads and optional bodies working.
-  2. **Updater health with auth.** Health checks must authenticate under `REEF_OPEN=1` + `REEF_PASSWORD`, both in the
+  1. **Updater health with auth.** Health checks must authenticate under `REEF_OPEN=1` + `REEF_PASSWORD`, both in the
      Python child (`updater._healthy`) and in `termux/update.sh`. Prove it with a scratch fake Basic-auth server; no
      real updates.
-  3. **JS proof in CI.** Dependency-free `node:test` checks of the sentinel cores, plus `node --check static/app.js`.
+  2. **JS proof in CI.** Dependency-free `node:test` checks of the sentinel cores, plus `node --check static/app.js`.
      No bundler, modules or new dependencies.
-  4. **Frontend correctness.**
+  3. **Frontend correctness.**
      - U-a: `api()` must reject an invalid 2xx JSON body instead of returning `{}`.
      - Root-confirmed (`/tmp/reef-codex-refactor-20261022/frontend-before.cjs` runs the actual functions):
        - `pinFix` has an async target race. An old selection waiting on a pending key POSTs under the new target's
@@ -76,10 +102,10 @@ Last updated: 2026-10-22 (Round 16, UI remake step 5, audit batches 1 and 2 acce
        - A successful restore refreshes settings / history / blocklist / Home but not likes / playlists. Cached
          detail and lyrics may need scoped invalidation that keeps playback going.
      - Add regressions first.
-  5. **U-b art byte budget (justified).** Root mocked 33 valid 512 KiB responses: 17,301,504 bytes retained; the
+  4. **U-b art byte budget (justified).** Root mocked 33 valid 512 KiB responses: 17,301,504 bytes retained; the
      400-entry count alone allows 209,715,200 bytes. Keep the count limit, add a sensible byte budget with race-safe
      accounting.
-  6. **Only with evidence:** F10 (finished-job cap) if shown necessary. J1–J3 / U-c / U-d performance and gesture
+  5. **Only with evidence:** F10 (finished-job cap) if shown necessary. J1–J3 / U-c / U-d performance and gesture
      hypotheses need measurements first. No cosmetic whole-file splits.
 - **Tooling note**: `worker-start --terminal` returns `agent_unconfigured`. The proven fallback is manual
   task-create, then `dispatch --return-preamble`, then terminal-send the exact preamble.

@@ -7,10 +7,14 @@ import threading
 
 import pytest
 
+import requests
+
 import app
 import config
 import log
+import navidrome
 import streamer
+from sources import failover
 
 SIGNED = ("https://rr1---sn-x.googlevideo.com/videoplayback?expire=1767225600&ei=abc&itag=140"
           "&sig=AOq0QJ8wRAIgSECRETSIG&lsig=LSIGSECRET&pot=POTOKEN123&n=NCHALLENGE&c=WEB")
@@ -103,6 +107,96 @@ def test_redact_subsonic_path_params_and_headers():
 def test_redact_obj_walks_structures():
     out = log.redact_obj({"a": [SIGNED, 1, None], "b": {"c": SIGNED}})
     assert "POTOKEN123" not in json.dumps(out) and out["a"][1] == 1
+
+
+CRED_URL = "https://demo:synthetic-pass@example.invalid/api?api_key=synthetic-token"
+CRED_SECRETS = ("synthetic-pass", "synthetic-token", "demo:")
+
+
+def test_redact_masks_url_userinfo_and_common_secret_params():
+    out = log.redact(f"failover cool host={CRED_URL} s=180")
+    assert not any(s in out for s in CRED_SECRETS), out
+    assert out.startswith("failover cool host=https://len=19,sha1=") and "@example.invalid/api?api_key=len=15," in out
+    assert out.endswith(" s=180")
+    for name in ("api_key", "key", "token", "access_token", "password", "auth", "API_KEY", "Token"):
+        assert "hunter2" not in log.redact(f"http://h/x?a=1&{name}=hunter2&region=eu"), name
+    kept = log.redact("http://h/x?keyword=a&monkey=b&author=c&tokens=d&region=eu")
+    assert kept == "http://h/x?keyword=a&monkey=b&author=c&tokens=d&region=eu"  # only whole parameter names
+    assert log.redact("ftp://user@host/x") == f"ftp://{log.mask('user')}@host/x"
+    assert log.redact("http://u:p@ss@host/x").endswith("@host/x") and "p@ss" not in log.redact("http://u:p@ss@host/x")
+    assert log.redact("mail me at a@b.example or see http://host/x?u=1") == "mail me at a@b.example or see http://host/x?u=1"
+
+
+def test_redact_is_idempotent():
+    """A message redacted twice (a redacted error, then the log formatter) keeps the first mask, so lines still compare."""
+    for text in (SIGNED, CRED_URL, "Authorization: Bearer abc.def", "http://h/rest/x?u=a&t=0123456789&s=abcdef"):
+        once = log.redact(text)
+        assert log.redact(once) == once
+
+
+def test_redact_obj_masks_keys_too():
+    out = log.redact_obj({CRED_URL: 120, "plain": {CRED_URL: [CRED_URL]}, 7: "x"})
+    raw = json.dumps(out)
+    assert not any(s in raw for s in CRED_SECRETS), raw
+    assert list(out["plain"].values())[0][0] == log.redact(CRED_URL) and out[7] == "x"
+
+
+class FailingSession:
+    """failover's session: every request fails like a real one (requests' text carries the query, not userinfo)."""
+    headers = {}
+
+    def request(self, method, url, timeout=None, **kw):
+        raise requests.ConnectionError("HTTPSConnectionPool(host='example.invalid', port=443): Max retries exceeded "
+                                       "with url: /api?api_key=synthetic-token/x (Caused by NameResolutionError)")
+
+
+@pytest.fixture
+def failing_failover(monkeypatch):
+    monkeypatch.setattr(failover, "_session", FailingSession())
+    monkeypatch.setattr(failover, "_cooling", {})
+
+
+def test_credentialed_instance_never_shows_after_a_failover_failure(client, failing_failover, logging_setup):
+    with pytest.raises(requests.ConnectionError) as caught:
+        failover.request([CRED_URL], "/x")
+    # The raw identity is untouched inside failover: cooling is keyed by the configured URL and still skips it.
+    assert list(failover.cooling()) == [CRED_URL] and failover._until(CRED_URL) is not None
+    assert "synthetic-token" in str(caught.value)  # the raw error stays raw for callers (they classify it)
+    for h in logging.getLogger().handlers:
+        h.flush()
+    text = logging_setup.read_text()
+    assert "failover cool host=" in text and not any(s in text for s in CRED_SECRETS), text
+    assert not any(s in "\n".join(log.recent()) for s in CRED_SECRETS)
+    for path in ("/api/diagnostics", "/api/health"):
+        raw = client.get(path).get_data(as_text=True)
+        assert not any(s in raw for s in CRED_SECRETS), (path, raw[:400])
+        cooling = json.loads(raw)["failover_cooling"]
+        assert list(cooling) == [log.redact(CRED_URL)] and list(cooling.values())[0] > 0
+
+
+def test_navidrome_ping_error_has_no_subsonic_token(monkeypatch):
+    class Refused:
+        def get(self, url, params=None, timeout=None):
+            q = "&".join(f"{k}={v}" for k, v in params.items())
+            raise requests.ConnectionError(f"HTTPConnectionPool(host='127.0.0.1', port=9): Max retries exceeded with "
+                                           f"url: /rest/ping?{q} (Caused by NewConnectionError('refused'))")
+
+    monkeypatch.setattr(navidrome, "NAVIDROME_USER", "demo")
+    monkeypatch.setattr(navidrome, "NAVIDROME_PASS", "synthetic-pass")
+    monkeypatch.setattr(navidrome, "_session", Refused())
+    seen = []
+    real = navidrome._auth_params
+    monkeypatch.setattr(navidrome, "_auth_params", lambda: seen.append(real()) or seen[-1])
+    out = navidrome.ping()
+    assert out["ok"] is False and "Max retries exceeded" in out["error"] and "u=demo" in out["error"]
+    assert seen[0]["t"] not in out["error"] and seen[0]["s"] not in out["error"]
+
+
+def test_health_is_redacted(client, monkeypatch):
+    monkeypatch.setattr(navidrome, "ping", lambda: {"ok": False, "error": f"refused {CRED_URL}"})
+    monkeypatch.setattr(streamer, "last_timing", {"error": CRED_URL})
+    raw = client.get("/api/health").get_data(as_text=True)
+    assert not any(s in raw for s in CRED_SECRETS), raw
 
 
 # ---------- log file + tail ----------
@@ -201,3 +295,54 @@ def test_diagnostics_hides_credentials_in_configured_urls(client, monkeypatch):
 def test_diagnostics_is_behind_the_same_gate(client, monkeypatch):
     monkeypatch.setattr(config, "PASSWORD", "")
     assert from_ip(client, "192.168.1.20", "/api/diagnostics").status_code == 403
+
+
+def test_error_responses_mask_credentials_before_cutting(client, monkeypatch, tmp_path):
+    monkeypatch.setattr(config, "SETTINGS_FILE", tmp_path / "settings.json")
+    monkeypatch.setattr(app.ytmusic, "enabled", lambda: True)
+    # 150 chars of text first: the old [:160] cut kept "https://demo:synt" without the "@" that marks userinfo.
+    boom = RuntimeError("z" * 150 + f" {CRED_URL}")
+
+    def fail(*a, **k):
+        raise boom
+
+    monkeypatch.setattr(app.ytmusic, "search_kind", fail)
+    r = client.get("/api/search?q=x&filter=videos")
+    assert r.status_code == 502 and not any(s in r.get_data(as_text=True) for s in ("synth", "demo"))
+    monkeypatch.setattr(app, "_find_song", fail)
+    monkeypatch.setattr(app.sources, "get", lambda key: None)  # no Monochrome: YouTube Music is the only source
+    dead = {"id": "dQw4w9WgXcQ", "title": "Song", "channel": "Artist", "source": "yt"}
+    r = client.post("/api/replace", json={"track": dead})
+    assert r.status_code == 502 and r.get_json()["error"].startswith("YouTube Music: zzz")
+    assert not any(s in r.get_data(as_text=True) for s in ("synth", "demo"))
+    r = client.patch("/api/settings", json={"tracks_api": ["ftp://demo:synthetic-pass@example.invalid/x"]})
+    assert r.status_code == 400 and "not an http(s) URL" in r.get_json()["error"]
+    assert "synthetic-pass" not in r.get_data(as_text=True)
+
+
+def test_failover_log_masks_userinfo_longer_than_the_cut(failing_failover, logging_setup, monkeypatch):
+    long_url = "https://demo:" + "synthetic-pass" * 6 + "@example.invalid/api"
+
+    class Session(FailingSession):
+        def request(self, method, url, timeout=None, **kw):
+            raise requests.ConnectionError("x" * 30 + f" proxy refused {long_url}")
+
+    monkeypatch.setattr(failover, "_session", Session())
+    with pytest.raises(requests.ConnectionError):
+        failover.request(["https://a.example"], "/x")
+    for h in logging.getLogger().handlers:
+        h.flush()
+    text = logging_setup.read_text()
+    assert "failover cool host=https://a.example" in text and "synthetic" not in text and "demo:" not in text
+    assert list(failover.cooling()) == ["https://a.example"]
+
+
+def test_playlist_export_failure_is_redacted(client, monkeypatch):
+    def fail(pid):
+        raise OSError(f"can't write to {CRED_URL}")
+
+    monkeypatch.setattr(app, "_pid_or_404", lambda pid: pid)
+    monkeypatch.setattr(app.playlists, "export", fail)
+    r = client.post("/api/playlists/0123abcd/export")
+    assert r.status_code == 500 and r.get_json()["error"].startswith("couldn't write the playlist file: can't write")
+    assert not any(s in r.get_data(as_text=True) for s in CRED_SECRETS)

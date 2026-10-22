@@ -120,6 +120,78 @@ def require_password():
     return Response("Password required", 401, {"WWW-Authenticate": 'Basic realm="reef"'})
 
 
+_SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+_DEFAULT_PORTS = {"http": 80, "https": 443}
+
+
+def _loopback(addr):
+    """True for a loopback socket peer (Tailscale Serve's proxy, or a process on the phone itself)."""
+    try:
+        ip = ipaddress.ip_address((addr or "").split("%")[0])
+    except ValueError:
+        return False
+    return (getattr(ip, "ipv4_mapped", None) or ip).is_loopback
+
+
+def _origin_key(scheme, netloc):
+    """(scheme, host, port) with the host lowercased (an IP literal in its canonical form) and the default port
+    filled in, or None for anything that isn't a plain http(s) origin."""
+    scheme = (scheme or "").lower()
+    if scheme not in _DEFAULT_PORTS or not netloc or "@" in netloc:
+        return None
+    try:
+        u = urlsplit(f"//{netloc}")
+        host, port = u.hostname, u.port
+    except ValueError:  # a bad port, a malformed IPv6 literal
+        return None
+    if not host or u.path or u.query or u.fragment:
+        return None
+    try:
+        host = ipaddress.ip_address(host).compressed
+    except ValueError:
+        pass
+    return scheme, host, port or _DEFAULT_PORTS[scheme]
+
+
+def _own_origin():
+    """This request's origin as the browser sees it. The scheme is the socket's, except behind Tailscale Serve:
+    it connects from loopback, keeps the Host header and says X-Forwarded-Proto: https. That header is only
+    believed from loopback (any tailnet peer could send it), and X-Forwarded-Host / -For are never read."""
+    scheme = request.scheme
+    if _loopback(request.remote_addr):
+        forwarded = request.headers.get("X-Forwarded-Proto", "").split(",")[0].strip().lower()
+        if forwarded in _DEFAULT_PORTS:
+            scheme = forwarded
+    return _origin_key(scheme, request.host)
+
+
+@app.before_request
+def refuse_cross_site():
+    """A state-changing request must come from Reef's own page. Trusted networks get in without a password, so a
+    page on another site could otherwise POST a text/plain restore (no CORS preflight) from the user's browser.
+    Browsers send Origin and Sec-Fetch-Site on these requests; curl, scripts and update.sh send neither and pass."""
+    if request.method in _SAFE_METHODS:
+        return None
+    site = request.headers.get("Sec-Fetch-Site")
+    origin = request.headers.get("Origin")
+    if site is not None and site.strip().lower() not in ("same-origin", "none"):
+        return _cross_site()
+    if origin is not None:
+        u = None
+        try:
+            u = urlsplit(origin.strip())
+        except ValueError:
+            pass
+        theirs = _origin_key(u.scheme, u.netloc) if u and not (u.path or u.query or u.fragment) else None
+        if theirs is None or theirs != _own_origin():
+            return _cross_site()
+    return None
+
+
+def _cross_site():
+    return jsonify({"error": "cross-site request refused: use Reef's own page"}), 403
+
+
 @app.get("/")
 def index():
     return render_template("index.html", tiles=tiles.load())
@@ -127,7 +199,8 @@ def index():
 
 @app.get("/api/health")
 def health():
-    return jsonify({
+    """Redacted like diagnostics: Navidrome's error carries the Subsonic token, cooling hosts are configured URLs."""
+    return jsonify(log.redact_obj({
         "reef": "ok",
         "navidrome": {**navidrome.ping(), "configured": navidrome.configured()},
         "download_dir": str(config.DOWNLOAD_DIR),
@@ -135,14 +208,14 @@ def health():
         "yt_client": config.YT_CLIENT,
         "yt_backend": sources.youtube.last_backend,
         "yt_fallbacks": sources.youtube.fallback_names(),
-        "stream_timing": log.redact_obj(streamer.last_timing),
+        "stream_timing": streamer.last_timing,
         "stream_cache": streamer.stats(),
         "yt_gates": sources.youtube.gates.snapshot(),
         "failover_cooling": sources.failover.cooling(),
         "sources": list(sources.SOURCES),
         "ytmusic": {"enabled": ytmusic.enabled(), "version": ytmusic.VERSION},
         "test_audio": testaudio.enabled(),
-    })
+    }))
 
 
 _git_sha = None
@@ -267,7 +340,7 @@ def api_search_all():
         try:
             body = ytmusic.search_all(q)
         except Exception as e:
-            logger.warning(f"search all failed, songs only: {str(e)[:160]!r}")
+            logger.warning(f"search all failed, songs only: {errors.message(e, 160)!r}")
     if body is None:
         src = sources.get("yt")
         try:
@@ -331,7 +404,7 @@ def api_suggest():
             out = ytmusic.suggestions(q)
         except Exception as e:
             failed = True
-            logger.warning(f"suggest failed: {str(e)[:160]!r}")
+            logger.warning(f"suggest failed: {errors.message(e, 160)!r}")
     if q and (failed or not ytmusic.enabled()) and settings.get("itunes_suggestions"):
         out = itunes.suggestions(q)
     resp = jsonify(out)
@@ -443,7 +516,7 @@ def _link_track(video_id):
             if found:
                 return found
         except Exception as e:
-            logger.warning(f"link: ytmusic song {video_id} failed: {str(e)[:160]!r}")
+            logger.warning(f"link: ytmusic song {video_id} failed: {errors.message(e, 160)!r}")
     return sources.youtube.lookup(video_id)
 
 
@@ -454,7 +527,7 @@ def _link_playlist(list_id):
             if page["tracks"]:
                 return page["title"], page["tracks"]
         except Exception as e:
-            logger.warning(f"link: ytmusic playlist {list_id} failed: {str(e)[:160]!r}")
+            logger.warning(f"link: ytmusic playlist {list_id} failed: {errors.message(e, 160)!r}")
     return sources.youtube.playlist_flat(list_id)
 
 
@@ -495,6 +568,13 @@ MATCH_LIMIT = 10      # search results scored per query
 REPLACE_ACCEPT = 0.45  # a replacement plays in place of what the user picked: stricter than a plain match
 REPLACE_STOP = 0.93
 EXCLUDE_MAX = 20
+
+
+def _json_object():
+    """The request's JSON body when it is an object, else {} (no body, malformed JSON, a list, a number...), so
+    the route's own "x is required" 400 answers instead of a 500 from `.get` on a list."""
+    body = request.get_json(silent=True)
+    return body if isinstance(body, dict) else {}
 
 
 def _match_query(body):
@@ -569,7 +649,7 @@ def api_match_fix(key):
     `key` resolves to, for good: the automatic matcher never overwrites it."""
     if not matching.valid_key(key):
         abort(404)
-    body = request.get_json(silent=True) or {}
+    body = _json_object()
     raw = body.get("id") if isinstance(body, dict) else None
     parsed = parse_link(raw)
     tid = parsed[1] if parsed and parsed[0] == "track" else store.track_id(raw.strip()) if isinstance(raw, str) else None
@@ -580,7 +660,7 @@ def api_match_fix(key):
         try:
             track = _link_track(tid)
         except Exception as e:
-            logger.warning(f"match: lookup of {tid} failed: {str(e)[:160]!r}")
+            logger.warning(f"match: lookup of {tid} failed: {errors.message(e, 160)!r}")
     if not track or track.get("id") != tid:
         track = {"id": tid, "title": _hint(body.get("title")), "channel": _hint(body.get("artist"))}
     entry = matching.remember(key, track, None, manual=True)
@@ -649,7 +729,7 @@ def api_replace():
             found = _find_song(query, REPLACE_ACCEPT, REPLACE_STOP, exclude, same_artist=True)
             best = (*found, "yt") if found else None
         except Exception as e:
-            failures.append(f"YouTube Music: {str(e)[:160]}")
+            failures.append(f"YouTube Music: {errors.message(e, 160)}")
     mc = sources.get("mc")
     if mc is not None and (best is None or best[1] < REPLACE_STOP):
         tried += 1
@@ -659,7 +739,7 @@ def api_replace():
             if found and (best is None or found[1] > best[1]):
                 best = (*found, "mc")
         except Exception as e:
-            failures.append(f"Monochrome: {str(e)[:160]}")
+            failures.append(f"Monochrome: {errors.message(e, 160)}")
     logger.info(f"replace id={dead['id']} found={best[0]['id'] if best else None} score={best[1] if best else None} "
                 f"source={best[2] if best else None} ms={int((time.monotonic() - t0) * 1000)}")
     if not best:
@@ -684,7 +764,7 @@ def api_segments(video_id):
     try:
         found = segments.for_video(video_id)
     except segments.Unavailable as e:
-        return jsonify({"error": str(e)[:200]}), 502
+        return jsonify({"error": errors.message(e, 200)}), 502
     resp = jsonify(found)
     resp.headers["Cache-Control"] = "private, max-age=3600"
     return resp
@@ -813,7 +893,7 @@ def api_blocklist():
 @app.post("/api/blocklist")
 def api_blocklist_add():
     """Block an artist by name (required) and channel id (optional, UC...). Re-blocking returns the entry (200)."""
-    body = request.get_json(silent=True) or {}
+    body = _json_object()
     name, artist_id = body.get("name"), body.get("id") or None
     if not isinstance(name, str) or not name.strip() or len(name) > blocklist.NAME_MAX:
         return jsonify({"error": "name is required"}), 400
@@ -856,7 +936,7 @@ def api_sources():
 
 @app.post("/api/prefetch")
 def api_prefetch():
-    body = request.get_json(silent=True) or {}
+    body = _json_object()
     ids = body.get("ids")
     if not isinstance(ids, list):
         return jsonify({"error": "ids must be a list"}), 400
@@ -1009,7 +1089,7 @@ def _keep(item, force=False):
 
 @app.post("/api/download")
 def api_download():
-    body = request.get_json(silent=True) or {}
+    body = _json_object()
     outcome, payload, status = _keep(body, bool(body.get("force")))
     if outcome == "invalid":
         return jsonify({"error": payload}), status
@@ -1023,7 +1103,7 @@ def api_download():
 @app.post("/api/download/batch")
 def api_download_batch():
     """Keep a whole album (or any selection): each track goes through the same duplicate guard as a single keep."""
-    body = request.get_json(silent=True) or {}
+    body = _json_object()
     items = body.get("tracks")
     if not isinstance(items, list) or not items:
         return jsonify({"error": "tracks must be a non-empty list"}), 400
@@ -1089,16 +1169,16 @@ def api_listens_add():
     try:
         entry, created = listens.record(body)
     except ValueError as e:
-        return jsonify({"error": str(e)}), 400
+        return jsonify({"error": errors.message(e)}), 400
     if entry["counted"]:
         try:
             home.listened()  # enough new listens: rebuild Home in the background
         except Exception as e:
-            logger.warning(f"home: tick after listen failed: {str(e)[:200]}")
+            logger.warning(f"home: tick after listen failed: {errors.message(e, 200)}")
         try:
             scrobble.listened(entry)  # queued for ListenBrainz when a token is set (no-op when it's in already)
         except Exception as e:
-            logger.warning(f"scrobble: queueing failed: {str(e)[:200]}")
+            logger.warning(f"scrobble: queueing failed: {errors.message(e, 200)}")
     return jsonify({"entry": entry, "created": created}), 201 if created else 200
 
 
@@ -1239,11 +1319,11 @@ def api_playlists():
 
 @app.post("/api/playlists")
 def api_playlist_create():
-    body = request.get_json(silent=True) or {}
+    body = _json_object()
     try:
         p = playlists.create(body.get("name"), body.get("tracks"), body.get("description") or "")
     except ValueError as e:
-        return jsonify({"error": str(e)}), 400
+        return jsonify({"error": errors.message(e)}), 400
     return _playlist_body(p), 201
 
 
@@ -1278,7 +1358,7 @@ def api_playlist_patch(pid):
     try:
         p = playlists.update(_pid_or_404(pid), body)
     except ValueError as e:
-        return jsonify({"error": str(e)}), 400
+        return jsonify({"error": errors.message(e)}), 400
     if not p:
         abort(404)
     return _playlist_body(p)
@@ -1295,12 +1375,12 @@ def api_playlist_delete(pid):
 @app.post("/api/playlists/<pid>/tracks")
 def api_playlist_add(pid):
     """Add {tracks: [...], position?: int, dedupe?: bool}. Invalid track ids are skipped, not an error."""
-    body = request.get_json(silent=True) or {}
+    body = _json_object()
     try:
         found = playlists.add_tracks(_pid_or_404(pid), body.get("tracks"), body.get("position"),
                                      body.get("dedupe") is True)
     except ValueError as e:
-        return jsonify({"error": str(e)}), 400
+        return jsonify({"error": errors.message(e)}), 400
     if not found:
         abort(404)
     p, added, skipped = found
@@ -1315,7 +1395,7 @@ def api_playlist_remove(pid, index):
     except IndexError:
         abort(404)
     except ValueError as e:
-        return jsonify({"error": str(e)}), 409
+        return jsonify({"error": errors.message(e)}), 409
     if not p:
         abort(404)
     return _playlist_body(p)
@@ -1323,7 +1403,7 @@ def api_playlist_remove(pid, index):
 
 @app.post("/api/playlists/<pid>/move")
 def api_playlist_move(pid):
-    body = request.get_json(silent=True) or {}
+    body = _json_object()
     src, dst = body.get("from"), body.get("to")
     if not all(isinstance(v, int) and not isinstance(v, bool) for v in (src, dst)):
         return jsonify({"error": "from and to must be track indexes"}), 400
@@ -1342,10 +1422,10 @@ def api_playlist_export(pid):
     try:
         out = playlists.export(_pid_or_404(pid))
     except ValueError as e:
-        return jsonify({"error": str(e)}), 409
+        return jsonify({"error": errors.message(e)}), 409
     except OSError as e:
-        logger.warning(f"playlist export {pid} failed: {e}")
-        return jsonify({"error": f"couldn't write the playlist file: {e.strerror or e}"}), 500
+        logger.warning(f"playlist export {pid} failed: {errors.message(e)}")
+        return jsonify({"error": f"couldn't write the playlist file: {errors.message(e.strerror or e)}"}), 500
     if out is None:
         abort(404)
     return jsonify({**out, "rescanned": navidrome.rescan()})
@@ -1403,7 +1483,7 @@ def api_import():
         parsed = importer.parse(raw, filename)
         p = importer.create(parsed, name if isinstance(name, str) else None)
     except ValueError as e:  # importer.ImportFailed, or playlists' limits
-        return jsonify({"error": str(e)}), 400
+        return jsonify({"error": errors.message(e)}), 400
     meta = p.get("import") or {}
     status = _import_resolve(p["id"]) if want and meta.get("total") and ytmusic.enabled() else importer.status(p["id"])
     return jsonify({"playlist": playlists.summary(p), "kind": parsed["kind"], "rows": meta.get("rows"),
@@ -1524,7 +1604,7 @@ def api_alias_put():
     try:
         entry, created = aliases.put(body.get("name"), body.get("id"), body.get("match"))
     except ValueError as e:
-        return jsonify({"error": str(e)}), 400
+        return jsonify({"error": errors.message(e)}), 400
     return jsonify({"entry": entry, "created": created}), 201 if created else 200
 
 
@@ -1556,7 +1636,7 @@ def api_settings_patch():
     try:
         settings.update(body)
     except ValueError as e:
-        return jsonify({"error": str(e)}), 400
+        return jsonify({"error": errors.message(e)}), 400
     if "listenbrainz_token" in body:
         scrobble.token_changed()  # checks the new token with ListenBrainz (a few seconds at most)
     return _settings_body()
@@ -1594,7 +1674,7 @@ def api_update():
     try:
         return jsonify(updater.start(body.get("what"), body.get("confirm"))), 202
     except updater.UpdateError as e:
-        return jsonify({"error": str(e)}), e.status
+        return jsonify({"error": errors.message(e)}), e.status
 
 
 @app.get("/api/update/status")
@@ -1611,8 +1691,8 @@ def api_backup():
     try:
         name, raw = backup.download()
     except Exception as e:
-        logger.warning(f"backup: download failed: {str(e)[:200]}")
-        return jsonify({"error": f"couldn't build the backup: {str(e)[:200]}"}), 500
+        logger.warning(f"backup: download failed: {errors.message(e, 200)}")
+        return jsonify({"error": f"couldn't build the backup: {errors.message(e, 200)}"}), 500
     return Response(raw, content_type="application/json; charset=utf-8",
                     headers={"Content-Disposition": f'attachment; filename="{name}"', "Cache-Control": "no-store"})
 
@@ -1645,14 +1725,14 @@ def api_restore():
     try:
         return jsonify(backup.restore(doc, mode))
     except backup.BackupError as e:
-        return jsonify({"error": str(e)}), 400
+        return jsonify({"error": errors.message(e)}), 400
 
 
 # ---------- source health ----------
 
 @app.get("/api/health/sources")
 def api_health_sources():
-    resp = jsonify(source_health.sources_health(force=request.args.get("refresh") == "1"))
+    resp = jsonify(log.redact_obj(source_health.sources_health(force=request.args.get("refresh") == "1")))
     resp.headers["Cache-Control"] = "no-store"
     return resp
 
@@ -1699,7 +1779,7 @@ def _tiny_bytes(url, redirects=True):
                 if len(buf) > ART_TINY_BYTES:
                     return None
     except Exception as e:
-        logger.info(f"art tiny fetch failed: {log.redact(str(e))[:160]}")
+        logger.info(f"art tiny fetch failed: {errors.message(e, 160)}")
         return None
     hit = (bytes(buf), mime)
     with _tiny_lock:
@@ -1838,10 +1918,10 @@ def _hint(value):
 
 
 def _seconds(value):
-    """A plausible track length in seconds, else None (also for nan/inf, which float() accepts)."""
+    """A plausible track length in seconds, else None (also for nan/inf, which float() accepts, and huge ints)."""
     try:
         d = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):  # OverflowError: a JSON int too large for a float (10**400)
         return None
     return d if 0 < d < 86400 else None
 
@@ -1859,7 +1939,7 @@ def api_lyrics_search():
     try:
         results = lyrics.search(q)
     except lyrics.Unavailable as e:
-        return jsonify({"error": str(e)}), 502
+        return jsonify({"error": errors.message(e)}), 502
     if hint["title"]:
         for r in results:
             r["score"] = matching.score(hint, {"title": r["track"], "artist": r["artist"], "duration": r["duration"]})[1]
@@ -1911,7 +1991,7 @@ def api_lyrics_offset(track_id):
     try:
         ms = lyrics.set_offset(t[1], body.get("ms") if isinstance(body, dict) else None)
     except ValueError as e:
-        return jsonify({"error": str(e)}), 400
+        return jsonify({"error": errors.message(e)}), 400
     return jsonify({"offset_ms": ms})
 
 
@@ -1929,9 +2009,9 @@ def api_lyrics_pin(track_id):
     try:
         return jsonify(lyrics.pin(t[1], rid))
     except LookupError as e:
-        return jsonify({"error": str(e)}), 404
+        return jsonify({"error": errors.message(e)}), 404
     except lyrics.Unavailable as e:
-        return jsonify({"error": str(e)}), 502
+        return jsonify({"error": errors.message(e)}), 502
 
 
 @app.delete("/api/lyrics/<track_id>/pin")
@@ -1955,7 +2035,7 @@ def _chores():
             try:
                 fn()
             except Exception as e:
-                logger.warning(f"chores: {name} failed: {str(e)[:200]}")
+                logger.warning(f"chores: {name} failed: {errors.message(e, 200)}")
         time.sleep(60)
 
 

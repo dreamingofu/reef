@@ -9,6 +9,8 @@ import socket
 
 import requests
 
+import log
+
 BLOCKS = ("BOT_WALL", "NETWORK", "LOGIN_REQUIRED", "REGION", "RATE_LIMITED", "MEMBERS_OR_PAID", "GONE", "UNKNOWN")
 # Not produced by classify(): the proxy's "the stream URL/file changed under a playing element" signal.
 EXPIRED = "EXPIRED"
@@ -73,7 +75,14 @@ def hint(block):
     return HINTS.get(block, HINTS["UNKNOWN"])
 
 
+def message(err, limit=None):
+    """An exception's (or a message's) text fit to show or log: secrets masked first, then cut to `limit`, so the
+    cut can't keep part of a password or token that the full text would have masked."""
+    return log.redact(str(err))[:limit]
+
+
 def payload(err, block=None):
-    """{error, block, hint} for an exception or a message; `block` overrides the classification."""
+    """{error, block, hint} for an exception or a message; `block` overrides the classification, which reads the
+    raw text (the redacted one could hide a word it matches)."""
     block = block or (classify_exc(err) if isinstance(err, BaseException) else classify(err))
-    return {"error": str(err)[:300], "block": block, "hint": hint(block)}
+    return {"error": message(err, 300), "block": block, "hint": hint(block)}

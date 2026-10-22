@@ -39,7 +39,9 @@ _clock = time.monotonic  # tests patch this
 
 
 def _row(name, kind, status, detail="", latency_ms=None):
-    return {"name": name, "kind": kind, "status": status, "latency_ms": latency_ms, "detail": str(detail)[:200]}
+    # Masked before the cut, like every detail below: a cut URL loses the "@" that marks its user:pass.
+    return {"name": name, "kind": kind, "status": status, "latency_ms": latency_ms,
+            "detail": errors.message(detail, 200)}
 
 
 def _down(e):
@@ -196,7 +198,7 @@ def run(checks=None, budget=BUDGET):
             try:
                 status, detail, ms = fut.result()
             except Exception as e:
-                status, detail, ms = REACHABLE, f"check failed: {str(e)[:100]}", None
+                status, detail, ms = REACHABLE, f"check failed: {errors.message(e, 100)}", None
             rows[i] = _row(name, kind, status, detail, None if status == DISABLED else ms)
     finally:
         pool.shutdown(wait=False, cancel_futures=True)  # a stuck check finishes on its own; nobody waits for it

@@ -7,6 +7,8 @@ import time
 import requests
 from requests.adapters import HTTPAdapter
 
+import log
+
 from .base import BROWSER_UA
 
 logger = logging.getLogger(__name__)
@@ -33,7 +35,9 @@ def _retryable(status):
 def cool(base, seconds, why=""):
     with _cool_lock:
         _cooling[base] = max(_cooling.get(base, 0), _clock() + seconds)
-    logger.warning(f"failover cool host={base} s={seconds} why={why[:80]!r}")
+    # `why` is redacted before the cut: a cut URL can lose the "@" that marks its userinfo (the formatter redacts
+    # the whole line, `base` included, but can't recognise half a password). The cooling key stays the raw base.
+    logger.warning(f"failover cool host={base} s={seconds} why={log.redact(why)[:80]!r}")
 
 
 def _until(base):

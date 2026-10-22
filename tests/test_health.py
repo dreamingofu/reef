@@ -163,3 +163,25 @@ def test_default_plan_runs_offline(monkeypatch):
     assert rows and all(r["status"] in ("ONLINE", "REACHABLE", "OFFLINE", "DISABLED") for r in rows)
     by = {r["name"]: r["status"] for r in rows}
     assert by["YouTube"] == "OFFLINE" and by["GitHub"] == "OFFLINE" and by["Navidrome"] == "DISABLED"
+
+
+LONG_USERINFO = "https://demo:" + "synthetic-pass" * 10 + "@example.invalid/api?api_key=synthetic-token"
+
+
+def test_crashed_check_text_is_masked_before_any_cut(monkeypatch):
+    """A cut URL loses the "@" that marks its userinfo, so masking must come before the run's and the row's cuts."""
+    def boom():
+        raise RuntimeError(f"bug talking to {LONG_USERINFO}")
+
+    rows = health.run([("A", "x", boom)], budget=1)
+    assert rows[0]["detail"].startswith("check failed: bug talking to https://len=")
+    assert "synthetic" not in rows[0]["detail"] and "demo:" not in rows[0]["detail"]
+    monkeypatch.setattr(health, "plan", lambda: [("A", "x", boom)])
+    raw = app.app.test_client().get("/api/health/sources?refresh=1").get_data(as_text=True)
+    assert "synthetic" not in raw and "demo:" not in raw
+
+
+def test_row_detail_is_masked_before_its_cut():
+    detail = health._row("A", "x", health.REACHABLE, "x" * 150 + " " + LONG_USERINFO)["detail"]
+    assert len(detail) <= 200 and "synthetic" not in detail and "demo:" not in detail
+    assert health._row("A", "x", health.ONLINE, "fine")["detail"] == "fine"

@@ -11,6 +11,7 @@ import re
 from urllib.parse import urlsplit
 
 import config
+import log
 import store
 
 _file = store.JsonFile(lambda: config.SETTINGS_FILE, dict)
@@ -85,13 +86,14 @@ URL_MAX = 300
 
 def _url(raw):
     u = raw.strip().rstrip("/")
+    shown = log.redact(u)[:60]  # masked before the cut: a cut URL loses the "@" that marks its user:pass
     try:
         parts = urlsplit(u)
         _ = parts.port  # raises ValueError for a bad port
     except ValueError:
-        raise ValueError(f"not a URL: {u[:60]}") from None
+        raise ValueError(f"not a URL: {shown}") from None
     if parts.scheme not in ("http", "https") or not parts.hostname or len(u) > URL_MAX or re.search(r"\s", u):
-        raise ValueError(f"not an http(s) URL: {u[:60]}")
+        raise ValueError(f"not an http(s) URL: {shown}")
     return u
 
 

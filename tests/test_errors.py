@@ -60,3 +60,26 @@ def test_hints_and_payload():
     assert p == {"error": "Video unavailable. This video has been removed by the uploader", "block": "GONE",
                  "hint": "This video was removed or is private"}
     assert errors.payload("x" * 500, block="REGION")["error"] == "x" * 300
+
+
+CRED_URL = "https://demo:synthetic-pass@example.invalid/api?api_key=synthetic-token"
+
+
+def test_payload_masks_credentials_before_cutting_and_classifies_the_raw_text():
+    # Long enough that cutting the raw text at 300 would keep "demo:synth..." without the "@" that marks userinfo.
+    err = requests.ConnectionError("x" * 280 + f" Max retries exceeded with url: {CRED_URL}")
+    p = errors.payload(err)
+    assert p["block"] == "NETWORK" and len(p["error"]) <= 300
+    assert "synth" not in p["error"] and "demo" not in p["error"]
+    nd = requests.ConnectionError("HTTPConnectionPool(host='127.0.0.1', port=9): Max retries exceeded with url: "
+                                  "/rest/stream?u=demo&t=0123456789abcdef0123456789abcdef&s=a1b2c3d4e5f6&id=7")
+    p = errors.payload(nd)
+    assert "0123456789abcdef" not in p["error"] and "a1b2c3d4e5f6" not in p["error"] and "id=7" in p["error"]
+    assert errors.payload(f"HTTP Error 429 from {CRED_URL}")["block"] == "RATE_LIMITED"
+    assert "synthetic" not in errors.payload(RuntimeError(f"failed: {CRED_URL}"))["error"]
+
+
+def test_message_is_redacted_then_cut():
+    assert errors.message(RuntimeError(CRED_URL)) == errors.message(CRED_URL)
+    assert "synthetic" not in errors.message(RuntimeError("y" * 30 + CRED_URL), 40)
+    assert errors.message(RuntimeError("plain"), 3) == "pla" and errors.message(RuntimeError("plain")) == "plain"

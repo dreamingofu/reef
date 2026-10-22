@@ -16,11 +16,16 @@ RECENT_MAX = 300
 FILE_BYTES = 1024 * 1024
 FILE_COUNT = 5
 
-# googlevideo's signature / PO token / n-challenge params, and Subsonic's token, salt and password.
-_SECRET_PARAMS = ("sig", "signature", "lsig", "pot", "n", "t", "s", "p")
-_QUERY = re.compile(r"([?&](?:%s)=)([^&#\s'\"]+)" % "|".join(_SECRET_PARAMS))
+# googlevideo's signature / PO token / n-challenge params, Subsonic's token, salt and password, and the usual API
+# key / token / password params of a configured instance URL. Whole names only, in any case (`keyword=` stays).
+_SECRET_PARAMS = ("sig", "signature", "lsig", "pot", "n", "t", "s", "p",
+                  "api_key", "key", "token", "access_token", "password", "auth")
+_QUERY = re.compile(r"(?i)([?&](?:%s)=)([^&#\s'\"]+)" % "|".join(_SECRET_PARAMS))
 _PATH = re.compile(r"(/(?:sig|lsig|signature)/)([^/?&#\s'\"]+)")  # older googlevideo path-style params
 _HEADER = re.compile(r"(?i)(\b(?:set-cookie|cookie|authorization)['\"]?\s*[:=]\s*['\"]?)([^'\"\r\n]+)")
+# user:pass@ in any scheme://authority, up to its last "@" (an unencoded "@" in a password stays inside).
+_USERINFO = re.compile(r"(?i)(\b[a-z][a-z0-9+.-]*://)([^/?#@\s'\"<>]*(?:@[^/?#@\s'\"<>]*)*)(?=@)")
+_MASKED = re.compile(r"len=\d+,sha1=[0-9a-f]{6}")
 
 _recent = deque(maxlen=RECENT_MAX)
 _setup_lock = threading.Lock()
@@ -32,20 +37,27 @@ def mask(value):
 
 
 def redact(text):
-    """`text` with secret URL params / header values replaced by `len=N,sha1=xxxxxx`."""
+    """`text` with URL userinfo, secret URL params and header values replaced by `len=N,sha1=xxxxxx`."""
     if not isinstance(text, str) or not text:
         return text
-    for rx in (_QUERY, _PATH, _HEADER):
-        text = rx.sub(lambda m: m.group(1) + mask(m.group(2)), text)
+    for rx in (_USERINFO, _QUERY, _PATH, _HEADER):
+        text = rx.sub(_masked, text)
     return text
 
 
+def _masked(m):
+    """The match with its secret group masked; a value that's already a mask stays (redacting twice changes nothing)."""
+    value = m.group(2)
+    return m.group(1) + (value if _MASKED.fullmatch(value) else mask(value))
+
+
 def redact_obj(obj):
-    """redact() over every string in a JSON-ish structure (for payloads that echo error messages)."""
+    """redact() over every string in a JSON-ish structure, dict keys included (for payloads that echo error
+    messages, and maps keyed by a configured URL such as failover's cooling hosts)."""
     if isinstance(obj, str):
         return redact(obj)
     if isinstance(obj, dict):
-        return {k: redact_obj(v) for k, v in obj.items()}
+        return {redact(k) if isinstance(k, str) else k: redact_obj(v) for k, v in obj.items()}
     if isinstance(obj, (list, tuple)):
         return [redact_obj(v) for v in obj]
     return obj
