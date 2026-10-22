@@ -18,6 +18,7 @@ from functools import partial
 import requests
 
 import config
+import personal
 import settings
 
 logger = logging.getLogger(__name__)
@@ -52,6 +53,7 @@ _ART_HOSTS = (".googleusercontent.com", ".ggpht.com")
 
 # YTMusic holds one requests.Session; share one instance and serialise calls on it.
 _yt = None
+_yt_visitor = None  # the kept visitor id _yt was built with (personal.py), None = ytmusicapi's own throwaway id
 _lock = threading.Lock()
 
 
@@ -79,13 +81,30 @@ def retry_after(max_age=300):
 
 
 def _client():
-    global _yt
-    if _yt is None:
+    """The shared client. While personalisation is on it carries the kept visitor id (header and context), so
+    YouTube Music answers for that visitor; when the setting or the id changes, the client is rebuilt."""
+    global _yt, _yt_visitor
+    want = personal.client_visitor()
+    if _yt is None or want != _yt_visitor:
         session = requests.Session()
         session.request = partial(session.request, timeout=TIMEOUT)
         session.hooks["response"].append(_note_429)
-        _yt = YTMusic(requests_session=session)
+        yt = YTMusic(requests_session=session)
+        if want:
+            _use_visitor(yt, want)
+        _yt, _yt_visitor = yt, want
     return _yt
+
+
+def _use_visitor(yt, visitor):
+    """Give a fresh YTMusic our visitor id. `base_headers` is a cached_property that fetches a throwaway id from
+    the homepage on first use; filling its cache first skips that request."""
+    from ytmusicapi.helpers import initialize_headers
+
+    headers = initialize_headers()
+    headers["X-Goog-Visitor-Id"] = visitor
+    yt.__dict__["base_headers"] = headers
+    yt.context["context"]["client"]["visitorData"] = visitor
 
 
 def _call(method, *args, **kwargs):
@@ -641,3 +660,142 @@ def refresh_mood_art(first=(), pause=0.5):
             logger.warning(f"ytmusic: mood art failed: {str(e)[:160]!r}")
         time.sleep(pause)
     return done
+
+
+# ---------- YouTube Music's own home (with personalisation on) ----------
+
+HOME_ROWS = 6  # get_home's `limit`: shelves wanted (it pages in threes)
+
+
+def _card(item):
+    """A home item as a card {type: track|album|playlist|artist, id, title, subtitle, thumb} (+ `track`), else None."""
+    if not isinstance(item, dict):
+        return None
+    if item.get("videoId"):
+        t = normalize(item)
+        return t and {"type": "track", "id": t["id"], "title": t["title"], "subtitle": t["channel"],
+                      "thumb": t["thumb"], "track": t}
+    bid, pid = str(item.get("browseId") or ""), str(item.get("playlistId") or "")
+    title = str(item.get("title") or "")
+    if bid.startswith("MPRE"):
+        names = [a.get("name") for a in item.get("artists") or [] if isinstance(a, dict) and a.get("name")]
+        return {"type": "album", "id": bid, "title": title, "subtitle": ", ".join(names) or item.get("year") or None,
+                "thumb": _sized(_largest(item.get("thumbnails")))}
+    if _LIST_ID.match(pid):
+        return {"type": "playlist", "id": pid, "title": title, "subtitle": item.get("description") or None,
+                "thumb": _sized(_largest(item.get("thumbnails")))}
+    if _CHANNEL_ID.match(bid):
+        return {"type": "artist", "id": bid, "title": title, "subtitle": item.get("subscribers") or None,
+                "thumb": _sized(_largest(item.get("thumbnails")), crop=True)}
+    return None
+
+
+def home(limit=HOME_ROWS):
+    """YouTube Music's home shelves, as its visitor id (personal.py) gets them: [{title, kind: tracks|cards,
+    items}]. A shelf of songs only is a track list; mixed shelves (playlists, albums, artists) are cards."""
+    shelves = []
+    for row in _call("get_home", limit=limit) or []:
+        if not isinstance(row, dict) or not row.get("title"):
+            continue
+        cards = [c for c in (_card(x) for x in row.get("contents") or []) if c]
+        if not cards:
+            continue
+        if all(c["type"] == "track" for c in cards):
+            shelves.append({"title": str(row["title"]), "kind": "tracks", "items": [c["track"] for c in cards]})
+        else:
+            shelves.append({"title": str(row["title"]), "kind": "cards", "items": cards})
+    return shelves
+
+
+# ---------- charts ----------
+
+CHART_LIST_PREFIX = "PL4fGSI1pDJn"  # every "Top 100 …" playlist the YouTube Charts account publishes
+SONGS_GLOBAL = "PL4fGSI1pDJn6puJdseH2Rt9sMvt9E2M4i"  # "Top 100 Songs Global"
+
+
+def _chart_artist(item):
+    from ytmusicapi.parsers.explore import parse_chart_artist
+
+    a = parse_chart_artist(item)
+    if not _CHANNEL_ID.match(str(a.get("browseId") or "")):
+        return None
+    rank = str(a.get("rank") or "")
+    return {"id": a["browseId"], "name": a.get("title") or "", "rank": int(rank) if rank.isdigit() else None,
+            "trend": a.get("trend"), "subscribers": a.get("subscribers") or None,
+            "thumb": _sized(_largest(a.get("thumbnails")), crop=True)}
+
+
+def _charts_tolerant(country):
+    """The FEmusic_charts page read by carousel: what get_charts parses, but an albums or podcasts carousel
+    (US has both) can't be taken for the artists one (ytmusicapi 1.12.3 takes the first list carousel)."""
+    from ytmusicapi.navigation import (CAROUSEL_CONTENTS, CAROUSEL_TITLE, FRAMEWORK_MUTATIONS, MRLIR, MTRIR,
+                                       MUSIC_SHELF, SECTION_LIST, SINGLE_COLUMN_TAB, TITLE, nav)
+    from ytmusicapi.parsers.explore import parse_chart_playlist
+
+    if not enabled():
+        raise RuntimeError("YouTube Music is disabled")
+    with _lock:
+        response = _client()._send_request("browse", {"browseId": "FEmusic_charts",
+                                                      "formData": {"selectedValues": [country]}})
+    results = nav(response, SINGLE_COLUMN_TAB + SECTION_LIST)
+    menu = nav(results[0], [*MUSIC_SHELF, "subheaders", 0, "musicSideAlignedItemRenderer", "startItems", 0,
+                            "musicSortFilterButtonRenderer"], True)
+    name = (nav(menu, TITLE, True) or {}).get("text") if menu else None
+    options = [nav(m, ["payload", "musicFormBooleanChoice", "opaqueToken"], True)
+               for m in nav(response, FRAMEWORK_MUTATIONS, True) or []]
+    playlists, artists = [], []
+    for section in results[1:]:
+        group = nav(section, ["musicCarouselShelfRenderer", *CAROUSEL_TITLE, "text"], True)
+        found = []
+        for item in nav(section, CAROUSEL_CONTENTS, True) or []:
+            try:
+                if MTRIR in item:
+                    p = parse_chart_playlist(item[MTRIR])
+                    if _LIST_ID.match(str(p.get("playlistId") or "")):
+                        playlists.append({"id": p["playlistId"], "title": p.get("title") or "", "group": group})
+                elif MRLIR in item and not artists:  # the first carousel of channels is the artists chart
+                    a = _chart_artist(item[MRLIR])
+                    if a:
+                        found.append(a)
+            except (KeyError, IndexError, TypeError):
+                continue
+        artists = artists or found
+    return {"country": country, "name": name, "countries": sorted({o for o in options if isinstance(o, str)}),
+            "playlists": playlists, "artists": artists}
+
+
+def charts(country="ZZ"):
+    """{country, name, countries, playlists: [{id, title, group}], artists: [{id, name, rank, trend, subscribers,
+    thumb}]} for a country code (ZZ = global). Falls back to ytmusicapi's own parser if the page moved."""
+    try:
+        return _charts_tolerant(country)
+    except (ImportError, AttributeError, KeyError, IndexError, TypeError) as e:
+        logger.warning(f"ytmusic: tolerant charts parse failed, using get_charts: {str(e)[:120]!r}")
+    raw = _call("get_charts", country) or {}
+    sel = (raw.get("countries") or {}).get("selected") or {}
+    playlists = [{"id": p["playlistId"], "title": p.get("title") or "", "group": group}
+                 for group in ("videos", "genres", "languages", "daily", "weekly")
+                 for p in raw.get(group) or [] if isinstance(p, dict) and _LIST_ID.match(str(p.get("playlistId") or ""))]
+    artists = []
+    for a in raw.get("artists") or []:
+        if isinstance(a, dict) and _CHANNEL_ID.match(str(a.get("browseId") or "")):
+            rank = str(a.get("rank") or "")
+            artists.append({"id": a["browseId"], "name": a.get("title") or "", "trend": a.get("trend"),
+                            "rank": int(rank) if rank.isdigit() else None, "subscribers": a.get("subscribers"),
+                            "thumb": _sized(_largest(a.get("thumbnails")), crop=True)})
+    return {"country": country, "name": sel.get("text"),
+            "countries": sorted(o for o in (raw.get("countries") or {}).get("options") or [] if isinstance(o, str)),
+            "playlists": playlists, "artists": artists}
+
+
+def chart_playlist(title):
+    """The YouTube Charts playlist id with exactly this title ("Top 100 Songs Germany"), found by a playlist
+    search, else None. The songs charts aren't on the anonymous charts page, but the playlists exist."""
+    want = title.casefold()
+    for kind in ("community_playlists", "playlists"):  # the first finds the US one (checked 2026-10-22), the 2nd India's
+        for r in _call("search", title, filter=kind, limit=20) or []:
+            pid = str((r or {}).get("browseId") or "")
+            pid = pid[2:] if pid.startswith("VL") else pid
+            if pid.startswith(CHART_LIST_PREFIX) and str(r.get("title") or "").casefold() == want:
+                return pid
+    return None

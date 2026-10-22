@@ -7,18 +7,27 @@ LISTENS_TRIGGER new counted listens arrive, so Quick picks follow what's being p
 The very first request (no file yet) waits up to BUDGET for the build, else answers with the shelves that need
 no network and `stale: true`.
 
-What's stored is filtered again on every request (hidden artists, "Not interested" tracks), and Liked songs
-and the mood tiles are read fresh (both cheap), so none of these waits for a rebuild.
+What's stored is filtered again on every request (hidden artists, "Not interested" tracks), and Liked songs,
+the Charts shelf (charts.py's cache, warmed by the refresher thread) and the mood tiles are read fresh (all cheap),
+so none of these waits for a rebuild.
+
+With personalisation on (personal.py), a build also stores YouTube Music's own home shelves for the kept visitor
+id ("Quick picks", "Mixed for you", …); they're served after Reef's shelves (ids `ytm:<slug>`), minus anything a
+shelf before them already shows. `GET /api/home?ytm=0` leaves them out.
 """
 import logging
 import threading
 import time
 
+import re
+
 import blocklist
+import charts
 import config
 import history
 import likes
 import listens
+import personal
 import recommend
 import store
 import tiles
@@ -43,8 +52,11 @@ SHELVES = {
     "jump_back": ("Jump back in", "tracks"),
     "liked": ("Liked songs", "tracks"),
     "top_artists": ("Your top artists", "artists"),
+    # YouTube Music's own shelves (personalisation on) come here, in YouTube's order.
+    "charts": ("Charts", "tracks"),
     "moods": ("Moods & genres", "moods"),
 }
+YTM_PREFIX = "ytm:"
 
 _file = store.JsonFile(lambda: config.HOME_FILE, dict)
 _lock = threading.Lock()   # held while a build runs
@@ -97,9 +109,31 @@ def build(now=None, remote=True):
         "jump_back": recommend.jump_back_in(items, now),
         "top_artists": recommend.top_artists(items, now),
     }
-    return {"generated_at": now, "source": "fallback" if reason else "fresh", "reason": reason,
-            "next_at": now + wait, "ytm": ytm, "seeds": len(seeds), "errors": [str(e)[:200] for e in errors[:3]],
-            "shelves": [{"id": k, "kind": SHELVES[k][1], "items": v} for k, v in shelves.items() if v]}
+    personalised = ytm and personal.active()
+    doc = {"generated_at": now, "source": "fallback" if reason else "fresh", "reason": reason,
+           "next_at": now + wait, "ytm": ytm, "personal": personalised, "seeds": len(seeds),
+           "errors": [str(e)[:200] for e in errors[:3]],
+           "shelves": [{"id": k, "kind": SHELVES[k][1], "items": v} for k, v in shelves.items() if v]}
+    if personalised and remote and limited is None:
+        try:
+            doc["shelves"] += _ytm_shelves(ytmusic.home())
+        except Exception as e:  # Reef's own shelves stand on their own
+            doc["ytm_error"] = str(e)[:200]
+            logger.warning(f"home: YouTube Music home failed: {str(e)[:200]}")
+    return doc
+
+
+def _ytm_shelves(rows):
+    """YouTube Music home rows as stored shelves {id: "ytm:<slug>", title, kind, items}."""
+    out, seen = [], set()
+    for row in rows:
+        slug = re.sub(r"[^a-z0-9]+", "-", row["title"].casefold()).strip("-")[:40] or str(len(out))
+        sid = YTM_PREFIX + slug
+        while sid in seen:
+            sid += "-2"
+        seen.add(sid)
+        out.append({"id": sid, "title": row["title"], "kind": row["kind"], "items": row["items"]})
+    return out
 
 
 def load():
@@ -176,7 +210,8 @@ def due(doc, now=None):
         return True
     if doc.get("reason") == "rate_limited":
         return False
-    if doc.get("ytm") != bool(ytmusic.enabled()):
+    ytm = bool(ytmusic.enabled())
+    if doc.get("ytm") != ytm or bool(doc.get("personal")) != (ytm and personal.active()):
         return True
     n = new_listens(doc.get("generated_at", 0))
     return n >= LISTENS_TRIGGER or (n > 0 and not doc.get("seeds"))  # first listens: Quick picks can start
@@ -196,26 +231,53 @@ def listened():
         tick()
 
 
-def _present(doc, source, stale, now):
+def _filtered(s, blocked, disliked, shown):
+    """A stored shelf's items minus hidden artists, "Not interested" tracks and (YouTube Music's shelves) what
+    an earlier shelf already shows. Copies: the stored document is shared."""
+    kind, items = s.get("kind"), s.get("items") or []
+    dedupe = str(s.get("id", "")).startswith(YTM_PREFIX)
+    if kind == "tracks":
+        items = [dict(t) for t in items if t.get("id") not in disliked and not blocked.track(t)
+                 and not (dedupe and t.get("id") in shown)]
+    elif kind == "artists":
+        items = [dict(a) for a in items if not blocked.artist(a.get("id"), a.get("name"))]
+    elif kind == "seeds":
+        items = [dict(m) for m in items if m["seed"].get("id") not in disliked and not blocked.track(m["seed"])]
+    elif kind == "cards":
+        items = [dict(c) for c in items if c.get("id") not in shown and c.get("id") not in disliked
+                 and not (c.get("type") == "track" and blocked.track(c.get("track") or {}))
+                 and not (c.get("type") == "artist" and blocked.artist(c.get("id"), c.get("title")))]
+    for x in items:
+        shown.add(x["seed"].get("id") if kind == "seeds" else x.get("id"))
+    return items
+
+
+def _present(doc, source, stale, now, ytm=True):
     blocked = blocklist.matcher()
     disliked = recommend.disliked_ids(now)
     stored = {s.get("id"): s for s in doc.get("shelves") or []}
     stored["liked"] = {"id": "liked", "kind": "tracks",
                        "items": [t for t in (store.clean_track(e) for e in likes.entries()[:recommend.LIKED]) if t]}
-    shelves = []
+    chart = charts.home_shelf() if ytmusic.enabled() else None
+    if chart:
+        stored["charts"] = {"id": "charts", "kind": "tracks", "items": chart["items"],
+                            "extra": {"country": chart["country"], "name": chart["name"], "section": chart["section"]}}
+    ytm_shelves = [s for s in doc.get("shelves") or [] if str(s.get("id", "")).startswith(YTM_PREFIX)]
+    shelves, shown = [], set()
     for sid in SHELVES:
+        if sid == "charts" and ytm and ytmusic.enabled() and personal.active():
+            for s in ytm_shelves:
+                items = _filtered(s, blocked, disliked, shown)
+                if items:
+                    shelves.append({"id": s["id"], "title": s.get("title") or "", "kind": s["kind"],
+                                    "source": "ytmusic", "items": items})
         s = stored.get(sid)
         if not s:
             continue
-        kind, items = s.get("kind"), s.get("items") or []
-        if kind == "tracks":
-            items = [dict(t) for t in items if t.get("id") not in disliked and not blocked.track(t)]
-        elif kind == "artists":
-            items = [dict(a) for a in items if not blocked.artist(a.get("id"), a.get("name"))]
-        elif kind == "seeds":
-            items = [dict(m) for m in items if m["seed"].get("id") not in disliked and not blocked.track(m["seed"])]
+        items = _filtered(s, blocked, disliked, shown)
         if items:
-            shelves.append({"id": sid, "title": SHELVES[sid][0], "kind": kind, "items": items})
+            shelves.append({"id": sid, "title": SHELVES[sid][0], "kind": s.get("kind"), "items": items,
+                            **(s.get("extra") or {})})
     moods = tiles.load()
     if moods:
         shelves.append({"id": "moods", "title": SHELVES["moods"][0], "kind": "moods", "items": moods})
@@ -225,9 +287,10 @@ def _present(doc, source, stale, now):
     return body
 
 
-def serve(now=None, budget=BUDGET):
+def serve(now=None, budget=BUDGET, ytm=True):
     """The /api/home body. From the file when there is one (kicking a rebuild when due); the first time, the
-    build if it finishes within `budget`, else the local shelves now and the rest on a later request."""
+    build if it finishes within `budget`, else the local shelves now and the rest on a later request.
+    `ytm=False` leaves YouTube Music's own shelves out."""
     now = time.time() if now is None else now
     doc = load()
     if doc is None:
@@ -236,12 +299,12 @@ def serve(now=None, budget=BUDGET):
             ev.wait(budget)
         doc = load()
         if doc is None:
-            return _present(build(now, remote=False), "fallback", True, now)
-        return _present(doc, doc["source"], refreshing(), now)
+            return _present(build(now, remote=False), "fallback", True, now, ytm)
+        return _present(doc, doc["source"], refreshing(), now, ytm)
     stale = due(doc, now)
     if stale:
         refresh_async()
-    return _present(doc, "cache" if doc.get("source") == "fresh" else "fallback", stale or refreshing(), now)
+    return _present(doc, "cache" if doc.get("source") == "fresh" else "fallback", stale or refreshing(), now, ytm)
 
 
 def status():
@@ -251,7 +314,9 @@ def status():
         return {"built": False, "refreshing": refreshing()}
     return {"built": True, "generated_at": int(doc["generated_at"]), "source": doc.get("source"),
             "reason": doc.get("reason"), "next_at": int(doc.get("next_at", 0)), "seeds": doc.get("seeds"),
-            "errors": doc.get("errors"), "refreshing": refreshing()}
+            "errors": doc.get("errors"), "refreshing": refreshing(), "personal": bool(doc.get("personal")),
+            "ytm_shelves": sum(str(s.get("id", "")).startswith(YTM_PREFIX) for s in doc.get("shelves") or []),
+            "ytm_error": doc.get("ytm_error"), "charts_cached": charts.fresh(charts.country())}
 
 
 def _loop():
@@ -261,6 +326,7 @@ def _loop():
             tick()
         except Exception as e:
             logger.warning(f"home: tick failed: {str(e)[:200]}")
+        charts.warm()  # the Charts shelf reads the cache only; never raises
         time.sleep(TICK)
 
 

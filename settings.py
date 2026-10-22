@@ -3,7 +3,8 @@ Reef runs. reef.env / the environment stays the default; a key only present in s
 resetting it (PATCH with null) goes back to the env value. Code that honours a setting calls `get(key)` at the
 moment it needs it, so a change applies without a restart.
 
-Secrets (`secret: True`) are write-only: `public()` reports only whether they're set.
+Secrets (`secret: True`) are write-only: `public()` reports only whether they're set. Masked text (`masked: True`, an
+anonymous id) is reported as set + a preview; server-side code reads it in full.
 Instance lists (`urls`) are sent as one comma-separated string (or a list); blank goes back to the reef.env list.
 """
 import re
@@ -46,6 +47,18 @@ SCHEMA = {
                          "default": lambda: ["lrclib", "youtube", "betterlyrics"], "label": "Lyrics sources",
                          "help": "Where the lyrics view looks, in order (LRCLIB, SimpMusic, YouTube Music, "
                                  "BetterLyrics for word timing). Kept songs are tagged with LRCLIB lyrics only."},
+    "yt_personalize": {"type": "bool", "default": lambda: config.YT_PERSONALIZE, "label": "Personalise YouTube Music",
+                       "help": "Reports what you play to YouTube Music under an anonymous visitor id so Quick "
+                               "picks/home learn your taste; no Google account. Off by default."},
+    # The anonymous id the reports and YouTube Music requests carry while personalisation is on. Made on first use;
+    # paste one to move the taste profile between installs, blank = start over with a new id. Shown masked.
+    "yt_visitor_id": {"type": "text", "masked": True, "pattern": r"Cg[A-Za-z0-9_%=+/-]{10,1000}", "default": lambda: "",
+                      "label": "YouTube Music visitor id",
+                      "help": "The anonymous id personalisation uses. Paste one to keep a taste profile; clear it to "
+                              "start over."},
+    "charts_country": {"type": "text", "pattern": r"[A-Z]{2}", "upper": True, "default": lambda: config.CHARTS_COUNTRY,
+                       "label": "Charts country",
+                       "help": "Whose YouTube Music charts Home and Charts show: ZZ = global, else a country code."},
     "listenbrainz_token": {"type": "secret", "default": lambda: "", "label": "ListenBrainz token",
                            "help": "User token from listenbrainz.org/settings, for scrobbling. Never shown again once saved."},
     "scrobble_enabled": {"type": "bool", "default": lambda: True, "label": "Scrobble to ListenBrainz",
@@ -100,6 +113,8 @@ def _valid(key, value):
             raise ValueError(f"{key} must be a token without spaces")
         return value.strip()
     if kind == "text":
+        if isinstance(value, str) and spec.get("upper"):
+            value = value.upper()
         if not isinstance(value, str) or not re.fullmatch(spec["pattern"], value.strip()):
             raise ValueError(f"{key} has the wrong format")
         return value.strip()
@@ -136,11 +151,23 @@ def get(key):
     return spec["default"]()
 
 
+def mask(value):
+    """A recognisable but unusable preview of an id: its first and last 4 characters."""
+    value = str(value or "")
+    return f"{value[:4]}…{value[-4:]}" if len(value) > 12 else "…" if value else ""
+
+
 def public():
-    """{key: value} for GET; secrets are {"set": bool}."""
+    """{key: value} for GET; secrets are {"set": bool}, masked values {"set": bool, "masked": "Cgs3…AQE"}."""
     out = {}
     for key, spec in SCHEMA.items():
-        out[key] = {"set": bool(get(key))} if spec["type"] == "secret" else get(key)
+        value = get(key)
+        if spec["type"] == "secret":
+            out[key] = {"set": bool(value)}
+        elif spec.get("masked"):
+            out[key] = {"set": bool(value), "masked": mask(value)}
+        else:
+            out[key] = value
     return out
 
 
@@ -149,8 +176,11 @@ def schema():
     over = _overrides()
     rows = []
     for key, spec in SCHEMA.items():
+        hidden = spec["type"] == "secret" or spec.get("masked")
         row = {"key": key, "type": spec["type"], "label": spec["label"], "help": spec["help"],
-               "default": None if spec["type"] == "secret" else spec["default"](), "overridden": key in over}
+               "default": None if hidden else spec["default"](), "overridden": key in over}
+        if spec.get("masked"):
+            row["masked"] = True
         if "choices" in spec:
             row["choices"] = list(spec["choices"])
         rows.append(row)

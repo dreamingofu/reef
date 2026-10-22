@@ -17,8 +17,10 @@ import yt_dlp
 from flask import Flask, Response, abort, jsonify, redirect, render_template, request
 from werkzeug.exceptions import BadRequest, RequestEntityTooLarge
 
+import aliases
 import backup
 import blocklist
+import charts
 import config
 import downloader
 import errors
@@ -31,6 +33,7 @@ import log
 import lyrics
 import matching
 import navidrome
+import personal
 import playlists
 import recommend
 import scrobble
@@ -177,6 +180,7 @@ def _config_summary():
         "lrc_sidecar": settings.get("lrc_sidecar"), "prefer_library": settings.get("prefer_library"),
         "keep_lossless": settings.get("keep_lossless"), "sponsorblock_play": settings.get("sponsorblock_play"),
         "replace_dead_tracks": settings.get("replace_dead_tracks"),
+        "yt_personalize": settings.get("yt_personalize"), "charts_country": settings.get("charts_country"),
         "settings_overridden": sorted(r["key"] for r in settings.schema() if r["overridden"]),
         "ydl_extra_keys": sorted(config.YDL_EXTRA), "fake_wall": config.FAKE_WALL,
         "log_dir": str(config.LOG_DIR) if config.LOG_DIR else None,
@@ -197,6 +201,7 @@ def api_diagnostics():
         "yt_gates": sources.youtube.gates.snapshot(),
         "failover_cooling": sources.failover.cooling(),
         "home": home.status(),
+        "personal": {k: v for k, v in personal.status().items() if k != "recent"},
         "scrobble": {k: v for k, v in scrobble.status().items()
                      if k in ("enabled", "token_set", "pending", "submitted", "last_ok_at", "last_error", "retry_at")},
         "update": {k: v for k, v in updater.status().items() if k != "log_tail"},
@@ -262,11 +267,13 @@ def _kept_entry(track_id):
     return entry
 
 
-def _mark_kept(tracks):
+def _mark_kept(tracks, names=None):
     """Mark `kept` and `liked` (one file read each, not one per track). A kept track Navidrome has scanned
-    also gets `nd_id`: the player streams `nd:<nd_id>` instead (production plan P1.5)."""
+    also gets `nd_id`: the player streams `nd:<nd_id>` instead (production plan P1.5). Every list the client
+    gets passes here, so artist aliases (display names) are applied here too."""
     kept = _kept_ids()
     liked = likes.ids()
+    (names or aliases.resolver()).tracks(tracks)
     for t in tracks:
         tid = t.get("id")
         t["kept"] = tid in kept or str(tid).startswith("nd:")  # library tracks are the library itself
@@ -612,6 +619,10 @@ def api_album(browse_id):
     page["blocked"] = blocked.any_artist(page["artists"])
     if not page["blocked"]:
         page["tracks"] = blocked.tracks(page["tracks"])
+    names = aliases.resolver()
+    if names:
+        page["artists"] = [{**a, "name": names.name(a["name"], a.get("id"))} for a in page["artists"]]
+        page["artist"] = ", ".join(a["name"] for a in page["artists"]) or page["artist"]
     return _page(page)
 
 
@@ -631,6 +642,11 @@ def api_artist(channel_id):
     if not page["blocked"]:
         page["songs"] = blocked.tracks(page["songs"])
     page["related"] = [r for r in page["related"] if not blocked.artist(r["id"], r["name"])]
+    names = aliases.resolver()
+    if names:
+        page["name"] = names.name(names.name(page["name"], page["channel_id"]), page["id"])
+        for r in page["related"]:
+            r["name"] = names.name(r["name"], r["id"])
     return _page(page, "songs")
 
 
@@ -940,11 +956,28 @@ def api_unlike(track_id):
 
 @app.get("/api/home")
 def api_home():
-    """Home shelves from home.json (rebuilt in the background); see home.py."""
-    body = home.serve()
+    """Home shelves from home.json (rebuilt in the background); see home.py. `ytm=0` leaves out YouTube Music's
+    own shelves (served with personalisation on)."""
+    body = home.serve(ytm=request.args.get("ytm", "1") != "0")
+    names = aliases.resolver()
     for s in body["shelves"]:
         if s["kind"] == "tracks":
-            _mark_kept(s["items"])
+            _mark_kept(s["items"], names)
+        elif s["kind"] == "cards":
+            _mark_kept([c["track"] for c in s["items"] if c.get("type") == "track" and c.get("track")], names)
+            for c in s["items"]:
+                if c.get("type") == "track" and c.get("track"):
+                    c["subtitle"] = c["track"].get("channel") or c.get("subtitle")
+                elif c.get("type") == "artist" and names:
+                    c["title"] = names.name(c.get("title"), c.get("id"))
+        elif s["kind"] == "artists" and names:
+            for a in s["items"]:
+                a["name"] = names.name(a.get("name"), a.get("id"))
+        elif s["kind"] == "seeds" and names:
+            for m in s["items"]:
+                m["name"] = names.name(m.get("name"), m.get("artist_id"))
+                m["seed"] = names.track(dict(m["seed"]))
+                m["with"] = [names.name(n) for n in m.get("with") or []]
     resp = jsonify(body)
     resp.headers["Cache-Control"] = "no-store"
     return resp
@@ -1100,6 +1133,106 @@ def api_playlist_export(pid):
     if out is None:
         abort(404)
     return jsonify({**out, "rescanned": navidrome.rescan()})
+
+
+# ---------- anonymous YouTube Music personalisation (production plan P1.2) ----------
+
+def _personal_body():
+    body = request.get_json(force=True, silent=True)  # sendBeacon may not send a JSON Content-Type
+    if not isinstance(body, dict) or not isinstance(body.get("id"), str) or len(body["id"]) > 140:
+        return None
+    return body
+
+
+def _personal_answer(queued, reason):
+    return jsonify({"queued": queued, **({"reason": reason} if reason else {})}), 202 if queued else 200
+
+
+@app.post("/api/personal/play")
+def api_personal_play():
+    """A track started playing. With personalisation on (and a YouTube id) the play is reported to YouTube Music
+    in the background; otherwise nothing is sent. Answers at once: {queued, reason?: off|not_youtube|paused}."""
+    body = _personal_body()
+    if body is None:
+        return jsonify({"error": "send {id}"}), 400
+    return _personal_answer(*personal.play(body["id"]))
+
+
+@app.post("/api/personal/progress")
+def api_personal_progress():
+    """Heartbeat while playing {id, t (s)}: a watchtime ping goes out at most every 10 s for the play /play
+    started. {queued, reason?: off|not_youtube|paused|no_play|throttled|bad_time}."""
+    body = _personal_body()
+    if body is None:
+        return jsonify({"error": "send {id, t}"}), 400
+    return _personal_answer(*personal.progress(body["id"], body.get("t")))
+
+
+@app.get("/api/personal/status")
+def api_personal_status():
+    return jsonify(personal.status())
+
+
+# ---------- charts (YouTube Music) ----------
+
+@app.get("/api/charts")
+def api_charts():
+    """YouTube Music charts for `country` (ZZ = global; default: the charts_country setting); see charts.py."""
+    code = (request.args.get("country") or charts.country()).strip().upper()
+    if not charts.valid(code):
+        return jsonify({"error": "country must be a two-letter code (ZZ = global)"}), 400
+    if not ytmusic.enabled():
+        return _ytm_off()
+    known = (charts.cached(charts.country()) or charts.cached("ZZ") or {}).get("countries")
+    if known and code not in known:
+        return jsonify({"error": f"no YouTube Music charts for {code}", "countries": known}), 400
+    try:
+        doc = charts.get(code)
+    except Exception as e:
+        return jsonify({"error": str(e)[:300]}), 502
+    blocked, names = blocklist.matcher(), aliases.resolver()
+    for s in doc["sections"]:
+        if s["kind"] == "artists":
+            s["items"] = [a for a in s["items"] if not blocked.artist(a["id"], a["name"])]
+            for a in s["items"]:
+                a["name"] = names.name(a["name"], a["id"])
+        else:
+            s["items"] = _mark_kept(blocked.tracks(s["items"]), names)
+    first = next((s["items"][0]["id"] for s in doc["sections"] if s["kind"] != "artists" and s["items"]), None)
+    if first:
+        streamer.prefetch([first])
+    return jsonify(doc)
+
+
+# ---------- artist aliases ----------
+
+@app.get("/api/aliases")
+def api_aliases():
+    return jsonify(aliases.entries())
+
+
+@app.put("/api/aliases")
+def api_alias_put():
+    """{name: display name, id?: channel id (UC…), match?: the name sources give}: add or rename an alias."""
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        return jsonify({"error": "send {name, id?, match?}"}), 400
+    try:
+        entry, created = aliases.put(body.get("name"), body.get("id"), body.get("match"))
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    return jsonify({"entry": entry, "created": created}), 201 if created else 200
+
+
+@app.delete("/api/aliases")
+def api_alias_delete():
+    artist_id = request.args.get("id", "").strip()
+    match = request.args.get("match", "").strip()[:aliases.NAME_MAX]
+    if not artist_id and not match:
+        return jsonify({"error": "id or match required"}), 400
+    if not aliases.remove(artist_id or None, match or None):
+        abort(404)
+    return "", 204
 
 
 # ---------- settings ----------

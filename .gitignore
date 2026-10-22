@@ -35,3 +35,5 @@ update.json.tmp
 matches.json
 matches.json.tmp
 backups/
+aliases.json
+aliases.json.tmp

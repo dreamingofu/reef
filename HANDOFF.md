@@ -1,6 +1,6 @@
 # Reef — handoff notes (resume on another machine)
 
-Last updated: 2026-10-22.
+Last updated: 2026-10-22 (Round 15).
 
 ## What's running
 
@@ -96,6 +96,8 @@ Pass the Navidrome password through the environment. Don't put it in a committed
 - `matching.py` (same-song scoring + `matches.json`), `segments.py` (SponsorBlock at play time): Round 13.
 - `lyrics.py` (LRCLIB, the provider chain, cache, offset/pin, embedding) + `lyrics_providers.py` (SimpMusic,
   YouTube Music, BetterLyrics TTML, the text checks): Round 14.
+- `personal.py` (opt-in anonymous YouTube Music personalisation), `charts.py` (YouTube Music charts),
+  `aliases.py` (artist display names): Round 15.
 - `log.py`: logging setup (stderr + `logs/reef.log` rotated 1 MB × 5 + a 300-line in-memory tail), `redact()` for
   signed-URL params / Subsonic tokens / cookies. Modules log through `logging.getLogger(__name__)`, no print().
 - `termux/reef-run.sh`: restart loop with backoff; `termux/reef-boot.sh` (Termux:Boot) (re)starts it.
@@ -580,6 +582,100 @@ disabled), unpin brings the word-timed lyrics back, offset survives a reload, ta
 1. Open lyrics on a popular song: BetterLyrics word highlighting on iPhone Safari (timeupdate ~4/s: words light in
    small groups); nudge timing and reopen the app.
 2. "Wrong lyrics?" → pick another result → it stays after a restart; keep the song → the file has the pinned text.
+
+## Round 15 (2026-10-22): anonymous personalisation, charts, artist aliases (production plan P1.2, P2)
+
+New settings `yt_personalize` (default **off**, `REEF_YT_PERSONALIZE`), `yt_visitor_id` (masked), `charts_country`
+(default `ZZ` = global, `REEF_CHARTS_COUNTRY`); new file `aliases.json` (git-ignored, `REEF_ALIASES_FILE`, next to
+history.json).
+
+- **Personalisation** (`personal.py`): with `yt_personalize` and `ytmusic` both on, Reef keeps one visitorData for
+  good (`yt_visitor_id`: made on first use from `music.youtube.com/sw.js_data`, the homepage's ytcfg as fallback;
+  paste one to carry a taste profile over, blank = a new one next time). `ytmusic._client()` rebuilds the shared
+  YTMusic with that id in `X-Goog-Visitor-Id` + `context.client.visitorData` (pre-filling ytmusicapi's
+  `base_headers` cache, so no homepage fetch) whenever the setting or the id changes; off = ytmusicapi's own
+  throwaway id again. The player (app.js `personalPing`, only when `state.settings.yt_personalize` and a YouTube id)
+  posts `/api/personal/play` when a play starts (the listen log's new `lis`) and `/api/personal/progress` every 10 s
+  of actual playing. One daemon thread (`reef-personal`, queue of 32) does the play sequence: InnerTube `player`
+  (WEB_REMIX, `signatureTimestamp` read from base.js once a day: without it YouTube answers UNPLAYABLE with no
+  `playbackTracking`) → GET `videostatsPlaybackUrl.baseUrl&ver=2&c=WEB_REMIX&cpn=<16>`; heartbeats GET
+  `music.youtube.com/api/stats/watchtime?ns=yt&ver=2&c=WEB_REMIX&cmt=&docid=&cpn=` (same cpn; server throttle 10 s per
+  play, only for the id /play started). All requests carry the visitor header plus `VISITOR_INFO1_LIVE` (decoded
+  from the visitorData) and `SOCS=CAI` cookies. Failures: debug log, dropped; any 4xx pauses everything 10 min.
+  Off: the routes answer `{queued: false, reason: "off"}` and nothing is sent (work queued before the switch is
+  dropped). One info line per reported play: `personal play id=… player=200 videostats=204 ms=…`.
+- **YouTube Music's own Home**: with personalisation on, a Home build also stores `get_home(6)` shelves (ids
+  `ytm:<slug>`, `source: "ytmusic"`; songs-only rows = `tracks`, mixed rows = `cards`), served after Reef's shelves
+  and before Charts/Moods, minus anything an earlier shelf shows. `?ytm=0` leaves them out; turning the setting on or
+  off makes a rebuild due (and hides them at once).
+- **Charts** (`charts.py`, `ytmusic.charts` / `chart_playlist`): the anonymous FEmusic_charts page only has video
+  playlists (Daily / Top 100 Music Videos, Trending 20, US genres, IN languages) + top artists (+ top albums and
+  podcasts for some countries; ytmusicapi 1.12.3's `get_charts` takes the US albums for the artists, so Reef reads
+  the page per carousel itself, falling back to `get_charts`). Sections: **Top 100 Songs** (`tracks`; Global's
+  playlist id is known, other countries' are found by an exact-title search among YouTube Charts' `PL4fGSI1pDJn…`
+  playlists: US and IN found, DE/BR/JP/GB/FR/MX not, as of 2026-10-22; the lookup is cached 7 days, misses too),
+  **Top 100 Music Videos** (`videos`), **Trending 20** (`trending`, not for ZZ), **Top artists** (`artists`).
+  Tracks carry `rank` (assigned before blocked artists are dropped). Cache per country 6 h in memory (30 min when a
+  section failed; a failed refetch serves the old copy as `stale` and waits 10 min). Home's **Charts** shelf (top
+  10 songs, else top 10 videos, of `charts_country`) reads that cache only; the Home refresher thread warms it.
+  Chart rows are mostly official videos: their art is 16:9 `i.ytimg.com` (YT Music gives no square art for them).
+- **Aliases** (`aliases.py`): `{id: UC… | null, match: name | null, name}`; id beats name; names compare like the
+  blocklist's (`BeyonceVEVO` = `Beyonce` = `Beyonce - Topic`). Applied at the response boundary: `_mark_kept`
+  (every track list: search, radio, link, album, artist, playlist, likes, playlists, charts, Home), album
+  `artist(s)`, artist page `name` + related, Home seeds / top artists / cards. Caches and stores keep the source's
+  names (the resolver copies `artists` lists). Keeps: `downloader._tags` passes the alias to `music_tags` (artist +
+  album artist; the uploading channel's id names a lone artist) and over album-page hints; the generic path tags the
+  aliased artist / album artist. Lyrics lookups, history and matching keep the source's names.
+
+### API shapes
+
+- `POST /api/personal/play {id}` → 202 `{queued: true}` / 200 `{queued: false, reason: off|not_youtube|paused}`; 400
+  bad body. `POST /api/personal/progress {id, t}` → same, reasons + `no_play|throttled|bad_time`. Both accept a
+  beacon body (any Content-Type). `GET /api/personal/status` → `{active, visitor (masked), paused_until, sent,
+  failed, dropped, current: {id, started_at}, recent: [{kind: player|videostats|watchtime, id, status, at, error?}]}`
+  (diagnostics carries it without `recent`).
+- Settings: `values.yt_visitor_id` = `{set, masked: "CgtF…TVFr"}`; schema row `type: "text", masked: true,
+  default: null`. PATCH a pasted id (`Cg…`, ≤ 1002 chars) or `""` to reset. `charts_country` is upper-cased.
+- `GET /api/charts?country=ZZ|US|…` (default: the setting) → `{country, name, countries: [codes], generated_at,
+  stale?, sections: [{title, kind: tracks|videos|trending, playlist_id, items: [track + {rank, kept, liked,
+  nd_id?}]} | {title: "Top artists", kind: "artists", items: [{id, name, rank, trend: up|down|neutral|null,
+  subscribers, thumb}]}]}`; 400 bad code / not in YouTube's list (with `countries`), 502 YT Music off or down.
+- `GET /api/home` shelves may now include `{id: "charts", title: "Charts", kind: "tracks", country, name, section,
+  items}` and `{id: "ytm:<slug>", title, kind: tracks|cards, source: "ytmusic", items}`; a card is `{type:
+  track|album|playlist|artist, id, title, subtitle, thumb, track? (for type track, marked kept/liked)}`.
+- `GET /api/aliases` → `[{id, match, name, at}]`; `PUT /api/aliases {name, id?, match?}` → 201/200 `{entry,
+  created}` (same id, or same name when the entry has no id, = rename); 400 bad body. `DELETE
+  /api/aliases?id=|match=` → 204 / 404 / 400.
+
+### Measured on the Mac (live, port 5310, scratch data)
+
+`/api/charts?country=ZZ` cold 1.38 s (tracks 99, videos 100, artists 40), warm 4 ms; `US` 2.1-2.6 s (tracks 100
+once the community-playlist search found it, videos 99, trending 20, artists 40: Drake #1, not the albums
+carousel). Personalisation ON with a fresh id: id made in ~0.9 s, `player=200 videostats=204 ms=359`, two heartbeats
+`watchtime 204`, 204; the next Home build (0.95 s) added 8 YouTube Music shelves (Quick picks 20 songs, Throwbacks,
+Pump it up, Low key vibes, Trending community playlists, All-time essentials, Today's biggest hits, Trending songs for
+you 14). OFF (before and after): play + 2 heartbeats answered `reason: off`, status counters unchanged, no new
+`personal` log lines, the rebuild dropped the YT shelves. Aliases: id alias `Beyoncé → Бейонсе` showed in search,
+radio and the artist page; name alias `DaftPunkVEVO → Daft Punk (FR)` matched YT Music's "Daft Punk"; delete →
+original names.
+
+### Privacy notes
+
+- Off by default; nothing goes to YouTube's stats endpoints unless the user turns it on. With it on, every play of a
+  YouTube track (not Monochrome / library-only ones) and its listening progress is tied to one long-lived anonymous
+  YouTube visitor id, and all YT Music requests (search, radio, browse) carry that id too, so YouTube can build a
+  profile of this Reef install (and of the phone's IP). No Google account is involved.
+- The id lives in `settings.json` (masked in the API, diagnostics and logs); it isn't in backups (backup.py's settings
+  whitelist), so a restore on another install starts a new profile unless the id is pasted. Clearing it starts
+  over; YouTube keeps whatever it already learnt about the old one.
+- `/api/personal/status` lists the last 20 reported video ids (local only, like the listen log).
+
+### To check on the phone
+
+1. Settings → turn personalisation on (no UI toggle yet: `PATCH /api/settings {"yt_personalize": true}`), play a
+   few songs for a day, then compare `/api/home` `ytm:quick-picks` with a fresh install's.
+2. Watch `logs/reef.log` for `personal play … videostats=204` and that nothing appears with the setting off.
+3. `/api/charts?country=<yours>`: whether a Top 100 Songs section is found for the phone's country.
 
 ## Production plan (2026-10-21)
 

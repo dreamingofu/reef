@@ -23,6 +23,7 @@ from yt_dlp.postprocessor.metadataparser import MetadataParserPP
 from yt_dlp.postprocessor.sponsorblock import SponsorBlockPP
 from yt_dlp.utils import sanitize_filename, sanitize_path
 
+import aliases
 import config
 import errors
 import history
@@ -106,8 +107,16 @@ def remove(job_id):
 
 # ---------- yt-dlp keep path ----------
 
-def _tags(info, hints):
-    return with_hints(music_tags(info), hints)
+def _tags(info, hints, alias=True):
+    """The tags a keep writes: yt-dlp's metadata cleaned up, album-page hints over it, artist aliases applied
+    (aliases.py). `alias=False` gives the source's own names (lyrics are looked up by those)."""
+    if not alias:
+        return with_hints(music_tags(info), hints)
+    names = aliases.resolver()
+    tags = with_hints(music_tags(info, names.name if names else None), hints)
+    if names and tags.get("meta_album_artist"):  # an album-page hint names the artist as the source does
+        tags["meta_album_artist"] = names.name(tags["meta_album_artist"])
+    return tags
 
 
 class _MusicTagsPP(PostProcessor):
@@ -230,8 +239,9 @@ def _run_ytdlp(job):
     job["file"] = requested.get("filepath")
     job["title"] = info.get("title") or job["title"]
     job["percent"] = 100
-    # What the file was tagged with (_MusicTagsPP is deterministic); the post steps look lyrics up by it.
-    tags = _tags(info, job.get("hints"))
+    # What the file was tagged with (_MusicTagsPP is deterministic), but with the source's artist names (not an
+    # alias): the post steps look lyrics up by them.
+    tags = _tags(info, job.get("hints"), alias=False)
     history.add({
         "id": job["video_id"],
         "title": job["title"],
@@ -431,8 +441,9 @@ def _run_generic(job, track_id=None, fmt=None, expect=None, extra=None):
         job["status"] = "converting"
         _convert(raw, entry.get("ext"), out, fmt)
         cover, cover_mime = _cover_bytes(src, native)
-        _tag(out, title, artist, album, cover, cover_mime, info.get("isrc") or "",
-             hints.get("album_artist") or "", hints.get("track_number"), hints.get("year"))
+        names = aliases.resolver()
+        _tag(out, title, names.name(artist), album, cover, cover_mime, info.get("isrc") or "",
+             names.name(hints.get("album_artist") or ""), hints.get("track_number"), hints.get("year"))
         length = _length(out)
         dest = DOWNLOAD_DIR / f"{_filename(title)}.{ext}"
         part = dest.with_name(dest.name + ".part")

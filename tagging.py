@@ -43,9 +43,10 @@ def _year(info):
     return None
 
 
-def music_tags(info):
+def music_tags(info, alias=None):
     """`meta_*` overrides for FFmpegMetadataPP (it prefers them over the plain fields). Never touches
-    info["title"], which names the file."""
+    info["title"], which names the file. `alias(name, channel_id=None)` gives an artist's display name
+    (aliases.py); the uploading channel's id goes with a lone artist."""
     artists = _names(info.get("artists")) or _names(info.get("artist")) or _names(info.get("creators")) \
         or _names(info.get("creator"))
     known = bool(artists)
@@ -63,9 +64,13 @@ def music_tags(info):
         artists = _names(info.get("uploader")) or _names(info.get("channel"))
     tags = {"meta_title": _strip_noise(title) or title}
     if artists:
+        album_artist = (_names(info.get("album_artists")) or _names(info.get("album_artist")) or artists)[0]
+        if alias:
+            channel_id = info.get("channel_id") if len(artists) == 1 else None
+            album_artist = alias(album_artist, channel_id if album_artist == artists[0] else None)
+            artists = [alias(a, channel_id) for a in artists]
         tags["meta_artist"] = ", ".join(artists)
-        tags["meta_album_artist"] = (_names(info.get("album_artists")) or _names(info.get("album_artist"))
-                                     or artists)[0]
+        tags["meta_album_artist"] = album_artist
     if info.get("album"):
         tags["meta_album"] = str(info["album"])
     if info.get("track_number"):

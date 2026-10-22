@@ -2197,13 +2197,25 @@
     if (!t || resume || audio.paused || rec.seekTo != null || rec.busy || rec.broken) { if (lis) lis.lastT = null; return; }
     if (!lis || lis.track.id !== t.id) {
       closeListen();
-      lis = { track: slim(t), startedAt: Date.now() / 1000, played: 0, lastT: null, lastWall: null, via: "", sent: null };
+      lis = { track: slim(t), startedAt: Date.now() / 1000, played: 0, lastT: null, lastWall: null, via: "", sent: null, beat: 0 };
+      personalPing("play", { id: t.id });
     }
     const now = Date.now();
     lis.played += L.playedDelta(lis.lastT, lis.lastWall, audio.currentTime, now, audio.playbackRate);
     lis.lastT = audio.currentTime;
     lis.lastWall = now;
     if (viaLibrary()) lis.via = "nd";
+    // Personalisation heartbeat: every 10 s of actual playing (the server throttles too).
+    if (lis.played - lis.beat >= 10) { lis.beat = lis.played; personalPing("progress", { id: lis.track.id, t: Math.floor(audio.currentTime) }); }
+  }
+  // Optional anonymous YouTube Music personalisation (Settings, off by default): play start + progress go to Reef,
+  // which reports them to YouTube Music in the background. Nothing is sent while the setting is off, nor for
+  // tracks that aren't YouTube's (the server checks both again).
+  function personalPing(kind, body) {
+    if (state.settings.yt_personalize !== true || srcKey(body.id) !== "yt" || M.isPlaceholder(cur())) return;
+    try {
+      fetch(`/api/personal/${kind}`, { method: "POST", keepalive: true, headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }).catch(() => {});
+    } catch { /* best effort */ }
   }
 
   // ---------- session (queue persistence + resume) ----------

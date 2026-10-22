@@ -95,6 +95,13 @@ UPDATE_REPO = os.environ.get("REEF_UPDATE_REPO", "dreamingofu/reef").strip() or 
 # Search, suggestions, radio and link metadata via YouTube Music (ytmusicapi, anonymous).
 # 0 = yt-dlp search only (no suggestions or radio).
 YTMUSIC = os.environ.get("REEF_YTMUSIC", "1").strip() != "0"
+# Anonymous YouTube Music personalisation (Settings can change it): 1 = report what's played under one persisted
+# visitor id so YouTube Music's own home learns the taste (no Google account). Off by default.
+YT_PERSONALIZE = os.environ.get("REEF_YT_PERSONALIZE", "0").strip() == "1"
+# YouTube Music charts country (ISO 3166-1 alpha-2) for /api/charts and the Home "Charts" shelf; ZZ = global.
+CHARTS_COUNTRY = (os.environ.get("REEF_CHARTS_COUNTRY", "ZZ").strip().upper() or "ZZ")[:2]
+# Artist display names (channel id or artist name -> the name to show and tag). Defaults next to history.json.
+ALIASES_FILE = Path(os.environ.get("REEF_ALIASES_FILE") or HISTORY_FILE.with_name("aliases.json"))
 # Before keeping a YouTube track, look for the same recording on Monochrome (lossless FLAC) and keep that instead;
 # silently falls back to the YouTube keep. Off by default: Monochrome is a third-party Tidal proxy (legally grey).
 KEEP_LOSSLESS = os.environ.get("REEF_KEEP_LOSSLESS", "0").strip() == "1"
