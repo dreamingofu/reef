@@ -28,6 +28,10 @@
     home: store.get("home", null), // the last /api/home body: Home paints from it at once, then refreshes
     query: "",
     results: [],
+    all: null, // a YouTube search grouped by kind (/api/search/all): {top, songs, videos, albums, artists, playlists}
+    kinds: new Map(), // filter chip -> {items, err, loading} for the current query (songs / videos / albums / ...)
+    tmp: [], // the "tmp" list: tracks played straight from data
+    charts: null, // /api/charts (Search landing's Charts cards), null until asked; false when unavailable
     searching: false,
     searchError: null, // the failed search's error (status, body {block, hint})
     link: null, // the current search is a pasted link: { kind: "track" | "playlist", title }
@@ -61,13 +65,27 @@
     results: () => state.results,
     history: () => state.history,
     recent: () => store.get("plays", []),
-    page: () => pageTracks(), // the open album / playlist / artist page
+    page: () => pageShown(), // the open album / playlist / artist page (as sorted / filtered there)
     quick: () => homeItems("quick"),
     on_repeat: () => homeItems("on_repeat"),
     jump_back: () => homeItems("jump_back"),
     liked: () => homeItems("liked"),
     queue: () => state.queue, // Up next rows (the track menu, §8.1)
+    // Search (§10.1): the top result first, then the songs; the videos group; a filter chip's songs / videos.
+    top: () => topQueue(),
+    sv: () => state.all?.videos || [],
+    sk: () => (["songs", "videos", "kept"].includes(state.filter) ? state.kinds.get(state.filter)?.items || [] : []),
+    av: () => (detail.kind === "artist" ? pageData()?.videos || [] : []), // an artist page's videos
+    tmp: () => state.tmp, // a list played straight from data (a top result's album, an artist's radio)
   };
+  // A list by name: the fixed ones above, Home shelves ("h:<id>" tracks, "hc:<id>" the songs among a cards shelf).
+  function listItems(name) {
+    if (typeof name !== "string") return null;
+    if (lists[name]) return lists[name]();
+    if (name.startsWith("h:")) return homeItems(name.slice(2));
+    if (name.startsWith("hc:")) return homeItems(name.slice(3)).filter((c) => c && c.type === "track" && c.track).map((c) => c.track);
+    return null;
+  }
 
   // ---------- helpers ----------
   const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
@@ -1082,6 +1100,195 @@
   })();
   // ==== sheet-core:end ====
 
+  // ---------- discovery core ----------
+  // Search, collection pages, the artist page and Home (UI_REMAKE_PLAN §9, §10.1-10.3): grouping of search results,
+  // sort / filter of a page's songs, the Home order, the cookie shape, thumbnail proxy URLs and header scroll maths.
+  // Pure functions, no DOM, no state. Unit-checked from node by slicing between these sentinels.
+  // ==== discovery-core:start ====
+  const DC = (() => {
+    const GROUPS = ["songs", "artists", "albums", "videos", "playlists"]; // §10.1 order
+    const LABEL = { top: "Top results", songs: "Songs", artists: "Artists", albums: "Albums", videos: "Videos", playlists: "Playlists", kept: "In library" };
+    const PREVIEW = { songs: 4, artists: 3, albums: 3, videos: 3, playlists: 3 }; // shown per group before "Show all"
+    const SORTS = ["default", "name", "artist"];
+    const SORT_LABEL = { default: "Default", name: "Name", artist: "Artist" };
+    const FILTER_MIN = 12; // a page with more songs than this gets the filter field (§10.2 "long playlists")
+    const THUMB_HOSTS = ["i.ytimg.com"];
+    const THUMB_SUFFIXES = [".googleusercontent.com", ".ggpht.com"];
+    const clamp = (x, a, b) => Math.min(b, Math.max(a, x));
+
+    // The id a top result stands for (a track's, or the card's).
+    const topId = (top) => (top ? (top.type === "track" ? top.track?.id : top.id) || null : null);
+
+    // [{kind, label, items (the preview), total, more}] for a /api/search/all body: the §10.1 order, the top result left
+    // out of its own group, empty groups dropped.
+    function searchGroups(all, { preview = PREVIEW } = {}) {
+      if (!all || typeof all !== "object") return [];
+      const skip = topId(all.top);
+      const out = [];
+      for (const kind of GROUPS) {
+        const items = (Array.isArray(all[kind]) ? all[kind] : []).filter((x) => x && x.id && x.id !== skip);
+        if (!items.length) continue;
+        const n = preview[kind] ?? items.length;
+        out.push({ kind, label: LABEL[kind], items: items.slice(0, n), total: items.length, more: items.length > n });
+      }
+      return out;
+    }
+
+    // Filter chips: YouTube gets every kind; other sources only search songs.
+    const chips = (grouped) => (grouped ? ["top", "songs", "videos", "albums", "artists", "playlists", "kept"] : ["top", "songs", "kept"]);
+
+    // Comparable text: accents folded, lowercase, spaces squeezed.
+    const fold = (s) => String(s ?? "").normalize("NFKD").replace(/[̀-ͯ]/g, "").toLowerCase().replace(/\s+/g, " ").trim();
+    const artistOf = (t) => (Array.isArray(t?.artists) && t.artists.find((a) => a && a.name)?.name) || t?.channel || t?.artist || "";
+
+    // A page's songs as shown: [{t, i}] (i = the index in `tracks`), filtered by `q` (title / artist / album words, any
+    // order) and sorted by name or artist (stable; "default" keeps the page's order).
+    function viewTracks(tracks, { sort = "default", q = "" } = {}) {
+      const words = fold(q).split(" ").filter(Boolean);
+      let rows = (Array.isArray(tracks) ? tracks : []).map((t, i) => ({ t, i })).filter(({ t }) => t);
+      if (words.length) {
+        rows = rows.filter(({ t }) => {
+          const hay = fold([t.title, artistOf(t), t.album].join(" "));
+          return words.every((w) => hay.includes(w));
+        });
+      }
+      if (sort === "name" || sort === "artist") {
+        const key = sort === "name" ? (t) => fold(t.title) : (t) => fold(artistOf(t)) + "\u0000" + fold(t.title);
+        rows = rows.map((r) => ({ ...r, k: key(r.t) }))
+          .sort((a, b) => (a.k < b.k ? -1 : a.k > b.k ? 1 : a.i - b.i)).map(({ t, i }) => ({ t, i }));
+      }
+      return rows;
+    }
+    const sortOf = (v) => (SORTS.includes(v) ? v : "default");
+
+    // Home (§9): mood chips from the moods shelf, Quick picks first, then the other shelves in the server's order
+    // (Reef's own, YouTube Music's, Charts). "jump_back" falls back to this device's recent plays when the server has none.
+    function homePlan(shelves, { recent = 0 } = {}) {
+      const list = (Array.isArray(shelves) ? shelves : []).filter((s) => s && s.id && Array.isArray(s.items) && s.items.length);
+      const moods = list.find((s) => s.kind === "moods") || null;
+      const quick = list.find((s) => s.id === "quick") || null;
+      const rest = list.filter((s) => s !== moods && s !== quick);
+      const order = rest.map((s) => ({ id: s.id, kind: s.kind, local: false }));
+      if (!rest.some((s) => s.id === "jump_back") && recent > 0) {
+        // where the server would put it: after Mixed for you / On repeat, else first
+        const at = Math.max(order.findIndex((s) => s.id === "mixed"), order.findIndex((s) => s.id === "on_repeat")) + 1;
+        order.splice(at, 0, { id: "jump_back", kind: "recent", local: true });
+      }
+      return { moods: moods ? moods.items : [], quick: quick ? quick.id : null, order };
+    }
+
+    // The cookie shape (§1.3): an SVG path in a 100 x 100 box, `lobes` gentle bumps of `amp` (share of the radius).
+    function cookiePath(lobes = 9, amp = 0.06, n = 144) {
+      const pts = [];
+      for (let k = 0; k < n; k++) {
+        const a = (k / n) * Math.PI * 2;
+        const r = 50 * (1 - amp) + 50 * amp * Math.cos(lobes * a);
+        pts.push(`${(50 + r * Math.sin(a)).toFixed(2)},${(50 - r * Math.cos(a)).toFixed(2)}`);
+      }
+      return `M${pts[0]}L${pts.slice(1).join(" ")}Z`;
+    }
+    const cookieMask = (path = cookiePath()) => `url("data:image/svg+xml,${encodeURIComponent(
+      `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><path d="${path}"/></svg>`)}")`;
+
+    // A thumbnail as same-origin bytes (/api/thumb) for the cover palette, or null when the server wouldn't fetch it.
+    function thumbSrc(url, size = 64) {
+      let u;
+      try { u = new URL(String(url || "")); } catch { return null; }
+      const host = u.hostname.toLowerCase();
+      if (u.protocol !== "https:" || u.port || u.username || u.password) return null;
+      const ok = THUMB_HOSTS.includes(host) || (THUMB_SUFFIXES.some((s) => host.endsWith(s)) && !u.search);
+      return ok ? `/api/thumb?u=${encodeURIComponent(u.href)}&size=${size}` : null;
+    }
+    // Google's resizable art at another size ("=w544-h544-p-l90-rj" -> "=w900-h900-p-l90-rj"); other URLs as they are.
+    const resized = (url, n) => (typeof url === "string" ? url.replace(/=w\d+-h\d+(?=(?:-[\w]+)*$)/, `=w${n}-h${n}`) : url);
+
+    // Header scroll (§10.2, §10.3): 0 at the top -> 1 once the header has scrolled `h` px; the hero image moves at .4.
+    const headerProgress = (y, h) => (h > 0 ? clamp(y / h, 0, 1) : 0);
+    const parallax = (y, h, k = 0.4) => (y <= 0 ? 0 : Math.min(y, h) * k);
+
+    // "Album · 2016" and "14 songs · 50 min" under a page title.
+    function collectionLines({ type = "", year = "", count = 0, seconds = 0 } = {}) {
+      const eyebrow = [type, year].filter(Boolean).join(" · ");
+      const mins = Math.round((Number(seconds) || 0) / 60);
+      const len = !seconds ? "" : mins >= 60 ? `${Math.floor(mins / 60)} hr ${mins % 60} min` : `${Math.max(1, mins)} min`;
+      const n = Number(count) || 0;
+      return { eyebrow, meta: [n ? `${n} song${n === 1 ? "" : "s"}` : "", len].filter(Boolean).join(" · ") };
+    }
+
+    // "239M monthly audience · 40.2M subscribers": an artist's numbers, each only when known. The search's top artist
+    // carries the monthly audience (`audience`); the artist page has both (`monthly_listeners`, `subscribers`).
+    const artistLine = (a) => [a?.audience || a?.monthly_listeners ? `${a.audience || a.monthly_listeners} monthly audience` : "",
+      a?.subscribers ? `${a.subscribers} subscribers` : ""].filter(Boolean).join(" · ");
+
+    // A recent-searches list without `q` (any case); the removed one comes back at its place on Undo.
+    function dropRecent(list, q) {
+      const arr = Array.isArray(list) ? list : [];
+      const at = arr.findIndex((s) => String(s).toLowerCase() === String(q).toLowerCase());
+      return { list: at < 0 ? arr.slice() : arr.filter((_, k) => k !== at), at };
+    }
+    const putBack = (list, q, at) => {
+      const arr = (Array.isArray(list) ? list : []).filter((s) => String(s).toLowerCase() !== String(q).toLowerCase());
+      arr.splice(clamp(at, 0, arr.length), 0, q);
+      return arr;
+    };
+
+    // "In library" (§10.1): the kept songs among everything this search found (the grouped preview, the full songs
+    // search once loaded), each once, in that order.
+    function keptPool(lists, isKept) {
+      const seen = new Set(), out = [];
+      for (const list of lists || []) for (const t of Array.isArray(list) ? list : []) {
+        if (!t || !t.id || seen.has(t.id)) continue;
+        seen.add(t.id);
+        if (isKept(t)) out.push(t);
+      }
+      return out;
+    }
+    // What a filter chip's list needs: "fetch" (nothing asked yet), "wait" (in flight), "show" (items or an error: a
+    // failure stays until Retry clears it, so a failing kind is never re-asked on every paint).
+    const kindAction = (entry) => (!entry ? "fetch" : entry.loading ? "wait" : "show");
+
+    // Hidden artists as this device knows them (state.blocked): a hide / unhide the server confirmed counts at once,
+    // whether or not the next GET /api/blocklist works (a stale page copy is filtered with this list). Names compare
+    // like the server's blocklist.key(): no " - Topic" / "VEVO", casefolded, no punctuation; a channel id beats names.
+    const blockKey = (n) => {
+      const s = String(n || "").trim().replace(/\s+-\s+Topic$/i, "").replace(/\s*VEVO$/, "").trim().toLowerCase();
+      return s.replace(/[^\p{L}\p{N}]+/gu, "") || s;
+    };
+    const sameArtist = (e, a) => !!(e && a && ((e.id && a.id && e.id === a.id) || (blockKey(e.name) && blockKey(e.name) === blockKey(a.name))));
+    function blockAdd(list, a) {
+      const arr = Array.isArray(list) ? list : [];
+      if (!a || !a.name) return arr.slice();
+      if (arr.some((e) => sameArtist(e, a))) return arr.map((e) => (sameArtist(e, a) && !e.id && a.id ? { ...e, id: a.id } : e));
+      return [...arr, { name: a.name, id: a.id || null, at: a.at ?? null }];
+    }
+    const blockRemove = (list, gone) => (Array.isArray(list) ? list : []).filter((e) => !(gone || []).some((a) => sameArtist(e, a)));
+
+    // May a cached page be played from? "fresh" (in date), "stale" (only expired: an old copy, hidden artists' songs
+    // left out), "refuse" (a hide / unhide invalidated it and its refresh failed: it may hold songs now hidden, and
+    // which ones isn't known for sure, so it isn't played), "none" (no copy).
+    const playableCopy = (entry, now, ttl) => (!entry ? "none" : entry.inv && entry.err ? "refuse" : now - entry.at < ttl ? "fresh" : "stale");
+    // A GET /api/blocklist answer is used only if no local hide / unhide happened after it was asked for.
+    const genCurrent = (startedAt, now) => startedAt === now;
+
+    // The search fields after ✕ (§10.1): nothing searched, nothing in flight (a pending answer is ignored as stale).
+    const clearedSearch = () => ({ query: "", link: null, results: [], all: null, searching: false, searchError: null, filter: "top" });
+
+    // Keep album progress: {state: "none" | "pending" | "kept" | "", done, total, frac} from the songs' keep states.
+    function keepProgress(states) {
+      const st = (Array.isArray(states) ? states : []).filter((x) => x === "none" || x === "pending" || x === "kept");
+      if (!st.length) return { state: "", done: 0, total: 0, frac: 0 };
+      const done = st.filter((x) => x === "kept").length;
+      const state = done === st.length ? "kept" : st.every((x) => x !== "none") ? "pending" : "none";
+      return { state, done, total: st.length, frac: done / st.length };
+    }
+
+    return { GROUPS, LABEL, PREVIEW, SORTS, SORT_LABEL, FILTER_MIN, topId, searchGroups, chips, fold, artistOf, viewTracks,
+      sortOf, homePlan, cookiePath, cookieMask, thumbSrc, resized, headerProgress, parallax, collectionLines, dropRecent,
+      putBack, keepProgress, artistLine, keptPool, kindAction, clearedSearch, blockKey, sameArtist, blockAdd, blockRemove,
+      playableCopy, genCurrent };
+  })();
+  // ==== discovery-core:end ====
+
   const navidromeUrl = (path) => `${location.protocol}//${location.hostname}:4533${path}`;
   const cur = () => state.queue[state.index];
   // What a queued / remembered track keeps (queue, session, "plays"). `auto` (an autoplay item) is dropped
@@ -1297,7 +1504,7 @@
   function trackCards(items, list) {
     return `<div class="scroller" data-shelf="${list}">${items.map((t, i) => `
       <div class="card" data-track="${esc(t.id)}">
-        <button class="card-art" data-play="${i}" data-list="${list}" aria-label="Play ${esc(t.title)}">${art(t.id)}${eqIfPlaying(t.id)}</button>
+        <button class="card-art" data-play="${i}" data-list="${list}" aria-label="Play ${esc(t.title)}">${art(t.id)}${t.rank ? `<span class="rank num">${t.rank}</span>` : ""}${eqIfPlaying(t.id)}</button>
         <div class="card-meta"><div class="card-text"><div class="card-t">${esc(t.title)}</div>
           <div class="card-s">${esc(t.channel)}${t.plays > 1 ? ` · ${t.plays} plays` : ""}</div></div>${moreBtn(t, i, list)}</div>
       </div>`).join("")}</div>`;
@@ -1306,7 +1513,7 @@
   // Top artists: the artist page when the id is known, else a search for the name.
   function topArtistCards(items) {
     return `<div class="scroller" data-shelf="top_artists">${items.map((a) => {
-      const inner = `<span class="card-art">${a.cover_id ? art(a.cover_id) : icon("person")}</span>
+      const inner = `<span class="card-art cookie">${a.cover_id ? art(a.cover_id) : icon("person")}</span>
         <div class="card-t">${esc(a.name)}</div><div class="card-s">${a.count} play${a.count === 1 ? "" : "s"}</div>`;
       return ARTIST_ID.test(a.id || "") ? `<a class="card av" href="#artist/${encodeURIComponent(a.id)}">${inner}</a>`
         : `<button class="card av" data-search="${esc(a.name)}">${inner}</button>`;
@@ -1324,41 +1531,87 @@
   }
 
   // ---------- views ----------
+  // ---------- Home (§9: header, mood chips, Quick picks, shelves) ----------
+  // Mood chips (§9.2): tonal chips scrolling sideways under the greeting; each opens its mood page (or, for the
+  // built-in tiles, a search). "All" opens every mood and genre.
+  function moodChips(items) {
+    const list = (items || []).filter((t) => t && t.label);
+    if (!list.length) return "";
+    return `<div class="chips mood-chips" data-shelf="moods">${list.map((t) => (t.params
+      ? `<a class="chip mood" style="--c:${esc(t.color || "#888")}" href="#mood/${encodeURIComponent(t.params)}">${esc(t.label)}</a>`
+      : `<button class="chip mood" style="--c:${esc(t.color || "#888")}" data-search="${esc(t.query || t.label)}">${esc(t.label)}</button>`)).join("")}${moodsOn()
+      ? `<a class="chip mood all" href="#moods">${icon("trend")}All</a>` : ""}</div>`;
+  }
+  // A shelf of YouTube Music cards (§9.7): songs play (the songs among the cards are the queue), albums / playlists /
+  // artists open their page; a type pill top-right on albums and playlists, artists round (cookie).
+  function homeCards(s) {
+    const list = `hc:${s.id}`;
+    let ti = -1;
+    return `<div class="scroller" data-shelf="${esc(s.id)}">${s.items.map((c) => {
+      if (c.type === "track" && c.track) {
+        ti++;
+        const t = c.track;
+        return `<div class="card" data-track="${esc(t.id)}">
+          <button class="card-art" data-play="${ti}" data-list="${list}" aria-label="Play ${esc(t.title)}">${art(t.id)}${eqIfPlaying(t.id)}</button>
+          <div class="card-meta"><div class="card-text"><div class="card-t">${esc(t.title)}</div><div class="card-s">${esc(t.channel || c.subtitle || "")}</div></div>${moreBtn(t, ti, list)}</div>
+        </div>`;
+      }
+      const round = c.type === "artist";
+      return `<a class="card${round ? " av" : ""}" href="${cardHref(c)}">
+          <span class="card-art${round ? " cookie" : ""}">${cardImg(c) || icon(round ? "person" : "note")}${round ? "" : `<span class="tpill">${esc(TYPE_LABEL[c.type] || "")}</span>`}</span>
+          <div class="card-t">${esc(c.title)}</div><div class="card-s">${esc(c.subtitle || "")}</div>
+        </a>`;
+    }).join("")}</div>`;
+  }
+  // One Home shelf by plan entry; "" for kinds Home doesn't draw.
+  function homeShelfHtml(it, plays) {
+    const s = homeShelf(it.id);
+    if (it.local) return shelf({ title: "Jump back in", ic: "clock", sub: "Played on this device", body: posters(plays, "recent") });
+    if (!s) return "";
+    const named = ["on_repeat", "jump_back", "liked"].includes(s.id);
+    const list = named ? s.id : `h:${s.id}`;
+    const playAll = `<button class="pill-out shelf-act" data-play-all="${list}">${icon("play", "fill")}Play all</button>`;
+    switch (s.id) {
+      case "on_repeat": return shelf({ title: s.title, ic: "repeat", sub: "Your most played this month", body: trackCards(s.items, list) });
+      case "mixed": return shelf({ title: s.title, ic: "radio", sub: "Radio from artists you play", body: mixCards(s.items) });
+      case "jump_back": return shelf({ title: s.title, ic: "clock", sub: "Songs you loved a while ago", body: trackCards(s.items, list) });
+      case "liked": return shelf({ title: s.title, ic: "heart", action: playAll, body: trackCards(s.items, list) });
+      case "top_artists": return shelf({ title: s.title, ic: "person", body: topArtistCards(s.items) });
+      case "charts": return shelf({ title: s.title, ic: "trend", sub: [s.section, s.name].filter(Boolean).join(" · ") || "",
+        action: s.playlist_id ? `<a class="link-btn shelf-act" href="#playlist/${encodeURIComponent(s.playlist_id)}">See all</a>` : playAll,
+        body: trackCards(s.items, list) });
+      default:
+        if (s.kind === "tracks") return shelf({ title: s.title, ic: s.source === "ytmusic" ? "sparkle" : "note", sub: s.source === "ytmusic" ? "From YouTube Music" : "", action: playAll, body: trackCards(s.items, list) });
+        if (s.kind === "cards") return shelf({ title: s.title, ic: "sparkle", sub: s.source === "ytmusic" ? "From YouTube Music" : "", body: homeCards(s) });
+        return "";
+    }
+  }
+
   function renderHome() {
     const plays = store.get("plays", []);
     const view = $("#view-home");
     // Re-rendering (a dislike, a refresh) keeps each shelf's sideways scroll.
     const scrolled = new Map($$("[data-shelf]", view).map((el) => [el.dataset.shelf, el.scrollLeft]));
-    let html = `<h1 class="page-title">${greeting()}</h1>`;
-    {
-      let s;
-      if (!state.home) {
-        html += state.homeErr
-          ? errorState(state.homeErr, { title: "Couldn't load Home", retry: "data-retry-home" })
-          : shelf({ title: "Quick picks", ic: "sparkle", body: skeletonCards() });
-      }
-      if ((s = homeShelf("quick"))) {
-        html += shelf({ title: s.title, ic: "sparkle", sub: "Based on what you've been playing", body: quickRows(s.items),
-          action: `<button class="link-btn shelf-act" data-play-all="quick">Play all</button>` });
-      }
-      if ((s = homeShelf("on_repeat"))) html += shelf({ title: s.title, ic: "repeat", sub: "Your most played this month", body: trackCards(s.items, "on_repeat") });
-      if ((s = homeShelf("mixed"))) html += shelf({ title: s.title, ic: "radio", sub: "Radio from artists you play", body: mixCards(s.items) });
-      // Old favourites once the log reaches back far enough; until then, what was played on this device.
-      html += (s = homeShelf("jump_back"))
-        ? shelf({ title: s.title, ic: "clock", sub: "Songs you loved a while ago", body: trackCards(s.items, "jump_back") })
-        : shelf({ title: "Jump back in", ic: "clock", body: posters(plays, "recent") });
-      if ((s = homeShelf("liked"))) html += shelf({ title: s.title, ic: "heart", body: trackCards(s.items, "liked") });
-      if ((s = homeShelf("top_artists"))) html += shelf({ title: s.title, ic: "person", body: topArtistCards(s.items) });
-      if (state.history.length) {
-        html += shelf({ title: "Recently kept", ic: "sparkle", sub: "Saved to Navidrome by Reef", more: "#library", body: squares(state.history.slice(0, 15), "history") });
-      }
-      const searches = store.get("searches", []);
-      if (searches.length) {
-        html += shelf({ title: "Recent searches", ic: "search", body: `<div class="chips wrap">${searches.map((q) => `<button class="chip" data-search="${esc(q)}">${esc(q)}</button>`).join("")}</div>` });
-      }
-      html += moodsOn()
-        ? shelf({ title: "Browse moods & genres", ic: "trend", sub: "Playlists from YouTube Music", more: "#moods", body: tiles() })
-        : shelf({ title: "Browse moods & genres", ic: "trend", sub: "Tap one to search YouTube", body: tiles() });
+    const plan = DC.homePlan(state.home?.shelves, { recent: plays.length });
+    let html = `<header class="home-head"><h1 class="page-title">${greeting()}</h1></header>`;
+    html += moodChips(plan.moods.length ? plan.moods : state.tiles);
+    if (!state.home) {
+      html += state.homeErr
+        ? errorState(state.homeErr, { title: "Couldn't load Home", retry: "data-retry-home" })
+        : shelf({ title: "Quick picks", ic: "sparkle", body: skeletonCards() });
+    }
+    const q = plan.quick && homeShelf(plan.quick);
+    if (q) {
+      html += shelf({ title: q.title, ic: "sparkle", sub: "Based on what you've been playing", body: quickRows(q.items),
+        action: `<button class="pill-out shelf-act" data-play-all="quick">${icon("play", "fill")}Play all</button>` });
+    }
+    for (const it of plan.order) html += homeShelfHtml(it, plays);
+    if (state.history.length) {
+      html += shelf({ title: "Recently kept", ic: "disc", sub: "Saved to Navidrome by Reef", more: "#library", body: squares(state.history.slice(0, 15), "history") });
+    }
+    if (!plan.moods.length && !moodsOn() && state.tiles.length) {
+      // the built-in tiles (YouTube Music browse is off): searches, as before
+      html += shelf({ title: "Browse moods & genres", ic: "trend", sub: "Tap one to search YouTube", body: tiles() });
     }
     paint(view, html);
     for (const [k, x] of scrolled) { const el = $(`[data-shelf="${k}"]`, view); if (el) el.scrollLeft = x; }
@@ -1376,7 +1629,7 @@
   function suggestRows(typed) {
     const items = sug.list.length ? sug.list : [typed];
     const low = typed.toLowerCase();
-    return `<ul class="rows sug">${items.map((s) => {
+    return `<h2 class="s-label">Suggestions</h2><ul class="rows sug">${items.map((s) => {
       const n = s.toLowerCase().startsWith(low) ? typed.length : 0;
       return `<li class="row sug-row"><button class="row-main" data-search="${esc(s)}"><span class="sug-ic">${icon("search")}</span>
         <span class="sug-t">${n ? `<b>${esc(s.slice(0, n))}</b>${esc(s.slice(n))}` : esc(s)}</span></button>
@@ -1384,19 +1637,235 @@
     }).join("")}</ul>`;
   }
 
-  function topCard(t) {
-    return `<div class="top-card" data-track="${esc(t.id)}">
-        <span class="top-art">${art(t.id)}</span>
+  // ---------- search results (§10.1) ----------
+  // A YouTube search is one /api/search/all: a top result card in its cover colours, then joined blocks by kind
+  // (Songs, Artists, Albums, Videos, Playlists), each with "Show all" (= that filter chip, fetched on demand). Other
+  // sources search songs only (the old layout). A pasted link opens as before.
+  const grouped = () => !!state.all && !state.link;
+  // The "top" list: the top song first, then the other songs.
+  function topQueue() {
+    const t = state.all?.top?.type === "track" ? state.all.top.track : null;
+    return t ? [t, ...state.results.filter((x) => x.id !== t.id)] : state.results;
+  }
+  let topTint = null; // the palette ref of the top card last painted (the card and the view's glow take it)
+  const TYPE_LABEL = { track: "Song", album: "Album", artist: "Artist", playlist: "Playlist" };
+  const cardHref = (c) => `#${c.type === "artist" ? "artist" : c.type === "album" ? "album" : "playlist"}/${encodeURIComponent(c.id)}`;
+  // A card's art: remote thumbnails straight from YouTube (only the palette needs same-origin bytes).
+  const cardImg = (c) => (c.thumb ? `<img src="${esc(c.thumb)}" alt="" loading="lazy" data-drop>` : "");
+
+  // The top result (§10.1): radius 28, its cover's colours, 104 px art (cookie for artists), 24 px title; songs play,
+  // keep and open their menu; artists get Shuffle + Radio; albums and playlists Play.
+  function topCardHtml(top) {
+    if (!top) return "";
+    const isTrack = top.type === "track", t = isTrack ? top.track : null;
+    const ref = isTrack ? tintRef(null, t.id) : tintRef(top.thumb);
+    const style = tintStyle(ref);
+    topTint = ref;
+    const typeLabel = isTrack ? (t.video ? "Video" : "Song") : (top.kind && top.type === "album" ? top.kind : TYPE_LABEL[top.type]);
+    const sub = isTrack ? trackSub(t) : esc(top.type === "artist" ? DC.artistLine(top)
+      : top.type === "album" ? [(top.artists || []).map((a) => a.name).join(", "), top.year].filter(Boolean).join(" · ") : top.author || "");
+    const artHtml = isTrack ? art(t.id) : cardImg(top);
+    const actions = isTrack ? `<button class="tc-play" data-play="0" data-list="top" aria-label="Play ${esc(t.title)}">${icon("play", "fill")}<span>Play</span></button>
+          ${keepBtn(t.id, "top")}${moreBtn(t, 0, "top")}`
+      : top.type === "artist" ? `<button class="tc-play" data-top-play="shuffle">${icon("shuffle")}<span>Shuffle</span></button>
+          <button class="tc-btn" data-top-play="radio">${icon("radio")}<span>Radio</span></button>`
+      : `<button class="tc-play" data-top-play="play">${icon("play", "fill")}<span>Play</span></button>
+          <button class="tc-btn" data-top-play="shuffle">${icon("shuffle")}<span>Shuffle</span></button>`;
+    return `<div class="top-card ptint${isTrack ? "" : " linked"}"${isTrack ? ` data-track="${esc(t.id)}"` : ""} data-tint="${esc(ref?.id || "")}"${style ? ` style="${style}"` : ""}>
+        ${isTrack ? "" : `<a class="tc-hit" href="${cardHref(top)}" aria-label="Open ${esc(top.title)}"></a>`}
+        <span class="top-art${top.type === "artist" ? " cookie" : ""}${t?.video ? " wide" : ""}">${artHtml}${isTrack ? eqIfPlaying(t.id) : ""}</span>
         <div class="top-meta">
-          <div class="top-t">${esc(t.title)}</div>
-          <div class="top-s">Song · ${trackSub(t)}</div>
-          <div class="top-actions">
-            <button class="play-round" data-play="0" data-list="results" aria-label="Play">${icon("play", "fill")}</button>
-            ${keepBtn(t.id, "results")}
-            ${moreBtn(t, 0, "results")}
-          </div>
+          <span class="top-type">${esc(typeLabel)}</span>
+          <div class="top-t">${esc(isTrack ? t.title : top.title)}</div>
+          ${sub ? `<div class="top-s">${sub}</div>` : ""}
         </div>
+        <div class="top-actions">${actions}</div>
       </div>`;
+  }
+  // The old top card for non-YouTube sources and pasted links (a song).
+  const topCard = (t, list = "results") => topCardHtml({ type: "track", track: t }).replace(/data-list="top"/g, `data-list="${list}"`);
+
+  // A row for an album / artist / playlist card: art (cookie for artists), title, subtitle, chevron; a tap opens it.
+  const cardRow = (c) => `<li class="row crow"><a class="row-main" href="${cardHref(c)}">
+      <span class="row-art${c.type === "artist" ? " cookie" : ""}">${cardImg(c) || icon(c.type === "artist" ? "person" : "note")}</span>
+      <span class="row-text"><span class="row-t">${esc(c.title)}</span><span class="row-s">${esc(c.subtitle || TYPE_LABEL[c.type] || "")}</span></span>
+      ${icon("chev-right", "row-chev")}</a></li>`;
+  // Video rows: 16:9 art.
+  const videoRows = (items, list, base = 0) => `<ul class="rows jrows vrows">${items.map((t, i) => row(t, base + i, list)).join("")}</ul>`;
+
+  function groupBlock(g) {
+    const more = g.more ? `<button class="link-btn" data-filter="${g.kind}">Show all</button>` : "";
+    let body;
+    if (g.kind === "songs") body = `<ul class="rows jrows">${g.items.map((t) => row(t, state.results.indexOf(t), "results")).join("")}</ul>`;
+    else if (g.kind === "videos") body = `<ul class="rows jrows vrows">${g.items.map((t) => row(t, (state.all.videos || []).indexOf(t), "sv")).join("")}</ul>`;
+    else body = `<ul class="joined crows">${g.items.map(cardRow).join("")}</ul>`;
+    return `<section class="s-group"><div class="head-row sec"><h2 class="section-title">${esc(g.label)}</h2>${more}</div>${body}</section>`;
+  }
+
+  // "No results for 'q'" with a way out: another source (§10.1 "Search Monochrome instead").
+  function noResults(what = "results") {
+    const cur = currentSource();
+    const other = state.sources.find((x) => x.key === (cur === "yt" ? "mc" : "yt"));
+    const action = other ? `<button class="pill-btn" data-source="${esc(other.key)}">${icon("search")}Search ${esc(other.name)} instead</button>` : "";
+    return emptyState("search", `No ${what} for “${state.query}”`, "Check the spelling, or try fewer words.", action);
+  }
+
+  // The filter chips (§10.1): 38 px, radius 20, the picked one solid accent.
+  function filterChips() {
+    const keys = DC.chips(grouped());
+    return `<div class="chips fchips" role="tablist">${keys.map((k) =>
+      `<button class="chip${state.filter === k ? " on" : ""}" role="tab" aria-selected="${state.filter === k}" data-filter="${k}">${esc(DC.LABEL[k])}</button>`).join("")}</div>`;
+  }
+
+  // One filter chip's list: fetched once per query (songs: the full songs search; others: /api/search?filter=).
+  async function loadKind(kind) {
+    if (!grouped() || !["songs", "videos", "albums", "artists", "playlists"].includes(kind)) return;
+    if (DC.kindAction(state.kinds.get(kind)) !== "fetch") return; // loaded, loading, or failed (Retry clears it)
+    const q = state.query, seq = searchSeq;
+    state.kinds.set(kind, { loading: true });
+    let entry;
+    try {
+      const url = kind === "songs" ? `/api/search?q=${encodeURIComponent(q)}&src=yt` : `/api/search?q=${encodeURIComponent(q)}&filter=${kind}`;
+      const items = await api(url);
+      entry = { items: Array.isArray(items) ? items : [] };
+      if (kind === "songs" || kind === "videos") noteKept(entry.items);
+    } catch (e) {
+      entry = { err: e };
+    }
+    if (seq !== searchSeq || q !== state.query) return;
+    state.kinds.set(kind, entry);
+    // "In library" shows the kept ones among the full songs search
+    if (state.view === "search" && (state.filter === kind || (kind === "songs" && state.filter === "kept"))) renderSearch();
+  }
+
+  function kindView(kind) {
+    const k = state.kinds.get(kind);
+    if (!k || k.loading) return kind === "songs" || kind === "videos" ? skRows(6) : skRows(5);
+    if (k.err) return errorState(k.err, { title: "Search failed", retry: `data-filter-retry="${kind}"` });
+    if (!k.items.length) return noResults(DC.LABEL[kind].toLowerCase());
+    if (kind === "songs") return `<ul class="rows jrows">${k.items.map((t, i) => row(t, i, "sk")).join("")}</ul>`;
+    if (kind === "videos") return videoRows(k.items, "sk");
+    return `<ul class="joined crows">${k.items.map(cardRow).join("")}</ul>`;
+  }
+
+  // Search landing (empty box): Recent (clock, ✕, long press deletes too) · Charts · Browse moods & genres.
+  function searchLanding() {
+    const searches = store.get("searches", []);
+    let html = sourceChips();
+    if (searches.length) {
+      html += `<div class="head-row s-head"><h2 class="s-label">Recent</h2><button class="link-btn" data-clear-searches>Clear</button></div>
+        <ul class="rows recent">${searches.map((q) => `<li class="row recent-row" data-recent="${esc(q)}"><button class="row-main" data-search="${esc(q)}">
+          <span class="sug-ic">${icon("clock")}</span><span class="sug-t">${esc(q)}</span></button>
+          <button class="icon-btn sm" data-recent-del="${esc(q)}" aria-label="Remove “${esc(q)}” from recent searches">${icon("x")}</button></li>`).join("")}</ul>`;
+    }
+    const ch = chartCards();
+    if (ch) html += `<div class="head-row s-head"><h2 class="s-label">Charts</h2></div>${ch}`;
+    html += `<div class="head-row s-head"><h2 class="s-label">Browse moods &amp; genres</h2>${moodsOn() ? `<a class="link-btn" href="#moods">See all</a>` : ""}</div>${tiles()}`;
+    return html;
+  }
+
+  // Charts (§10.1 "charts entry"): a card per chart playlist from /api/charts, opening it as a playlist page.
+  const CHART_BANDS = 4;
+  function chartCards() {
+    const secs = (state.charts?.sections || []).filter((x) => x.kind !== "artists" && x.playlist_id && x.items?.length);
+    if (!secs.length) return "";
+    return `<div class="scroller charts" data-shelf="charts-entry">${secs.map((x, k) => {
+      const first = x.items[0];
+      const title = x.title.replace(/\s+(?:Global|United States|[A-Z]{2})$/, "");
+      return `<a class="chart-card band${k % CHART_BANDS}" href="#playlist/${encodeURIComponent(x.playlist_id)}">
+          <span class="chart-art">${first ? art(first.id) : ""}</span>
+          <span class="chart-band"><span class="chart-t">${esc(title)}</span><span class="chart-s">${esc(state.charts.name || "")}</span></span>
+        </a>`;
+    }).join("")}</div>`;
+  }
+  async function loadCharts() {
+    if (state.charts !== null) return;
+    state.charts = false; // asked once per session; a failure leaves the card out
+    try {
+      const d = await api("/api/charts");
+      if (d && Array.isArray(d.sections)) state.charts = d;
+    } catch { /* YouTube Music off or down */ }
+    if (state.charts && state.view === "search" && !state.query && !suggesting()) renderSearch();
+  }
+
+  // The magnifier turns into a spinner while a search or its suggestions load (§10.1).
+  const setSearchBusy = (on) => $("#search-bar .search-pill")?.classList.toggle("busy", !!on);
+
+  function renderSearch() {
+    const el = $("#view-search");
+    const typed = suggesting();
+    searchMode = typed ? "suggest" : "results";
+    setSearchBusy(state.searching || (typed && sug.busy));
+    el.classList.remove("has-glow");
+    if (typed) {
+      el.innerHTML = suggestRows(typed);
+      fitSuggest();
+      return;
+    }
+    if (!state.query) {
+      paint(el, searchLanding());
+      loadCharts();
+      return;
+    }
+
+    // Pasted links ignore the source and the filters: they always resolve on YouTube.
+    const link = state.link;
+    const chips = link ? "" : sourceChips() + filterChips();
+
+    if (state.searching) {
+      el.innerHTML = chips + `<div class="skel short" ${SK_LABEL}><div class="sk sk-top"></div></div>${link ? "" : `<h2 class="section-title">Songs</h2>`}`
+        + skRows(link ? 3 : 4);
+      return;
+    }
+    if (state.searchError) {
+      paint(el, chips + errorState(state.searchError, { title: link ? "Couldn't open link" : "Search failed", retry: "data-retry-search" }));
+      return;
+    }
+    const res = state.results;
+    if (link?.kind === "playlist") { paint(el, playlistView(res)); return; }
+
+    let html = chips;
+    if (link) {
+      if (!res.length) { paint(el, emptyState("search", "Nothing playable", "That link has no song Reef can play.")); return; }
+      html += topCard(res[0]);
+    } else if (state.filter === "kept") {
+      // grouped: the preview has a few songs only, so the full songs search is asked for (once) and joins the pool
+      const songsK = grouped() ? state.kinds.get("songs") : null;
+      if (grouped()) loadKind("songs");
+      const items = DC.keptPool([res, songsK?.items, state.all?.videos], (t) => keepState(t.id) === "kept");
+      state.kinds.set("kept", { items });
+      html += items.length
+        ? `<ul class="rows jrows">${items.map((r, i) => row(r, i, "sk")).join("")}</ul>`
+        : grouped() && DC.kindAction(state.kinds.get("songs")) !== "show" ? skRows(4)
+        : emptyState("disc", "None kept yet", "Tap + on a song to keep it in your library.");
+    } else if (grouped()) {
+      const all = state.all;
+      if (state.filter === "top") {
+        const groups = DC.searchGroups(all);
+        if (!all.top && !groups.length) { paint(el, chips + noResults()); return; }
+        html += topCardHtml(all.top) + groups.map(groupBlock).join("");
+        if (all.fallback) html += `<p class="st-note s-note">YouTube Music didn't answer, so these are songs only.</p>`;
+      } else {
+        html += kindView(state.filter);
+        loadKind(state.filter);
+      }
+    } else if (!res.length) {
+      paint(el, chips + noResults());
+      return;
+    } else if (state.filter === "top") {
+      html += topCard(res[0]);
+      if (res.length > 1) html += `<h2 class="section-title">Songs</h2><ul class="rows jrows">${res.slice(1).map((r, i) => row(r, i + 1, "results")).join("")}</ul>`;
+    } else {
+      html += `<ul class="rows jrows">${res.map((r, i) => row(r, i, "results")).join("")}</ul>`;
+    }
+    paint(el, html);
+    // the background glow (§10.1) takes the top result's colours too
+    const card = $(".top-card.ptint", el);
+    el.setAttribute("style", card?.getAttribute("style") || "");
+    if (card) {
+      el.classList.add("has-glow");
+      if (!card.getAttribute("style")) { tintLater(card, topTint); tintLater(el, topTint); }
+    }
   }
 
   // A pasted playlist / album: header, Play all + Shuffle, then its tracks.
@@ -1419,59 +1888,6 @@
         : emptyState("note", "Nothing playable", "This playlist has no tracks Reef can play.")}`;
   }
 
-  function renderSearch() {
-    const el = $("#view-search");
-    const typed = suggesting();
-    searchMode = typed ? "suggest" : "results";
-    if (typed) {
-      el.innerHTML = suggestRows(typed);
-      fitSuggest();
-      return;
-    }
-    if (!state.query) {
-      const searches = store.get("searches", []);
-      paint(el, sourceChips() + (searches.length ? `
-        <div class="head-row"><h2 class="section-title">Recent</h2><button class="link-btn" data-clear-searches>Clear</button></div>
-        <ul class="rows">${searches.map((q) => `<li class="row"><button class="row-main" data-search="${esc(q)}"><span class="row-art" style="display:grid;place-items:center;color:var(--faint)">${icon("clock")}</span><span class="row-text"><span class="row-t">${esc(q)}</span></span></button></li>`).join("")}</ul>` : "")
-        + `<div class="head-row sec"><h2 class="section-title">Browse Categories</h2>${moodsOn() ? `<a class="link-btn" href="#moods">See all</a>` : ""}</div>${tiles()}`);
-      return;
-    }
-
-    // Pasted links ignore the source and the filters: they always resolve on YouTube.
-    const link = state.link;
-    const chips = link ? "" : sourceChips() + `<div class="chips">${[["top", "Top Results"], ["songs", "Songs"], ["kept", "In library"]].map(([k, l]) =>
-      `<button class="chip${state.filter === k ? " on" : ""}" data-filter="${k}">${l}</button>`).join("")}</div>`;
-
-    if (state.searching) {
-      el.innerHTML = chips + `<h2 class="section-title">${link ? "Opening link…" : "Top result"}</h2><div class="skel short" ${SK_LABEL}><div class="sk sk-top"></div></div>${link ? "" : `<h2 class="section-title">Songs</h2>`}`
-        + skRows(link ? 3 : 5);
-      return;
-    }
-    if (state.searchError) {
-      paint(el, chips + errorState(state.searchError, { title: link ? "Couldn't open link" : "Search failed", retry: "data-retry-search" }));
-      return;
-    }
-    const res = state.results;
-    if (link?.kind === "playlist") { paint(el, playlistView(res)); return; }
-    if (!res.length) {
-      paint(el, chips + emptyState("search", "No results", `Nothing found for “${state.query}”.`));
-      return;
-    }
-
-    let html = chips;
-    if (link) {
-      html += `<h2 class="section-title">Top result</h2>${topCard(res[0])}`;
-    } else if (state.filter === "top") {
-      html += `<h2 class="section-title">Top result</h2>${topCard(res[0])}`;
-      if (res.length > 1) html += `<h2 class="section-title">Songs</h2><ul class="rows">${res.slice(1).map((r, i) => row(r, i + 1, "results")).join("")}</ul>`;
-    } else {
-      const items = res.map((r, i) => [r, i]).filter(([r]) => state.filter === "songs" || keepState(r.id) === "kept");
-      html += items.length
-        ? `<ul class="rows" style="margin-top:14px">${items.map(([r, i]) => row(r, i, "results")).join("")}</ul>`
-        : emptyState("disc", "None kept yet", "Tap + on a song to keep it in your library.");
-    }
-    paint(el, html);
-  }
 
   // ---------- Library (UI remake step 1) ----------
   // One page for what used to be the Kept and Downloads tabs: active keeps (Downloads), Reef's own playlists
@@ -1646,7 +2062,7 @@
       try {
         const data = await api(PAGE_API[kind](id));
         if (kind === "local") for (const t of data.tracks || []) if (!t.title) t.title = `YouTube video ${t.id}`; // a Takeout row not looked up yet
-        noteKept(kind === "artist" ? data.songs : data.tracks);
+        noteKept(kind === "artist" ? [...(data.songs || []), ...(data.videos || [])] : data.tracks);
         if (kind === "local" && (data.import || (data.tracks || []).some(M.isPlaceholder))) loadImportStatus(id);
         if (kind === "artist") for (const r of [...(data.albums || []), ...(data.singles || [])]) if (r.type) releaseType.set(r.id, r.type);
         const old = detail.cache.get(key);
@@ -1656,7 +2072,7 @@
         while (detail.cache.size > 40) detail.cache.delete(detail.cache.keys().next().value);
         detail.errors.delete(key);
       } catch (e) {
-        if (detail.cache.has(key)) changed = false; // a failed refresh keeps what's shown
+        if (detail.cache.has(key)) { changed = false; detail.cache.get(key).err = e; } // a failed refresh keeps what's shown
         else detail.errors.set(key, e);
       } finally {
         detail.inflight.delete(key);
@@ -1686,38 +2102,34 @@
       retry: "data-retry", notFound: "YouTube Music doesn't have this page." });
   }
 
-  // The glyph sits under the cover, so it shows while the cover loads or if it fails.
-  function heroArt(src, tracks, round = false) {
-    const img = src ? `<img src="${esc(src)}" alt="" data-drop>` : tracks?.length ? art(tracks[0].id, true) : "";
-    return `<span class="hero-art${round ? " circle" : ""}">${icon(round ? "person" : "note")}${img}</span>`;
-  }
-  const pageActions = () => `<div class="actions joined h">
-      <button class="pill-btn" data-play-all="page">${icon("play", "fill")}Play</button>
-      <button class="pill-btn" data-shuffle-all="page">${icon("shuffle")}Shuffle</button>
-    </div>`;
   const hiddenBanner = (unhide) => `<div class="banner">${icon("hide")}<span>You've hidden this artist</span>${unhide
     ? `<button class="chip sm" data-unhide-page>Unhide</button>` : ""}</div>`;
 
-  // Keep album / Keep all: "none" (something to keep), "pending" (the rest is being kept), "kept", "" (nothing keepable).
-  function keepAllState() {
-    const st = pageTracks().filter((t) => canKeep(t.id) || keepState(t.id) === "kept").map((t) => keepState(t.id));
-    if (!st.length) return "";
-    return st.every((x) => x === "kept") ? "kept" : st.every((x) => x !== "none") ? "pending" : "none";
+  // Keep album / Keep all (§10.2): a round button with a 28 px ring of the share already kept. State "none" (something
+  // to keep), "pending" (the rest is being kept), "kept", "" (nothing keepable).
+  const keepAllProgress = () => DC.keepProgress(pageTracks().filter((t) => canKeep(t.id) || keepState(t.id) === "kept").map((t) => keepState(t.id)));
+  const keepAllState = () => keepAllProgress().state;
+  const RING_LEN = 2 * Math.PI * 12.5;
+  function keepAllInner(k) {
+    const what = detail.kind === "album" ? "album" : "playlist";
+    const label = k.state === "kept" ? "In your library" : k.state === "pending" ? "Keeping…" : detail.kind === "album" ? "Keep album" : "Keep all";
+    return `<svg class="kr" viewBox="0 0 28 28" aria-hidden="true"><circle class="kr-bg" cx="14" cy="14" r="12.5"/><circle class="kr-fg" cx="14" cy="14" r="12.5"
+        style="stroke-dasharray:${RING_LEN.toFixed(2)};stroke-dashoffset:${(RING_LEN * (1 - k.frac)).toFixed(2)}"/></svg>${icon(k.state === "kept" ? "check" : k.state === "pending" ? "download" : "plus")}
+      <span class="vh">${label}${k.total ? ` (${k.done} of ${k.total} in your library)` : ""}</span><span class="cb-l" aria-hidden="true">${k.state === "kept" ? "Kept" : k.state === "pending" ? "Keeping" : `Keep ${what}`}</span>`;
   }
-  const keepAllInner = (s) => (s === "kept" ? `${icon("check")}In your library`
-    : s === "pending" ? `${icon("download")}Keeping…` : `${icon("plus")}${detail.kind === "album" ? "Keep album" : "Keep all"}`);
   function keepAllBtn() {
-    const s = keepAllState();
-    return s ? `<button class="keep-all ${s}" data-keep-all data-state="${s}">${keepAllInner(s)}</button>` : "";
+    const k = keepAllProgress();
+    return k.state ? `<button class="cb keep-all ${k.state}" data-keep-all data-state="${k.state}" data-done="${k.done}">${keepAllInner(k)}</button>` : "";
   }
   function refreshKeepAll() {
     const b = $("#view-detail [data-keep-all]");
     if (!b || state.view !== "detail") return;
-    const s = keepAllState();
-    if (b.dataset.state === s) return;
-    b.dataset.state = s;
-    b.className = `keep-all ${s}`;
-    b.innerHTML = keepAllInner(s);
+    const k = keepAllProgress();
+    if (b.dataset.state === k.state && Number(b.dataset.done) === k.done) return;
+    b.dataset.state = k.state;
+    b.dataset.done = String(k.done);
+    b.className = `cb keep-all ${k.state}`;
+    b.innerHTML = keepAllInner(k);
   }
 
   // Tags for keeps from an album page, so the files land as that album (the server validates them too).
@@ -1769,78 +2181,164 @@
     if (kept.length) loadHistory();
   }
 
-  function albumPage(a) {
-    const tracks = a.tracks || [];
-    const total = a.duration || tracks.reduce((x, t) => x + (Number(t.duration) || 0), 0);
-    const meta = [releaseType.get(a.id) || "Album", a.year, songs(tracks.length), fmtLen(total)].filter(Boolean).join(" · ");
-    const by = (a.artists || []).filter((x) => x && x.name);
-    const artists = by.length ? by.map((x) => (ARTIST_ID.test(x.id || "")
-      ? `<a href="#artist/${encodeURIComponent(x.id)}">${esc(x.name)}</a>` : esc(x.name))).join(", ") : esc(a.artist);
-    // Rows name the artist only when it isn't the album's (features, compilations).
-    const sub = (t) => [t.channel && t.channel !== a.artist ? artistLinks(t) : "", t.duration ? fmt(t.duration) : ""].filter(Boolean).join(" · ");
-    return `<div class="hero">${heroArt(a.thumb, tracks)}
-        <h1 class="hero-t" data-anchor>${esc(a.title || "Album")}</h1>
-        ${artists ? `<p class="hero-a">${artists}</p>` : ""}
-        <p class="hero-s">${esc(meta)}</p>
-      </div>
-      ${a.blocked ? hiddenBanner(true) : ""}
-      ${tracks.length ? `${pageActions()}${keepAllBtn()}
-        <ul class="rows d-rows">${tracks.map((t, i) => row(t, i, "page", sub(t), { num: t.track_number || i + 1 })).join("")}</ul>`
-        : emptyState("note", "Nothing playable", "This album has no tracks Reef can play.")}`;
+  // ---------- collection pages (§10.2): an album, a YouTube Music playlist, a Reef playlist (#local/<id>) ----------
+  // The page takes its cover's colours: tinted toward the cover with a glow and the blurred cover behind the header;
+  // centred art with a shadow in its colour; type · year, title, artist (accent, links), songs · length, a clamped
+  // description; Play | Shuffle joined; Save · Keep (ring) · Share · ⋯ and, on playlists, Sort with a filter field.
+  const pageViews = new Map(); // page key -> {sort, q, tools}: how its songs are shown (this session)
+  const viewOf = (key = detail.key) => pageViews.get(key) || { sort: "default", q: "", tools: false };
+  const setView = (patch) => pageViews.set(detail.key, { ...viewOf(), ...patch });
+  const sortable = () => detail.kind === "playlist" || detail.kind === "local";
+  // The page's songs as shown (sorted / filtered on playlists): what "page" plays and the rows index into.
+  function pageShown() {
+    const all = pageTracks();
+    return sortable() ? DC.viewTracks(all, viewOf()).map((r) => r.t) : all;
+  }
+  const ytmUrl = (kind, id) => (kind === "album" ? `https://music.youtube.com/browse/${encodeURIComponent(id)}`
+    : kind === "artist" ? `https://music.youtube.com/channel/${encodeURIComponent(id)}` : `https://music.youtube.com/playlist?list=${encodeURIComponent(id)}`);
+
+  // The rows of a collection page (numbered on albums; placeholders of an import dimmed).
+  function collRows(kind, d) {
+    const shown = pageShown();
+    if (!shown.length) return emptyState("search", "No matching songs", "Try other words, or clear the filter.");
+    if (kind === "album") {
+      const sub = (t) => [t.channel && t.channel !== d.artist ? artistLinks(t) : "", t.duration ? fmt(t.duration) : ""].filter(Boolean).join(" · ");
+      return shown.map((t, i) => row(t, i, "page", sub(t), { num: t.track_number || i + 1 })).join("");
+    }
+    if (kind === "local") {
+      const sub = (t) => (M.isPlaceholder(t) ? `${esc(t.artist || t.channel || "")}${t.artist || t.channel ? " · " : ""}${t.miss ? "Not found" : "Not matched yet"}` : null);
+      return shown.map((t, i) => row(t, i, "page", sub(t))).join("");
+    }
+    return shown.map((t, i) => row(t, i, "page")).join("");
+  }
+  function paintRows() {
+    const ul = $("#pg-rows"), d = pageData();
+    if (ul && d) ul.innerHTML = collRows(detail.kind, d);
+  }
+  function collTools(n) {
+    const v = viewOf();
+    if (!sortable() || !v.tools) return "";
+    return `<div class="coll-tools">
+        <div class="chips sort-chips" role="radiogroup" aria-label="Sort songs">${DC.SORTS.map((k) =>
+          `<button class="chip sm${v.sort === k ? " on" : ""}" role="radio" aria-checked="${v.sort === k}" data-page-sortby="${k}">${DC.SORT_LABEL[k]}</button>`).join("")}</div>
+        ${n > DC.FILTER_MIN ? `<label class="coll-filter">${icon("search")}<input id="pg-filter" type="search" enterkeyhint="search" autocomplete="off"
+          placeholder="Filter ${n} songs" aria-label="Filter songs" value="${esc(v.q)}"></label>` : ""}
+      </div>`;
   }
 
-  function playlistPage(p) {
-    const tracks = p.tracks || [];
-    const total = tracks.reduce((x, t) => x + (Number(t.duration) || 0), 0);
-    return `<div class="hero">${heroArt(p.thumb, tracks)}
-        <h1 class="hero-t" data-anchor>${esc(pageTitle("playlist", p))}</h1>
-        ${p.author ? `<p class="hero-a plain">${esc(p.author)}</p>` : ""}
-        <p class="hero-s">${esc([songs(tracks.length), fmtLen(total)].filter(Boolean).join(" · "))}</p>
-      </div>
-      ${tracks.length ? `${pageActions()}${keepAllBtn()}
-        <ul class="rows d-rows">${tracks.map((t, i) => row(t, i, "page")).join("")}</ul>`
-        : emptyState("note", "Nothing playable", "This playlist has no tracks Reef can play.")}`;
+  function collectionPage(kind, d) {
+    const tracks = d.tracks || [];
+    const real = tracks.filter((t) => !M.isPlaceholder(t));
+    const total = (kind === "album" && d.duration) || tracks.reduce((x, t) => x + (Number(t.duration) || 0), 0);
+    const type = kind === "album" ? releaseType.get(d.id) || "Album" : kind === "local" ? "Your playlist" : "Playlist";
+    const { eyebrow, meta } = DC.collectionLines({ type, year: kind === "album" ? d.year : "", count: tracks.length, seconds: total });
+    const title = pageTitle(kind, d);
+    let by = "";
+    if (kind === "album") {
+      const list = (d.artists || []).filter((x) => x && x.name);
+      by = list.length ? list.map((x) => (ARTIST_ID.test(x.id || "") ? `<a href="#artist/${encodeURIComponent(x.id)}">${esc(x.name)}</a>` : esc(x.name))).join(", ") : esc(d.artist);
+    } else if (kind === "playlist" && d.author) by = esc(d.author);
+    const desc = kind === "local" ? d.description : d.description;
+    const thumb = kind === "local" ? null : d.thumb;
+    const ref = tintRef(thumb, real[0]?.id);
+    const style = tintStyle(ref);
+    const wide = /(^|\.)ytimg\.com\//.test(String(thumb || "").replace(/^https:\/\//, "")); // 16:9 video art: blur-fill
+    const img = thumb ? `<img class="ca-img" src="${esc(DC.resized(thumb, 720))}" alt="" data-drop>` : real.length ? art(real[0].id, true) : "";
+    const v = viewOf(), n = tracks.length;
+    const longDesc = desc && desc.length > 140;
+    const save = kind === "local"
+      ? `<button class="cb${d.pinned ? " on" : ""}" data-page-pin aria-pressed="${!!d.pinned}">${icon("pin")}<span class="cb-l">${d.pinned ? "Pinned" : "Pin"}</span></button>`
+      : `<button class="cb" data-page-save>${icon("library")}<span class="cb-l">Save</span></button>`;
+    return `<div class="pg coll ptint" data-tint="${esc(ref?.id || "")}"${style ? ` style="${style}"` : ""}>
+      <div class="coll-bg" aria-hidden="true">${ref ? `<img src="${esc(ref.src)}" alt="">` : ""}</div>
+      <header class="coll-head">
+        <span class="coll-art${wide ? " wide" : ""}">${icon("note")}${wide ? `<img class="ca-fill" src="${esc(thumb)}" alt="" data-drop>` : ""}${img}</span>
+        ${eyebrow ? `<p class="coll-type">${esc(eyebrow)}</p>` : ""}
+        <h1 class="coll-t${title.length > 28 ? " long" : ""}" data-anchor>${esc(title)}</h1>
+        ${by ? `<p class="coll-a">${by}</p>` : ""}
+        ${meta ? `<p class="coll-meta">${esc(meta)}</p>` : ""}
+        ${desc ? `<p class="coll-desc${longDesc && !detail.about ? " clamp" : ""}" id="about">${esc(desc)}</p>${longDesc
+          ? `<button class="link-btn about-more" data-about data-more="Show more" data-less="Show less" aria-expanded="${detail.about}">${detail.about ? "Show less" : "Show more"}</button>` : ""}` : ""}
+      </header>
+      ${d.blocked ? hiddenBanner(true) : ""}
+      ${kind === "local" ? `<div id="imp-line">${importLine(d.id)}</div>` : ""}
+      ${n ? `<div class="coll-play joined h">
+          <button class="cp-play" data-play-all="page">${icon("play", "fill")}Play</button>
+          <button class="cp-shuf" data-shuffle-all="page">${icon("shuffle")}Shuffle</button>
+        </div>
+        <div class="coll-icons">${real.length || kind !== "local" ? save : ""}${keepAllBtn()}
+          ${kind !== "local" ? `<button class="cb" data-page-share>${icon("share")}<span class="cb-l">Share</span></button>` : ""}
+          <button class="cb" data-page-more aria-haspopup="dialog">${icon("more")}<span class="cb-l">More</span></button>
+          ${sortable() && n > 1 ? `<button class="cb cb-sort${v.tools ? " on" : ""}${v.sort !== "default" || v.q ? " set" : ""}" data-page-sort aria-expanded="${v.tools}">${icon("sort")}<span class="cb-l">Sort</span></button>` : ""}
+        </div>
+        ${collTools(n)}
+        <ul class="rows jrows d-rows" id="pg-rows">${collRows(kind, d)}</ul>`
+      : emptyState("note", kind === "local" ? "Empty playlist" : "Nothing playable",
+        kind === "local" ? "Nothing in this playlist yet." : `This ${kind} has no tracks Reef can play.`)}
+    </div>`;
   }
+  const albumPage = (a) => collectionPage("album", a);
+  const playlistPage = (p) => collectionPage("playlist", p);
 
-  const releaseCards = (items) => `<div class="scroller">${items.map((r) => `
-      <a class="card" href="#album/${encodeURIComponent(r.id)}">
+  // ---------- artist page (§10.3) ----------
+  // A full-bleed hero (the photo under the header, bottom radius 48, shaded into the page, slight parallax), the name
+  // over its foot with the audience line; Play (white pill) · Shuffle · Radio · Hide in a row that scrolls sideways;
+  // Top songs (5 + Show all) · Albums · Singles & EPs · Videos · Similar artists (cookie portraits) · About.
+  // The page takes the photo's colours. Follow needs a follow list (§12 "later"): not shown.
+  const releaseCards = (items) => `<div class="scroller rel">${items.map((r) => `
+      <a class="card rcard" href="#album/${encodeURIComponent(r.id)}">
         <span class="card-art">${r.thumb ? `<img src="${esc(r.thumb)}" alt="" loading="lazy" data-drop>` : ""}</span>
         <div class="card-t">${esc(r.title)}</div>
         <div class="card-s">${esc([r.year, r.type].filter(Boolean).join(" · "))}</div>
       </a>`).join("")}</div>`;
-  const artistCards = (items) => `<div class="scroller">${items.map((r) => `
-      <a class="card av" href="#artist/${encodeURIComponent(r.id)}">
-        <span class="card-art">${r.thumb ? `<img src="${esc(r.thumb)}" alt="" loading="lazy" data-drop>` : icon("person")}</span>
+  const artistCards = (items) => `<div class="scroller rel">${items.map((r) => `
+      <a class="card av rcard" href="#artist/${encodeURIComponent(r.id)}">
+        <span class="card-art cookie">${r.thumb ? `<img src="${esc(r.thumb)}" alt="" loading="lazy" data-drop>` : icon("person")}</span>
         <div class="card-t">${esc(r.name)}</div>
       </a>`).join("")}</div>`;
+  // 16:9 video cards (play on tap, long press / ⋯ for the menu).
+  const videoCards = (items, list) => `<div class="scroller vids" data-shelf="${esc(list)}">${items.map((t, i) => `
+      <div class="card vcard" data-track="${esc(t.id)}">
+        <button class="card-art" data-play="${i}" data-list="${esc(list)}" aria-label="Play ${esc(t.title)}">${art(t.id)}${eqIfPlaying(t.id)}</button>
+        <div class="card-meta"><div class="card-text"><div class="card-t">${esc(t.title)}</div><div class="card-s">${esc(t.channel || "")}</div></div>${moreBtn(t, i, list)}</div>
+      </div>`).join("")}</div>`;
 
   function artistPage(a) {
     const list = a.songs || [];
     // With a full "Songs" playlist to go to, show the first five here (Apple Music style); else all of them.
     const top = a.songs_playlist_id ? list.slice(0, 5) : list;
-    let html = `<div class="hero artist">${heroArt(a.thumb, null, true)}
-        <h1 class="hero-t" data-anchor>${esc(a.name)}</h1>
-        <div class="actions joined h">
-          ${list.length ? `<button class="pill-btn" data-play-all="page">${icon("play", "fill")}Play</button>
-          <button class="pill-btn" data-page-radio>${icon("radio")}Radio</button>` : ""}
-          <button class="pill-btn${a.blocked ? " on" : ""}" data-artist-hide aria-pressed="${a.blocked ? "true" : "false"}">${icon("hide")}${a.blocked ? "Unhide" : "Hide"}</button>
-        </div>
+    const ref = tintRef(a.thumb);
+    const style = tintStyle(ref);
+    const aud = DC.artistLine(a);
+    let html = `<div class="pg artist-pg ptint" data-tint="${esc(ref?.id || "")}"${style ? ` style="${style}"` : ""}>
+      <div class="ahero">
+        <div class="ahero-img" id="ahero-img">${a.thumb ? `<img src="${esc(DC.resized(a.thumb, 900))}" alt="" data-drop>` : icon("person")}</div>
+        <div class="ahero-shade" aria-hidden="true"></div>
+        <div class="ahero-text"><h1 class="ahero-name" data-anchor>${esc(a.name)}</h1>${aud ? `<p class="ahero-sub">${esc(aud)}</p>` : ""}</div>
       </div>
+      <div class="aact" role="group" aria-label="Artist actions"><div class="aact-in">
+        ${list.length ? `<button class="aa-play" data-play-all="page">${icon("play", "fill")}Play</button>
+        <button class="aa-btn" data-artist-play="shuffle">${icon("shuffle")}Shuffle</button>
+        <button class="aa-btn" data-page-radio>${icon("radio")}Radio</button>` : ""}
+        <button class="aa-btn${a.blocked ? " on" : ""}" data-artist-hide aria-pressed="${a.blocked ? "true" : "false"}">${icon("hide")}${a.blocked ? "Unhide" : "Hide"}</button>
+        <button class="aa-btn" data-page-share>${icon("share")}Share</button>
+      </div></div>
       ${a.blocked ? hiddenBanner(false) : ""}`;
     if (top.length) {
-      html += shelf({ title: "Top songs", more: a.songs_playlist_id ? `#playlist/${encodeURIComponent(a.songs_playlist_id)}` : "",
-        body: `<ul class="rows">${top.map((t, i) => row(t, i, "page")).join("")}</ul>` });
+      html += shelf({ title: "Top songs", action: a.songs_playlist_id ? `<a class="link-btn shelf-act" href="#playlist/${encodeURIComponent(a.songs_playlist_id)}">Show all</a>` : "",
+        body: `<ul class="rows jrows">${top.map((t, i) => row(t, i, "page")).join("")}</ul>` });
     }
     if (a.albums?.length) html += shelf({ title: "Albums", body: releaseCards(a.albums) });
     if (a.singles?.length) html += shelf({ title: "Singles & EPs", body: releaseCards(a.singles) });
-    if (a.related?.length) html += shelf({ title: "Fans also like", body: artistCards(a.related) });
+    if (a.videos?.length) html += shelf({ title: "Videos", body: videoCards(a.videos, "av") });
+    if (a.related?.length) html += shelf({ title: "Similar artists", body: artistCards(a.related) });
     if (a.description) {
       const long = a.description.length > 220;
       html += `<section class="shelf"><div class="shelf-head"><h2>About</h2></div>
         <p class="about${long && !detail.about ? " clamp" : ""}" id="about">${esc(a.description)}</p>
         ${long ? `<button class="link-btn about-more" data-about aria-expanded="${detail.about}">${detail.about ? "Less" : "More"}</button>` : ""}</section>`;
     }
-    return html;
+    return html + `</div>`;
   }
 
   function moodsPage(d) {
@@ -1874,21 +2372,7 @@
       : missing ? `<button class="chip sm" data-import-resolve="${esc(pid)}" data-retry-missing>${icon("repeat")}Try missing again</button>` : "";
     return `<div class="imp-line" role="status"><span>${s.running ? '<i class="spin"></i>' : ""}${esc(text)}</span>${btn}</div>`;
   }
-  function localPage(p) {
-    const tracks = p.tracks || [];
-    const total = tracks.reduce((x, t) => x + (Number(t.duration) || 0), 0);
-    const real = tracks.filter((t) => !M.isPlaceholder(t));
-    const sub = (t) => (M.isPlaceholder(t) ? `${esc(t.artist || t.channel || "")}${t.artist || t.channel ? " · " : ""}${t.miss ? "Not found" : "Not matched yet"}` : null);
-    return `<div class="hero">${heroArt(null, real)}
-        <h1 class="hero-t" data-anchor>${esc(p.name || "Playlist")}</h1>
-        ${p.description ? `<p class="hero-a plain">${esc(p.description)}</p>` : ""}
-        <p class="hero-s">${esc([songs(tracks.length), fmtLen(total)].filter(Boolean).join(" · "))}</p>
-      </div>
-      <div id="imp-line">${importLine(p.id)}</div>
-      ${tracks.length ? `${pageActions()}${keepAllBtn()}
-        <ul class="rows d-rows">${tracks.map((t, i) => row(t, i, "page", sub(t))).join("")}</ul>`
-        : emptyState("note", "Empty playlist", "Nothing in this playlist yet.")}`;
-  }
+  const localPage = (p) => collectionPage("local", p);
   // GET /api/import/<id>/status; polled every 2 s while the background pass runs, refreshing the page as songs match.
   async function loadImportStatus(pid) {
     clearTimeout(imp.timer);
@@ -1922,14 +2406,38 @@
     const entry = detail.cache.get(detail.key);
     const err = detail.errors.get(detail.key);
     $("#top-title").textContent = pageTitle();
+    document.body.dataset.page = entry && ["album", "playlist", "local", "artist"].includes(detail.kind) ? detail.kind : "";
     if (entry) {
       paint(el, PAGES[detail.kind](entry.data));
+      const pg = $(".pg.ptint", el);
+      if (pg && pg.dataset.tint && !pg.getAttribute("style")) tintLater(pg, pageTint(detail.kind, entry.data));
       if (detail.restore != null) { window.scrollTo(0, detail.restore); detail.restore = null; }
+      pageScrolled();
     } else {
       paint(el, err ? pageError(err) : pageSkeleton(detail.kind));
       if (err) detail.restore = null;
     }
     syncTopTitle();
+  }
+
+  // The palette ref a page was painted with (see collectionPage / artistPage).
+  function pageTint(kind, d) {
+    if (kind === "artist") return tintRef(d.thumb);
+    const real = (d.tracks || []).filter((t) => !M.isPlaceholder(t));
+    return tintRef(kind === "local" ? null : d.thumb, real[0]?.id);
+  }
+  // Header scroll on album / artist pages (§10.2, §10.3): the hero photo drifts at .4 of the scroll (parallax) and the
+  // cover's art shrinks a little as the header leaves. One rAF per scroll burst; nothing with reduced motion.
+  let pageRaf = 0;
+  function pageScrolled() {
+    if (pageRaf || state.view !== "detail") return;
+    pageRaf = requestAnimationFrame(() => {
+      pageRaf = 0;
+      const img = $("#ahero-img"), y = window.scrollY;
+      if (img) img.style.transform = reducedMotion() ? "" : `translate3d(0, ${DC.parallax(y, img.offsetHeight).toFixed(1)}px, 0)`;
+      const head = $("#view-detail .coll-head");
+      if (head) head.style.setProperty("--hp", reducedMotion() ? "0" : DC.headerProgress(y, head.offsetHeight).toFixed(3));
+    });
   }
 
   // The header shows the page's name once its big title has scrolled under it.
@@ -1962,10 +2470,12 @@
     return t.channel ? { name: t.channel, id: null } : null;
   }
 
+  let blockGen = 0; // bumped by every local hide / unhide the server confirmed
   async function loadBlocklist() {
+    const gen = blockGen;
     try {
       const list = await api("/api/blocklist");
-      if (Array.isArray(list)) state.blocked = list;
+      if (Array.isArray(list) && DC.genCurrent(gen, blockGen)) state.blocked = list;
     } catch { /* keep the last list */ }
     if (!$("#status-sheet").hidden) renderStatus();
     if (!$("#hidden-sheet").hidden) renderHidden();
@@ -1973,8 +2483,9 @@
 
   async function hideArtist(a, { undo = false } = {}) {
     if (!a?.name) return;
+    let r;
     try {
-      await api("/api/blocklist", {
+      r = await api("/api/blocklist", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(a.id ? { name: a.name, id: a.id } : { name: a.name }),
@@ -1984,7 +2495,8 @@
       return;
     }
     toast(`Hidden “${a.name}”`, undo ? { action: "Undo", onAction: () => unhideArtists([a]) } : {});
-    blockedChanged(a);
+    const e = r?.entry || r; // {entry, created}; the entry names it as the server stored it
+    blockedChanged(e?.name ? { name: e.name, id: e.id || a.id || null } : a);
   }
 
   async function unhideArtists(list) {
@@ -1999,6 +2511,9 @@
       } catch (e) {
         if (e.status !== 404) { toast(`Couldn't unhide: ${e.message}`); blockedChanged(null); return; }
       }
+      // the server confirmed it (404 = it wasn't hidden): this device stops hiding it now
+      if (state.blocked) state.blocked = DC.blockRemove(state.blocked, [a]);
+      blockGen++;
     }
     toast(`Unhid “${list.map((a) => a.name).filter(Boolean).join(", ")}”`);
     blockedChanged(null);
@@ -2015,14 +2530,18 @@
 
   // The blocklist changed: what's on screen drops (hide) or may regain (unhide) their songs.
   function blockedChanged(hid) {
-    for (const e of detail.cache.values()) e.at = 0; // any page may hold their songs: refetch on the next visit
+    blockGen++; // a GET /api/blocklist asked before this is out of date
+    for (const e of detail.cache.values()) { e.at = 0; e.inv = true; e.err = null; } // any page may hold their songs: refetch on the next visit
+    // a hide the server confirmed counts here at once, even if the GET /api/blocklist below fails
+    if (hid) state.blocked = DC.blockAdd(state.blocked, hid);
     if (hid) {
       dropFromHome((x, kind) => (kind === "artists" ? (hid.id && x.id === hid.id) || nameKey(x.name) === nameKey(hid.name) : byArtist(x, hid)));
     } else {
       loadHome();
     }
     if (hid) {
-      if (state.results.some((t) => byArtist(t, hid))) {
+      if (state.all && !state.link && !state.searching) refetchSearch(); // cards (artists, albums) go too
+      else if (state.results.some((t) => byArtist(t, hid))) {
         state.results = state.results.filter((t) => !byArtist(t, hid));
         if (state.view === "search") renderSearch();
       }
@@ -2039,10 +2558,12 @@
   async function refetchSearch() {
     const q = state.query, seq = ++searchSeq;
     try {
-      const r = await api(`/api/search?q=${encodeURIComponent(q)}&src=${encodeURIComponent(currentSource())}`);
-      if (seq !== searchSeq || !Array.isArray(r)) return;
-      state.results = r;
-      noteKept(r);
+      const r = await fetchSearch(q);
+      if (seq !== searchSeq) return;
+      state.all = r.all;
+      state.results = r.results;
+      state.kinds.clear();
+      noteKept(r.results);
       if (state.view === "search") renderSearch();
     } catch { /* keep what's shown */ }
   }
@@ -2136,6 +2657,7 @@
     const tab = r.view === "detail" ? state.parent : r.view;
     document.body.dataset.view = tab;
     document.body.classList.toggle("in-detail", r.view === "detail");
+    if (r.view !== "detail") document.body.dataset.page = "";
     $$(".view").forEach((s) => { s.hidden = s.id !== `view-${r.view}`; });
     $$(".tab").forEach((t) => t.classList.toggle("active", t.dataset.view === tab));
     const y = visited ? scrollAt.get(navDepth) || 0 : 0;
@@ -2218,7 +2740,10 @@
     }
     state.homeErr = null;
     if (!body || !Array.isArray(body.shelves)) return;
-    for (const s of body.shelves) if (s.kind === "tracks") noteKept(s.items);
+    for (const s of body.shelves) {
+      if (s.kind === "tracks") noteKept(s.items);
+      else if (s.kind === "cards") noteKept(s.items.filter((c) => c && c.type === "track").map((c) => c.track));
+    }
     const moods = body.shelves.find((s) => s.kind === "moods");
     if (moods?.items?.length) state.tiles = moods.items;
     const same = JSON.stringify(body.shelves) === JSON.stringify(state.home?.shelves);
@@ -2236,8 +2761,11 @@
     if (!state.home) return;
     let changed = false;
     for (const s of state.home.shelves) {
-      if (!["tracks", "seeds", "artists"].includes(s.kind)) continue;
-      const left = s.items.filter((x) => !drop(s.kind === "seeds" ? x.seed : x, s.kind));
+      if (!["tracks", "seeds", "artists", "cards"].includes(s.kind)) continue;
+      const gone = (x) => (s.kind === "cards"
+        ? (x.type === "track" ? !!x.track && drop(x.track, "tracks") : x.type === "artist" && drop({ id: x.id, name: x.title }, "artists"))
+        : drop(s.kind === "seeds" ? x.seed : x, s.kind));
+      const left = s.items.filter((x) => !gone(x));
       if (left.length !== s.items.length) { s.items = left; changed = true; }
     }
     if (!changed) return;
@@ -2344,6 +2872,8 @@
     state.searching = true;
     state.searchError = null;
     state.filter = "top";
+    state.all = null;
+    state.kinds.clear();
     clearTimeout(sug.timer);
     sug.seq++;
     $("#q").value = q;
@@ -2370,11 +2900,13 @@
         const name = state.link.kind === "playlist" ? state.link.title : t ? `${t.title} ${t.channel || ""}`.trim() : "";
         if (name) rememberSearch(name);
       } else {
-        const r = await api(`/api/search?q=${encodeURIComponent(q)}&src=${encodeURIComponent(currentSource())}`);
+        const r = await fetchSearch(q);
         if (seq !== searchSeq) return;
-        state.results = r;
+        state.all = r.all;
+        state.results = r.results;
       }
       noteKept(state.results);
+      noteKept(state.all?.videos);
     } catch (e) {
       if (seq !== searchSeq) return;
       state.results = [];
@@ -2384,6 +2916,16 @@
     if (state.view === "search") renderSearch();
   }
 
+  // A search on YouTube is grouped by kind (/api/search/all, §10.1); other sources search songs.
+  async function fetchSearch(q) {
+    if (currentSource() === "yt") {
+      const all = await api(`/api/search/all?q=${encodeURIComponent(q)}`);
+      return { all, results: Array.isArray(all?.songs) ? all.songs : [] };
+    }
+    const r = await api(`/api/search?q=${encodeURIComponent(q)}&src=${encodeURIComponent(currentSource())}`);
+    return { all: null, results: Array.isArray(r) ? r : [] };
+  }
+
   function rememberSearch(q) {
     store.set("searches", [q, ...store.get("searches", []).filter((s) => s.toLowerCase() !== q.toLowerCase())].slice(0, 8));
   }
@@ -2391,7 +2933,7 @@
   // ---------- search suggestions ----------
   // Shown in place of Recent / the results while the box holds text that hasn't been searched yet.
   // Debounced; `seq` drops stale answers; `cache` is per typed text (lowercased), successes only.
-  const sug = { seq: 0, timer: 0, cache: new Map(), list: [] };
+  const sug = { seq: 0, timer: 0, cache: new Map(), list: [], busy: false };
   let searchMode = "";
   const suggesting = () => {
     const typed = $("#q").value.trim();
@@ -2401,6 +2943,7 @@
   function suggest() {
     clearTimeout(sug.timer);
     const typed = suggesting();
+    sug.busy = false;
     if (typed) {
       const key = typed.toLowerCase();
       if (sug.cache.has(key)) {
@@ -2408,6 +2951,7 @@
         sug.list = sug.cache.get(key);
       } else {
         const seq = ++sug.seq;
+        sug.busy = true;
         sug.timer = setTimeout(async () => {
           let list;
           try { list = await api(`/api/suggest?q=${encodeURIComponent(typed)}`); } catch { list = null; }
@@ -2417,6 +2961,7 @@
             if (sug.cache.size > 200) sug.cache.delete(sug.cache.keys().next().value);
           }
           if (seq !== sug.seq || suggesting() !== typed) return;
+          sug.busy = false;
           sug.list = list || [];
           if (state.view === "search") renderSearch();
         }, 250);
@@ -2442,7 +2987,15 @@
 
   // ---------- player ----------
   function play(listName, i, { shuffle = false } = {}) {
-    const list = lists[listName]?.();
+    // a page a hide / unhide invalidated whose refresh failed isn't played from (it may hold songs now hidden)
+    const pe = (listName === "page" || listName === "av") && state.view === "detail" ? detail.cache.get(detail.key) : null;
+    if (pe && DC.playableCopy(pe, Date.now(), PAGE_TTL) === "refuse") { toast(errorInfo(pe.err, "Couldn't load it").title + ": try again in a moment"); return; }
+    const list = listItems(listName);
+    if (!list || !list.length) return;
+    startQueue(list, i, { shuffle, from: fromLabel(listName), route: fromRoute(listName) });
+  }
+  // Play `list` from `i` (a list that isn't on screen as rows: an album from a search card, an artist's radio).
+  function startQueue(list, i, { shuffle = false, from = "", route = "" } = {}) {
     if (!list || !list.length) return;
     const tracks = list.map(slim);
     i = Math.min(Math.max(i, 0), tracks.length - 1);
@@ -2457,21 +3010,24 @@
       state.queue = tracks; state.index = i; state.original = null;
     }
     queueGen++;
-    state.from = fromLabel(listName);
-    state.fromRoute = fromRoute(listName);
+    state.from = from;
+    state.fromRoute = route;
     prefetch([cur() && playId(cur())]);
     load();
   }
 
   // "Now playing from …": a pasted playlist and a browse page show their own name.
-  const fromLabel = (listName) => (listName === "page" ? pageTitle()
-    : listName === "results" && state.link?.kind === "playlist" ? state.link.title || "Playlist" : FROM[listName] || "");
+  const fromLabel = (listName) => (listName === "page" || listName === "av" ? pageTitle()
+    : listName === "results" && state.link?.kind === "playlist" ? state.link.title || "Playlist"
+    : ["top", "sv", "sk"].includes(listName) ? FROM.results
+    : /^hc?:/.test(listName) ? homeShelf(listName.replace(/^hc?:/, ""))?.title || "Home" : FROM[listName] || "");
   // "Playing from search" / "Playing from Discovery" ("" when the queue has no source).
   const playingFrom = () => (state.from ? `Playing from ${state.from.replace(/^From /, "")}` : "");
   // The page a list lives on, for "Playing from …" in Now Playing and Up next (a tap goes back there).
   const HOME_LISTS = ["quick", "on_repeat", "jump_back", "liked", "recent"];
-  const fromRoute = (listName) => (listName === "page" ? (state.view === "detail" ? location.hash : "")
-    : listName === "results" ? "#search" : listName === "history" ? "#library" : HOME_LISTS.includes(listName) ? "#home" : "");
+  const fromRoute = (listName) => (listName === "page" || listName === "av" ? (state.view === "detail" ? location.hash : "")
+    : ["results", "top", "sv", "sk"].includes(listName) ? "#search" : listName === "history" ? "#library"
+    : HOME_LISTS.includes(listName) || /^hc?:/.test(listName) ? "#home" : "");
 
   function rememberPlay(t) {
     store.set("plays", [slim(t), ...store.get("plays", []).filter((p) => p.id !== t.id)].slice(0, 12));
@@ -2853,10 +3409,18 @@
   const THEMES = { cover: "Cover colours", accent: "Accent only", black: "Pure black" };
   const PALETTE_SIZE = 64, PALETTE_KEEP = 150;
   const pal = { theme: THEMES[store.get("theme")] ? store.get("theme") : "cover", mem: new Map(), loading: new Map(), seq: 0 };
-  function paletteFor(id) {
-    if (pal.mem.has(id)) return Promise.resolve(pal.mem.get(id));
+  const paletteFor = (id) => paletteOf(id, artUrl(id, PALETTE_SIZE));
+  // A palette already known (memory, then this device's saved ones), else null.
+  function paletteCached(id) {
+    if (pal.mem.has(id)) return pal.mem.get(id);
     const saved = store.get("palettes", {})?.[id];
-    if (saved && P.vars(saved)["--c-base"] === saved.base) { pal.mem.set(id, saved); return Promise.resolve(saved); }
+    if (saved && P.vars(saved)["--c-base"] === saved.base) { pal.mem.set(id, saved); return saved; }
+    return null;
+  }
+  // The palette of the image at `src` (same origin: /api/art or /api/thumb), cached under `id`.
+  function paletteOf(id, src) {
+    const known = paletteCached(id);
+    if (known) return Promise.resolve(known);
     if (pal.loading.has(id)) return pal.loading.get(id);
     const p = new Promise((resolve) => {
       const img = new Image();
@@ -2873,7 +3437,7 @@
         resolve(out);
       };
       img.onerror = () => resolve(null);
-      img.src = artUrl(id, PALETTE_SIZE);
+      img.src = src;
     }).then((out) => {
       pal.loading.delete(id);
       if (out) {
@@ -2896,19 +3460,40 @@
     // Until the new cover is read, the previous colours stay (then glide over); unreadable art -> the defaults.
     paletteFor(t.id).then((p) => { if (seq === pal.seq) setPaletteVars(p || P.DEFAULT); });
   }
+  // Cover colours for a page or a card (§1.1: album / artist pages, the top search result): {id, src} from a thumbnail
+  // through /api/thumb, else a track's /api/art; null when neither can be read from Reef's origin.
+  function tintRef(thumb, trackId) {
+    const src = thumb ? DC.thumbSrc(thumb, PALETTE_SIZE) : null;
+    if (src) return { id: "u:" + thumb, src };
+    if (trackId && !/^pq:/.test(trackId)) return { id: trackId, src: artUrl(trackId, PALETTE_SIZE) };
+    return null;
+  }
+  // The theme's fixed palette, the cached one for `ref`, or null (not read yet).
+  const tintNow = (ref) => (pal.theme !== "cover" ? (pal.theme === "black" ? P.BLACK : P.DEFAULT) : ref ? paletteCached(ref.id) : P.DEFAULT);
+  // An inline style with the palette's custom properties ("" until it's known), for markup painted as a string.
+  const tintStyle = (ref) => { const p = tintNow(ref); return p ? Object.entries(P.vars(p)).map(([k, v]) => `${k}:${v}`).join(";") : ""; };
+  // Once the palette is read, set it on `el` (still on screen); the registered properties glide over 800 ms.
+  function tintLater(el, ref) {
+    if (!el || !ref || pal.theme !== "cover" || paletteCached(ref.id)) return;
+    paletteOf(ref.id, ref.src).then((p) => {
+      if (!el.isConnected) return;
+      for (const [k, v] of Object.entries(P.vars(p || P.DEFAULT))) el.style.setProperty(k, v);
+    });
+  }
   function setTheme(theme) {
     if (!THEMES[theme] || theme === pal.theme) return;
     pal.theme = theme;
     store.set("theme", theme);
     applyPalette();
     applyBg();
+    if (state.view === "detail") renderDetail(); else if (state.view === "search") renderSearch();
     if (!$("#status-sheet").hidden) renderStatus();
     if (!$("#bg-sheet").hidden) renderBgPicker();
   }
   const themePicker = () => `<li class="st-theme"><span class="k">Player colours</span>
       <div class="seg" role="radiogroup" aria-label="Player colours">${Object.entries(THEMES).map(([k, label]) =>
         `<button role="radio" aria-checked="${k === pal.theme}" class="${k === pal.theme ? "on" : ""}" data-set-theme="${k}">${label}</button>`).join("")}</div>
-      <span class="hint">Colours the mini player and Now Playing. Saved on this device.</span></li>`;
+      <span class="hint">Colours the player, album and artist pages and the top search result. Saved on this device.</span></li>`;
 
   // Re-run an element's cross-fade (titles and art on track change, §1.4 "cross").
   function crossFade(...els) {
@@ -4579,7 +5164,7 @@
     const s = keepState(id);
     if (s === "kept") { toast("Already in your library"); return; }
     if (s === "pending") { libFocus = "lib-dl"; location.hash = "#library"; return; }
-    const t = (lists[listName]?.() || []).find((x) => x.id === id) || state.queue.find((x) => x.id === id) || { id, title: "" };
+    const t = (listItems(listName) || []).find((x) => x.id === id) || state.queue.find((x) => x.id === id) || { id, title: "" };
     // From an album page, the keep carries the album's tags (as Keep album does).
     const hints = listName === "page" && detail.kind === "album" ? albumHints(t, pageData()) : {};
     try {
@@ -5177,7 +5762,7 @@
     keep: ["Keep", "plus"], playlist: ["Add to playlist", "note"], like: ["Like", "heart"],
   };
   function findTrack(id, listName, i) {
-    const list = lists[listName]?.() || [];
+    const list = listItems(listName) || [];
     return (list[i]?.id === id ? list[i] : list.find((x) => x && x.id === id)) || state.queue.find((x) => x.id === id) || null;
   }
   function openActions(id, listName, i, { page = "main" } = {}) {
@@ -5915,6 +6500,175 @@
     toast(`Playing next: “${t.title}”`);
   }
 
+  // ---------- discovery actions (§10.1-10.3): play a card's album / playlist / artist mix, page buttons and menu ----------
+  // Play an album / playlist / artist's songs from its page data (fetched into the page cache, so opening it later is
+  // instant). `from` names the queue ("Playing from …"); a tap on it opens that page.
+  async function playCollection(kind, id, { shuffle = false, from = "" } = {}) {
+    const key = `${kind}/${id}`;
+    // loadPage re-asks a page that's missing, expired (PAGE_TTL) or invalidated (a hide / unhide sets at = 0), so a
+    // hidden artist's songs never come back from an old copy; a fresh one is used as is
+    await loadPage(key);
+    const entry = detail.cache.get(key), d = entry?.data;
+    const copy = DC.playableCopy(entry, Date.now(), PAGE_TTL);
+    if (copy === "refuse") { // invalidated by a hide / unhide and the refresh failed: never play the old copy
+      toast(errorInfo(entry.err, "Couldn't load it").title + ": try again in a moment");
+      return;
+    }
+    let tracks = ((kind === "artist" ? d?.songs : d?.tracks) || []).filter(Boolean);
+    // only expired and the refresh failed: the old copy, minus the artists hidden since
+    if (copy === "stale" && state.blocked?.length) tracks = tracks.filter((t) => !state.blocked.some((b) => byArtist(t, b)));
+    if (!tracks.length) {
+      const e = detail.errors.get(key);
+      toast(e ? errorInfo(e, "Couldn't load it").title : "Nothing playable there");
+      return;
+    }
+    state.tmp = tracks;
+    if (!shuffle) state.shuffle = false;
+    startQueue(tracks, 0, { shuffle, from: from || pageTitle(kind, d, id), route: `#${key}` });
+  }
+  // An artist's Shuffle / Radio: YouTube's own mixes (RDAO… shuffle, RDEM… radio) when known, else the artist's songs.
+  async function artistMix(id, name, mode, ids = {}) {
+    let list = mode === "radio" ? ids.radio_id : ids.shuffle_id;
+    if (!list) { // the "Top result" block names no mixes: the artist page does
+      await loadPage(`artist/${id}`); // fresh, or re-asked when expired / invalidated
+      const a = detail.cache.get(`artist/${id}`)?.data;
+      list = mode === "radio" ? a?.radio_id : a?.shuffle_id;
+      if (!list) {
+        if (mode === "radio" && a?.songs?.length) startRadio(a.songs[0]);
+        else playCollection("artist", id, { shuffle: true, from: name });
+        return;
+      }
+    }
+    playCollection("playlist", list, { shuffle: mode === "shuffle", from: mode === "radio" ? `${name} radio` : name });
+  }
+  function topPlay(mode) {
+    const top = state.all?.top;
+    if (!top || top.type === "track") return;
+    if (top.type === "artist") { artistMix(top.id, top.title, mode, top); return; }
+    playCollection(top.type, top.id, { shuffle: mode === "shuffle", from: top.title });
+  }
+
+  // Play next / Add to queue for a whole page (as shown).
+  function queueAll(tracks, mode) {
+    const list = (tracks || []).filter((t) => t && t.id !== cur()?.id);
+    if (!list.length) return;
+    if (!cur()) { state.shuffle = false; startQueue(list, 0, { from: pageTitle(), route: location.hash }); return; }
+    for (const t of mode === "next" ? list.slice().reverse() : list) addToQueue(t, "page", mode, { quiet: true });
+    toast(mode === "next" ? `Playing next: ${songs(list.length)}` : `Added to queue: ${songs(list.length)}`);
+  }
+  // Save (§10.2 "Save/Like"): a YouTube album / playlist becomes one of your Reef playlists.
+  async function savePage() {
+    const d = pageData();
+    const tracks = pageTracks().filter((t) => !M.isPlaceholder(t)).map(slim);
+    if (!d || !tracks.length) return;
+    try {
+      const p = await api("/api/playlists", { method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: pageTitle().slice(0, 100) || "Playlist", tracks }) });
+      toast(`Saved “${p.name}” to your playlists`, { action: "Open", onAction: () => openRoute(`#local/${encodeURIComponent(p.id)}`) });
+      loadPlaylists();
+    } catch (e) {
+      toast(`Couldn't save it: ${e.message}`);
+    }
+  }
+  async function togglePin() {
+    const d = pageData();
+    if (!d || detail.kind !== "local") return;
+    const pinned = !d.pinned;
+    d.pinned = pinned; // at once; the PATCH confirms
+    renderDetail();
+    try {
+      await api(`/api/playlists/${encodeURIComponent(d.id)}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ pinned }) });
+      toast(pinned ? "Pinned to the top of your playlists" : "Unpinned");
+      loadPlaylists();
+    } catch (e) {
+      d.pinned = !pinned;
+      renderDetail();
+      toast(`Couldn't change it: ${e.message}`);
+    }
+  }
+  async function sharePage() {
+    const d = pageData();
+    if (!d || detail.kind === "local") return;
+    const url = ytmUrl(detail.kind, detail.kind === "artist" ? d.id : d.id || detail.id), title = pageTitle();
+    try {
+      if (navigator.share) { await navigator.share({ title, url }); return; }
+    } catch (e) {
+      if (e && e.name === "AbortError") return;
+    }
+    copyText(url, "Link copied");
+  }
+
+  // The page's ⋯ (§10.2): a floating card like the track menu, tinted like the page.
+  const prow = (act, label, sub, ic, arg = "") => `<button class="mrow" data-pact="${act}"${arg ? ` data-arg="${esc(arg)}"` : ""}>
+      <span class="mic">${icon(ic)}</span><span class="ml"><span>${label}</span>${sub ? `<small>${sub}</small>` : ""}</span></button>`;
+  function openPageMenu() {
+    const d = pageData(), kind = detail.kind;
+    if (!d || !["album", "playlist", "local"].includes(kind)) return;
+    const shown = pageShown().filter((t) => !M.isPlaceholder(t) || kind === "local");
+    const real = (d.tracks || []).filter((t) => !M.isPlaceholder(t));
+    const thumb = kind === "local" ? null : d.thumb;
+    $("#page-head").innerHTML = `<span class="mh-art">${thumb ? `<img src="${esc(thumb)}" alt="" data-drop>` : real.length ? art(real[0].id) : icon("note")}</span>
+      <span class="mh-text"><span class="mh-t" id="page-title">${esc(pageTitle())}</span><span class="mh-s">${esc([kind === "album" ? releaseType.get(d.id) || "Album" : "Playlist", songs((d.tracks || []).length)].join(" · "))}</span></span>`;
+    const a = kind === "album" ? (d.artists || []).find((x) => x && ARTIST_ID.test(x.id || "")) : null;
+    const play = [prow("next", "Play next", shown.length ? songs(shown.length) : "", "play-next"), prow("queue", "Add to queue", "", "queue-add")];
+    const go = a ? [prow("artist", "Go to artist", esc(a.name), "person", a.id)] : [];
+    const more = kind === "local"
+      ? [prow("m3u", "Download .m3u", "For other players", "download")]
+      : [prow("save", "Save to your playlists", "A Reef playlist with these songs", "library"), prow("copy", "Copy link", "", "link"),
+        prow("open", "Open on YouTube Music", "", "external")];
+    const group = (title, rows) => (rows.length ? `<section class="mgroup"><h4>${title}</h4><div class="mlist">${rows.join("")}</div></section>` : "");
+    $("#page-menu").innerHTML = group("Play", play) + group("Go to", go) + group("More", more);
+    const sheet = $("#page-sheet .sheet"), p = tintNow(pageTint(kind, d)) || P.DEFAULT;
+    for (const [k, v] of Object.entries(P.vars(p))) sheet.style.setProperty(k, v);
+    openSheet("#page-sheet");
+  }
+  function runPageAction(act, arg) {
+    const d = pageData(), kind = detail.kind;
+    closeSheet("#page-sheet");
+    if (!d) return;
+    if (act === "next" || act === "queue") queueAll(pageShown(), act);
+    else if (act === "artist" && arg) openRoute(`#artist/${encodeURIComponent(arg)}`);
+    else if (act === "save") savePage();
+    else if (act === "copy") copyText(ytmUrl(kind, d.id || detail.id), "Link copied");
+    else if (act === "open") window.open(ytmUrl(kind, d.id || detail.id), "_blank", "noopener");
+    else if (act === "m3u") window.open(`/api/playlists/${encodeURIComponent(d.id)}.m3u`, "_blank", "noopener");
+  }
+
+  // Recent searches: ✕ (or a long press) removes one, with Undo.
+  function dropRecentSearch(q) {
+    const r = DC.dropRecent(store.get("searches", []), q);
+    if (r.at < 0) return;
+    store.set("searches", r.list);
+    if (state.view === "search" && !state.query) renderSearch();
+    toast(`Removed “${q}”`, { action: "Undo", onAction: () => {
+      store.set("searches", DC.putBack(store.get("searches", []), q, r.at));
+      if (state.view === "search" && !state.query) renderSearch();
+    } });
+  }
+  (function recentLongPress() {
+    let p = null;
+    const clear = () => { if (p) clearTimeout(p.timer); p = null; };
+    document.addEventListener("pointerdown", (e) => {
+      clear();
+      const el = e.target.closest?.("[data-recent]");
+      if (!el || e.target.closest("[data-recent-del]") || (e.pointerType === "mouse" && e.button !== 0)) return;
+      const q = { el, x: e.clientX, y: e.clientY, id: e.pointerId, timer: 0 };
+      q.timer = setTimeout(() => { swallowClick(); dropRecentSearch(el.dataset.recent); p = null; }, 550);
+      p = q;
+    });
+    document.addEventListener("pointermove", (e) => { if (p && e.pointerId === p.id && Math.hypot(e.clientX - p.x, e.clientY - p.y) > 10) clear(); });
+    for (const type of ["pointerup", "pointercancel"]) document.addEventListener(type, (e) => { if (p && e.pointerId === p.id) clear(); });
+    window.addEventListener("scroll", clear, { passive: true });
+  })();
+
+  // The filter field on a playlist page: only the rows repaint, so the field keeps focus and the keyboard.
+  document.addEventListener("input", (e) => {
+    if (e.target.id !== "pg-filter" || state.view !== "detail") return;
+    setView({ q: e.target.value });
+    paintRows();
+    $("[data-page-sort]")?.classList.toggle("set", viewOf().sort !== "default" || !!viewOf().q);
+  });
+
   // ---------- toast ----------
   // toast(msg) or toast(msg, {action: "Undo", onAction}) with a button (5 s).
   let toastTimer, toastAct = null;
@@ -5939,7 +6693,7 @@
 
   // ---------- events ----------
   document.addEventListener("click", (e) => {
-    const t = e.target.closest("[data-keep],[data-play],[data-search],[data-source],[data-retry-search],[data-retry-home],[data-retry-history],[data-retry-playlists],[data-retry-library],[data-set-theme],[data-set-swipe],[data-filter],[data-dismiss],[data-play-all],[data-shuffle-all],[data-close],[data-clear-finished],[data-clear-searches],[data-more],[data-act],[data-q-jump],[data-q-remove],[data-q-clear],[data-q-mode],[data-q-save],[data-npbg],[data-open-bg],[data-sleep],[data-fill],[data-keep-all],[data-retry],[data-page-radio],[data-artist-hide],[data-unhide],[data-unhide-page],[data-open-hidden],[data-yt-reset],[data-copy-diag],[data-about],[data-mix],[data-st],[data-import-resolve]");
+    const t = e.target.closest("[data-keep],[data-play],[data-search],[data-source],[data-retry-search],[data-retry-home],[data-retry-history],[data-retry-playlists],[data-retry-library],[data-set-theme],[data-set-swipe],[data-filter],[data-dismiss],[data-play-all],[data-shuffle-all],[data-close],[data-clear-finished],[data-clear-searches],[data-more],[data-act],[data-q-jump],[data-q-remove],[data-q-clear],[data-q-mode],[data-q-save],[data-npbg],[data-open-bg],[data-sleep],[data-fill],[data-keep-all],[data-retry],[data-page-radio],[data-artist-hide],[data-unhide],[data-unhide-page],[data-open-hidden],[data-yt-reset],[data-copy-diag],[data-about],[data-mix],[data-st],[data-import-resolve],[data-top-play],[data-artist-play],[data-recent-del],[data-filter-retry],[data-page-save],[data-page-pin],[data-page-share],[data-page-more],[data-page-sort],[data-page-sortby],[data-pact]");
     if (!t) return;
     const d = t.dataset;
     if ("keep" in d) { e.preventDefault(); if (d.keep) keep(d.keep, d.list); return; }
@@ -5955,7 +6709,23 @@
     if ("setTheme" in d) { setTheme(d.setTheme); return; }
     if ("setSwipe" in d) { const [dir, act] = d.setSwipe.split(":"); setSwipePref(dir, act); return; }
     if ("mix" in d) { const m = homeItems("mixed")[Number(d.mix)]; if (m?.seed) startRadio(m.seed); return; }
-    if ("pageRadio" in d) { const s = pageTracks()[0]; if (s) startRadio(s); return; }
+    if ("pageRadio" in d) {
+      const a = pageData();
+      if (detail.kind === "artist" && a) artistMix(a.id, a.name, "radio", a);
+      else { const s = pageTracks()[0]; if (s) startRadio(s); }
+      return;
+    }
+    if ("artistPlay" in d) { const a = pageData(); if (a && detail.kind === "artist") artistMix(a.id, a.name, d.artistPlay, a); return; }
+    if ("topPlay" in d) { topPlay(d.topPlay); return; }
+    if ("recentDel" in d) { dropRecentSearch(d.recentDel); return; }
+    if ("filterRetry" in d) { state.kinds.delete(d.filterRetry); renderSearch(); return; }
+    if ("pageSave" in d) { savePage(); return; }
+    if ("pagePin" in d) { togglePin(); return; }
+    if ("pageShare" in d) { sharePage(); return; }
+    if ("pageMore" in d) { openPageMenu(); return; }
+    if ("pact" in d) { runPageAction(d.pact, d.arg); return; }
+    if ("pageSort" in d) { const v = viewOf(); setView({ tools: !v.tools }); renderDetail(); return; }
+    if ("pageSortby" in d) { setView({ sort: DC.sortOf(d.pageSortby) }); renderDetail(); return; }
     if ("artistHide" in d) { toggleArtistHidden(); return; }
     if ("unhidePage" in d) {
       const a = pageData();
@@ -5971,7 +6741,7 @@
     if ("about" in d) {
       detail.about = !detail.about;
       $("#about")?.classList.toggle("clamp", !detail.about);
-      t.textContent = detail.about ? "Less" : "More";
+      t.textContent = detail.about ? t.dataset.less || "Less" : t.dataset.more || "More";
       t.setAttribute("aria-expanded", String(detail.about));
       return;
     }
@@ -6002,7 +6772,13 @@
       if (state.query) runSearch(state.query); else renderSearch();
       return;
     }
-    if ("filter" in d) { state.filter = d.filter; renderSearch(); return; }
+    if ("filter" in d) {
+      state.filter = d.filter;
+      renderSearch();
+      if (t.classList.contains("link-btn")) window.scrollTo(0, 0); // "Show all": the chip's list from the top
+      $(`.fchips [data-filter="${d.filter}"]`)?.scrollIntoView?.({ block: "nearest", inline: "nearest" });
+      return;
+    }
     if ("dismiss" in d) {
       fetch(`/api/jobs/${encodeURIComponent(d.dismiss)}`, { method: "DELETE" }).finally(pollJobs);
       state.jobs = state.jobs.filter((j) => j.id !== d.dismiss);
@@ -6035,11 +6811,13 @@
   $("#q-clear").addEventListener("click", () => {
     $("#q").value = "";
     $("#q-clear").hidden = true;
-    state.query = "";
-    state.link = null;
-    state.results = [];
+    // Cancel whatever is in flight: a pending search's answer is dropped by its stale seq (runSearch returns before its
+    // own reset), so the cleared state must not be "searching" (the spinner would stay on the empty landing).
+    Object.assign(state, DC.clearedSearch());
+    state.kinds.clear();
     searchSeq++;
     sug.seq++;
+    sug.busy = false;
     clearTimeout(sug.timer);
     renderSearch();
     $("#q").focus();
@@ -6066,6 +6844,8 @@
   longPress($("#np-s"), copyTrackName);
   $("#status-btn").addEventListener("click", openStatus);
   $("#top-back").addEventListener("click", goBack);
+  // The search bar's back arrow (§10.1): the page before, else Home.
+  $("#search-back").addEventListener("click", () => { $("#q").blur(); if (navDepth > 0) history.back(); else openRoute("#home"); });
   $("#np-s").addEventListener("click", () => {
     const a = linkable(cur())[0];
     if (a) openRoute(`#artist/${encodeURIComponent(a.id)}`);
@@ -6082,7 +6862,7 @@
   window.addEventListener("scroll", () => {
     top.classList.toggle("scrolled", window.scrollY > 4);
     scrollAt.set(navDepth, window.scrollY);
-    if (state.view === "detail") syncTopTitle();
+    if (state.view === "detail") { syncTopTitle(); pageScrolled(); }
   }, { passive: true });
   window.addEventListener("hashchange", route);
 
@@ -6090,6 +6870,7 @@
   document.addEventListener("touchstart", () => {}, { passive: true });
 
   // ---------- boot ----------
+  document.documentElement.style.setProperty("--cookie", DC.cookieMask()); // §1.3: artist portraits
   state.view = "";
   applyPalette(null);
   applyBg();

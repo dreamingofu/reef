@@ -33,6 +33,7 @@ VERSION = getattr(ytmusicapi, "__version__", None)
 TIMEOUT = (5, 10)  # connect, read; the library default is 30 s, too long for a search box
 THUMB_SIZE = 544
 SUGGEST_TTL, SUGGEST_MAX = 600, 8
+SEARCH_TTL = 600     # grouped and per-kind search results (the songs-only search is not cached here)
 RADIO_TTL = 1800
 MOODS_TTL = ART_TTL = 7 * 86400  # YouTube's mood catalogue and its first-playlist art change slowly
 PAGE_TTL = 86400      # a mood's playlists, album and artist pages
@@ -262,6 +263,134 @@ def search(q, limit=config.SEARCH_LIMIT):
     return _tracks(_call("search", q, filter="songs", limit=limit), limit)
 
 
+# ---------- search by kind (UI remake §10.1: results grouped by type) ----------
+
+SEARCH_KINDS = ("songs", "videos", "albums", "artists", "playlists")
+GROUP_MAX = 8  # results per kind from the mixed search
+_search_cache = _TTLCache(SEARCH_TTL, 128)
+
+
+def _list_id(value):
+    """A playlist id from a search result's browseId / playlistId ("VL" browse prefix dropped), else None."""
+    s = str(value or "")
+    s = s[2:] if s.startswith("VL") else s
+    return s if _LIST_ID.match(s) else None
+
+
+def _result_card(item):
+    """A search result that isn't a song or video as a card {type: album|artist|playlist, id, title, subtitle, thumb,
+    ...}, else None. Albums add `artists`, `year`, `kind` (Album / Single / EP); artists add `radio_id` /
+    `shuffle_id` (YouTube's RD… mixes, playable as playlists) and `audience`; playlists add `author`.
+    The only artist result with a count is the "Top result" one, and ytmusicapi files that count as `subscribers`
+    although it is YouTube Music's monthly audience (68.7M for Daft Punk, whose page says 7.2M subscribers)."""
+    if not isinstance(item, dict):
+        return None
+    kind = item.get("resultType")
+    thumb = _largest(item.get("thumbnails"))
+    if kind == "album" and str(item.get("browseId") or "").startswith("MPRE"):
+        artists = [{"name": a.get("name") or "", "id": a.get("id")}
+                   for a in item.get("artists") or [] if isinstance(a, dict) and a.get("name")]
+        year = str(item["year"]) if item.get("year") else None
+        typ = item.get("type") if item.get("type") in ("Album", "Single", "EP") else "Album"
+        return {"type": "album", "id": item["browseId"], "title": item.get("title") or "",
+                "subtitle": " · ".join(x for x in (typ, ", ".join(a["name"] for a in artists), year) if x),
+                "thumb": _sized(thumb), "artists": artists, "year": year, "kind": typ}
+    if kind == "artist":
+        cid = item.get("browseId")
+        name = item.get("artist") or item.get("title")
+        if not _CHANNEL_ID.match(str(cid or "")):  # the "Top result" artist names itself in `artists`
+            first = next((a for a in item.get("artists") or [] if isinstance(a, dict) and a.get("name")), {})
+            cid, name = first.get("id"), name or first.get("name")
+        if not _CHANNEL_ID.match(str(cid or "")) or not name:
+            return None
+        aud = item.get("subscribers") if isinstance(item.get("subscribers"), str) else None
+        return {"type": "artist", "id": cid, "title": str(name),
+                "subtitle": f"Artist · {aud} monthly audience" if aud else "Artist",
+                "thumb": _sized(thumb, crop=True), "audience": aud or None,
+                "radio_id": _list_id(item.get("radioId")), "shuffle_id": _list_id(item.get("shuffleId"))}
+    if kind == "playlist":
+        pid = _list_id(item.get("browseId") or item.get("playlistId"))
+        if not pid:
+            return None
+        author = item.get("author")
+        author = author.get("name") if isinstance(author, dict) else author
+        count = item.get("itemCount")
+        return {"type": "playlist", "id": pid, "title": item.get("title") or "",
+                "subtitle": " · ".join(str(x) for x in ("Playlist", author, f"{count} songs" if count else None) if x),
+                "thumb": _sized(thumb), "author": author if isinstance(author, str) else None}
+    return None
+
+
+def _search_item(item):
+    """("songs" | "videos", track) or (kind, card) for one search result, else None (podcasts, episodes, profiles)."""
+    kind = item.get("resultType") if isinstance(item, dict) else None
+    if kind in ("song", "video"):
+        t = normalize(item)
+        if not t:
+            return None
+        if kind == "video":
+            t["video"] = True
+        return ("songs" if kind == "song" else "videos", t)
+    card = _result_card(item)
+    return (card["type"] + "s", card) if card else None
+
+
+def search_all(q):
+    """One mixed YouTube Music search, grouped: {top: {type, ...card} | {type: "track", track} | None, songs, videos,
+    albums, artists, playlists} (each ≤ GROUP_MAX, ids unique). Songs listed right under an artist top result belong to
+    it: YouTube leaves their artists out, so they get the top artist. Cached SEARCH_TTL per query."""
+    key = q.strip().lower()
+    hit = _search_cache.get(("all", key))
+    if hit is None:
+        hit = _search_all(_call("search", key))
+        _search_cache.put(("all", key), hit)
+    return copy.deepcopy(hit)
+
+
+def _search_all(raw):
+    out = {k: [] for k in SEARCH_KINDS}
+    seen, top, top_artist = set(), None, None
+    for item in raw or []:
+        found = _search_item(item)
+        if not found:
+            continue
+        kind, x = found
+        if kind == "songs" and not x["artists"] and top_artist:
+            x["artists"] = [{"name": top_artist["title"], "id": top_artist["id"]}]
+            x["channel"] = top_artist["title"]
+        if item.get("category") == "Top result" and top is None:
+            top = {"type": "track", "track": x} if kind in ("songs", "videos") else x
+            if kind == "artists":
+                top_artist = x
+        if x["id"] in seen or len(out[kind]) >= GROUP_MAX:
+            continue
+        seen.add(x["id"])
+        out[kind].append(x)
+    if top is None:  # no "Top result" block: the first song stands in
+        first = (out["songs"] or out["videos"] or [None])[0]
+        top = {"type": "track", "track": first} if first else None
+    out["top"] = top
+    return out
+
+
+def search_kind(q, kind, limit=20):
+    """One kind of result ("videos" tracks, or "albums" / "artists" / "playlists" cards) for a query."""
+    if kind not in SEARCH_KINDS or kind == "songs":
+        raise ValueError(f"unknown search kind {kind!r}")
+    key = (kind, q.strip().lower(), limit)
+    hit = _search_cache.get(key)
+    if hit is None:
+        hit, seen = [], set()
+        for item in _call("search", q.strip(), filter=kind, limit=limit) or []:
+            found = _search_item(item)
+            if found and found[0] == kind and found[1]["id"] not in seen:
+                seen.add(found[1]["id"])
+                hit.append(found[1])
+        hit = hit[:limit]
+        _search_cache.put(key, hit)
+    return copy.deepcopy(hit)
+
+
 def suggestions(q):
     key = q.strip().lower()
     if not key:
@@ -381,6 +510,7 @@ def _album(browse_id):
         "track_count": count if isinstance(count, int) and not isinstance(count, bool) else len(tracks),
         "duration": duration if isinstance(duration, int) and not isinstance(duration, bool) else None,
         "audio_playlist_id": a.get("audioPlaylistId") or None,
+        "description": _trim(a.get("description")) or None,
         "tracks": tracks,
     }
 
@@ -449,8 +579,11 @@ def _playlist(list_id, limit):
     data = _call("get_playlist", list_id, limit=limit) or {}
     author = data.get("author")
     author = author.get("name") if isinstance(author, dict) else author
+    count = data.get("trackCount")
     return {"id": list_id, "title": data.get("title"), "author": author if isinstance(author, str) else None,
-            "thumb": _sized(_largest(data.get("thumbnails"))), "tracks": _tracks(data.get("tracks"), limit)}
+            "thumb": _sized(_largest(data.get("thumbnails"))), "tracks": _tracks(data.get("tracks"), limit),
+            "description": _trim(data.get("description")) or None,
+            "track_count": count if isinstance(count, int) and not isinstance(count, bool) else None}
 
 
 # ---------- artist pages ----------
@@ -503,7 +636,12 @@ def _artist(channel_id):
         "songs_playlist_id": songs_list if _LIST_ID.match(songs_list) else None,
         "albums": _releases(a.get("albums"), "Album"),
         "singles": _releases(a.get("singles"), "Single"),
+        "videos": [dict(t, video=True) for t in _tracks((a.get("videos") or {}).get("results"), 10)],
         "related": related,
+        "subscribers": a.get("subscribers") if isinstance(a.get("subscribers"), str) else None,
+        "monthly_listeners": a.get("monthlyListeners") if isinstance(a.get("monthlyListeners"), str) else None,
+        "radio_id": _list_id(a.get("radioId")),
+        "shuffle_id": _list_id(a.get("shuffleId")),
     }
 
 

@@ -171,4 +171,4 @@ def home_shelf(code=None):
     if not section:
         return None
     return {"country": code, "name": doc["name"], "section": section["title"],
-            "items": [dict(t) for t in section["items"][:HOME_ITEMS]]}
+            "playlist_id": section.get("playlist_id"), "items": [dict(t) for t in section["items"][:HOME_ITEMS]]}

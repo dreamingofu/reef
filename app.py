@@ -219,9 +219,89 @@ def api_diagnostics():
     }))
 
 
+CARD_KINDS = ("albums", "artists", "playlists")
+
+
+def _cards(cards, blocked, names):
+    """Search cards minus hidden artists (an artist card, an album by one), artist names through the aliases."""
+    out = []
+    for c in cards:
+        if c["type"] == "artist":
+            if blocked.artist(c["id"], c["title"]):
+                continue
+            c["title"] = names.name(c["title"], c["id"])
+        elif c["type"] == "album":
+            if blocked.any_artist(c.get("artists") or []):
+                continue
+            c["artists"] = [{**a, "name": names.name(a["name"], a.get("id"))} for a in c.get("artists") or []]
+        out.append(c)
+    return out
+
+
+def _search_kind(q, kind):
+    """GET /api/search?filter=videos|albums|artists|playlists: YouTube Music results of that kind."""
+    if not ytmusic.enabled():
+        return _ytm_off()
+    try:
+        found = ytmusic.search_kind(q, kind, config.SEARCH_LIMIT)
+    except Exception as e:
+        return jsonify(errors.payload(e)), 502
+    blocked, names = blocklist.matcher(), aliases.resolver()
+    if kind == "videos":
+        return jsonify(_mark_kept(blocked.tracks(found), names))
+    return jsonify(_cards(found, blocked, names))
+
+
+@app.get("/api/search/all")
+def api_search_all():
+    """One YouTube Music search grouped by kind (UI remake §10.1): {top, songs, videos, albums, artists, playlists}.
+    `top` is a card ({type: album|artist|playlist, …}) or {type: "track", track}. YouTube Music off or failing →
+    the songs search of the YouTube source (yt-dlp fallback included) as the songs group, `fallback: true`."""
+    q = request.args.get("q", "").strip()[:HINT_MAX]
+    empty = {"top": None, **{k: [] for k in ytmusic.SEARCH_KINDS}}
+    if not q:
+        return jsonify(empty)
+    blocked, names = blocklist.matcher(), aliases.resolver()
+    body = None
+    if ytmusic.enabled():
+        try:
+            body = ytmusic.search_all(q)
+        except Exception as e:
+            logger.warning(f"search all failed, songs only: {str(e)[:160]!r}")
+    if body is None:
+        src = sources.get("yt")
+        try:
+            songs = src.search(q, config.SEARCH_LIMIT * 2 if blocked else config.SEARCH_LIMIT)
+        except Exception as e:
+            return jsonify(errors.payload(e)), 502
+        body = {**empty, "songs": songs[:config.SEARCH_LIMIT * 2], "fallback": True}
+    for k in ("songs", "videos"):
+        body[k] = _mark_kept(blocked.tracks(body[k]), names)[:config.SEARCH_LIMIT]
+        for t in body[k]:
+            t.setdefault("source", "yt")
+    for k in CARD_KINDS:
+        body[k] = _cards(body[k], blocked, names)
+    top = body.get("top")
+    if top and top.get("type") == "track":
+        t = top.get("track")
+        top = {"type": "track", "track": _mark_kept([t], names)[0]} if t and not blocked.track(t) else None
+    elif top:
+        top = (_cards([top], blocked, names) or [None])[0]
+    if top is None and body["songs"]:
+        top = {"type": "track", "track": body["songs"][0]}
+    body["top"] = top
+    streamer.prefetch([t["id"] for t in body["songs"][:3] if _track(t["id"])])
+    return jsonify(body)
+
+
 @app.get("/api/search")
 def api_search():
     q = request.args.get("q", "").strip()
+    kind = request.args.get("filter") or "songs"
+    if kind != "songs":
+        if kind not in ytmusic.SEARCH_KINDS:
+            return jsonify({"error": "unknown filter"}), 400
+        return _search_kind(q, kind) if q else jsonify([])
     src = sources.get(request.args.get("src") or sources.default_key())
     if src is None:
         return jsonify({"error": "unknown source"}), 400
@@ -695,10 +775,13 @@ def api_artist(channel_id):
         return jsonify(errors.payload(e)), 502
     blocked = blocklist.matcher()
     page["blocked"] = blocked.artist(page["id"], page["name"]) or blocked.artist(page["channel_id"])
+    page.setdefault("videos", [])
     if not page["blocked"]:
         page["songs"] = blocked.tracks(page["songs"])
+        page["videos"] = blocked.tracks(page["videos"])
     page["related"] = [r for r in page["related"] if not blocked.artist(r["id"], r["name"])]
     names = aliases.resolver()
+    _mark_kept(page["videos"], names)
     if names:
         page["name"] = names.name(names.name(page["name"], page["channel_id"]), page["id"])
         for r in page["related"]:
@@ -1597,15 +1680,16 @@ def _art_size():
     return min(max(request.args.get("size", 300, type=int), ART_MIN), ART_MAX)
 
 
-def _tiny_bytes(url):
-    """(data, mime) of a small upstream image, from memory or fetched once; None when it can't be had."""
+def _tiny_bytes(url, redirects=True):
+    """(data, mime) of a small upstream image, from memory or fetched once; None when it can't be had.
+    `redirects=False` refuses a redirect (the /api/thumb proxy only fetches the host it checked)."""
     with _tiny_lock:
         hit = _tiny_art.get(url)
         if hit is not None:
             _tiny_art.move_to_end(url)
             return hit
     try:
-        with _art_session.get(url, timeout=(3, 6), stream=True) as r:
+        with _art_session.get(url, timeout=(3, 6), stream=True, allow_redirects=redirects) as r:
             mime = (r.headers.get("Content-Type") or "").split(";")[0].strip().lower()
             if r.status_code != 200 or not mime.startswith("image/"):
                 return None
@@ -1698,6 +1782,55 @@ def api_art(track_id):
     resp = redirect(found[1], 302)
     resp.headers["Cache-Control"] = "public, max-age=3600"
     return resp
+
+
+# YouTube Music / YouTube image hosts /api/thumb may fetch from (https, default port, no credentials).
+THUMB_HOST_SUFFIXES = (".googleusercontent.com", ".ggpht.com")
+THUMB_HOSTS = {"i.ytimg.com", "i1.ytimg.com", "i2.ytimg.com", "i3.ytimg.com", "i4.ytimg.com", "i9.ytimg.com"}
+THUMB_URL_MAX = 1024
+THUMB_TYPES = {"image/jpeg", "image/png", "image/webp", "image/gif"}
+_GOOGLE_SIZE = re.compile(r"=(?:w\d+-h\d+|s\d+)((?:-[\w]+)*)$")
+
+
+def thumb_source(raw, size):
+    """The upstream URL /api/thumb fetches for `raw`, else None: an https URL on a YouTube Music / YouTube image
+    host only (never an open proxy). Resizable Google art is asked for at `size` (its crop flag kept)."""
+    if not isinstance(raw, str) or len(raw) > THUMB_URL_MAX or any(c in raw for c in "\\\r\n\t "):
+        return None
+    try:
+        u = urlsplit(raw)
+        port = u.port
+    except ValueError:
+        return None
+    host = (u.hostname or "").lower()
+    if u.scheme != "https" or port not in (None, 443) or u.username or u.password or "@" in u.netloc:
+        return None
+    if host in THUMB_HOSTS:
+        return urlunsplit(("https", host, u.path, u.query, ""))
+    if not host.endswith(THUMB_HOST_SUFFIXES) or u.query:
+        return None
+    path = u.path
+    m = _GOOGLE_SIZE.search(path)
+    if m:
+        crop = "-p" if "p" in m.group(1).split("-") else ""
+        path = path[:m.start()] + f"=w{size}-h{size}{crop}-l90-rj"
+    return urlunsplit(("https", host, path, "", ""))
+
+
+@app.get("/api/thumb")
+def api_thumb():
+    """A small (≤ ART_TINY px) copy of an album / artist / playlist thumbnail, sent from Reef's own origin so the
+    browser can read its pixels (cover colours, UI remake §1.1). Only YouTube Music / YouTube image hosts; the
+    upstream answer must be an image ≤ ART_TINY_BYTES, and redirects are not followed."""
+    size = min(max(request.args.get("size", 64, type=int), ART_MIN), ART_TINY)
+    url = thumb_source(request.args.get("u", ""), size)
+    if not url:
+        return jsonify({"error": "not a YouTube Music image"}), 400
+    got = _tiny_bytes(url, redirects=False)
+    if not got or got[1] not in THUMB_TYPES:  # raster images only: never an SVG (or HTML) from our origin
+        abort(404)
+    return Response(got[0], content_type=got[1], headers={
+        "Cache-Control": ART_CACHE, "X-Content-Type-Options": "nosniff", "Content-Security-Policy": "default-src 'none'"})
 
 
 def _hint(value):

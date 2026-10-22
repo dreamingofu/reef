@@ -69,6 +69,8 @@
   <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M12 11v5.2M12 7.9h.01"/></symbol>
   <symbol id="i-link" viewBox="0 0 24 24"><path d="M10.2 13.8a3.6 3.6 0 0 0 5.1 0l3.1-3.1a3.6 3.6 0 0 0-5.1-5.1l-1.1 1.1M13.8 10.2a3.6 3.6 0 0 0-5.1 0l-3.1 3.1a3.6 3.6 0 0 0 5.1 5.1l1.1-1.1"/></symbol>
   <symbol id="i-swap" viewBox="0 0 24 24"><path d="M4.5 8h13.5m-3.2-3.2L18 8l-3.2 3.2M19.5 16H6m3.2-3.2L6 16l3.2 3.2"/></symbol>
+  <symbol id="i-pin" viewBox="0 0 24 24"><path d="M9 3.8h6M10 3.8v5.6L6.6 13h10.8L14 9.4V3.8M12 13v7.2"/></symbol>
+  <symbol id="i-sort" viewBox="0 0 24 24"><path d="M4 7h11M4 12h8M4 17h5m10.5-11.5v13m0 0-3-3m3 3 3-3"/></symbol>
   <symbol id="i-minus" viewBox="0 0 24 24"><path d="M6 12h12"/></symbol>
   <symbol id="i-logo" viewBox="0 0 32 32"><circle cx="16" cy="16" r="15" fill="url(#g-logo)" stroke="none"/><path d="M10.5 12v8M16 8.5v15M21.5 13v6" stroke="#fff" stroke-width="2.6" stroke-linecap="round" fill="none"/></symbol>
 </svg>
@@ -120,9 +122,9 @@
 </div>
 
 <form class="searchbar" id="search-bar" role="search" autocomplete="off">
-  <a class="fab glass sm" href="#home" aria-label="Home"><svg class="i"><use href="#i-home"/></svg></a>
+  <button type="button" class="fab glass sm" id="search-back" aria-label="Back"><svg class="i"><use href="#i-chev-left"/></svg></button>
   <label class="search-pill glass">
-    <svg class="i"><use href="#i-search"/></svg>
+    <svg class="i s-mag"><use href="#i-search"/></svg><i class="spin s-spin" aria-hidden="true"></i>
     <input id="q" type="search" placeholder="Artists, songs, videos…" enterkeyhint="search" autocorrect="off" autocapitalize="off" spellcheck="false">
     <button type="button" class="icon-btn sm" id="q-clear" aria-label="Clear" hidden><svg class="i"><use href="#i-x"/></svg></button>
   </label>
@@ -289,6 +291,16 @@
       <div class="mpage main" id="act-menu" data-scroll></div>
       <div class="mpage sub" id="act-sub" data-scroll aria-hidden="true"></div>
     </div>
+  </div>
+</div>
+
+<!-- an album / playlist page's ⋯ (§10.2): same floating card as the track menu -->
+<div class="sheet-wrap menu-wrap" id="page-sheet" hidden>
+  <div class="scrim" data-close></div>
+  <div class="sheet msheet" role="dialog" aria-modal="true" aria-labelledby="page-title" tabindex="-1">
+    <div class="sheet-top msheet-top"><div class="grabber"></div><button class="icon-btn sm m-close" data-close aria-label="Close">
+      <svg class="i"><use href="#i-x"/></svg></button><div class="act-head" id="page-head"></div></div>
+    <div class="mpages"><div class="mpage main" id="page-menu" data-scroll></div></div>
   </div>
 </div>
 

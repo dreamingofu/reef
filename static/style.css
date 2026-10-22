@@ -379,11 +379,11 @@ body.in-detail .top-title {
 .poster-grad .poster-glyph .i { width: 96px; height: 96px; stroke-width: 1.3; color: rgba(255, 255, 255, .9); }
 
 /* square cards */
-.card { flex: 0 0 160px; width: 160px; min-width: 0; }
-.card-art { position: relative; display: block; width: 160px; height: 160px; border-radius: var(--r-lg); overflow: hidden; background: var(--s4); }
+.card { flex: 0 0 150px; width: 150px; min-width: 0; }
+.card-art { position: relative; display: block; width: 150px; height: 150px; border-radius: 13px; overflow: hidden; background: var(--s4); }
 .card-art img { width: 100%; height: 100%; object-fit: cover; }
-.card-t { margin-top: 10px; font-size: var(--fs-l3); font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.card-s { margin-top: 1px; font-size: var(--fs-b3); color: var(--text-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.card-t { margin-top: 9px; font-size: var(--fs-l3); font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.card-s { margin-top: 1px; font-size: var(--fs-b3); color: rgb(245 245 247 / .62); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 a.card { display: block; }
 /* artist cards: round avatars, names centered */
 .card.av { flex-basis: 120px; width: 120px; text-align: center; }
@@ -590,14 +590,7 @@ body:not(.is-playing) .eq i { animation-play-state: paused; }
 .row .more-btn { width: 30px; margin-right: -4px; }
 @keyframes spin { to { transform: rotate(360deg); } }
 
-/* top result */
-.top-card { display: flex; align-items: center; gap: 16px; padding: 16px; border-radius: var(--r-lg); background: var(--s2); border: 1px solid var(--hairline); }
-.top-art { flex: none; width: 112px; height: 112px; border-radius: var(--r-md); overflow: hidden; background: var(--s4); }
-.top-art img { width: 100%; height: 100%; object-fit: cover; }
-.top-meta { min-width: 0; flex: 1; }
-.top-t { font-size: var(--fs-t2); font-weight: 700; line-height: 1.2; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
-.top-s { margin-top: 4px; font-size: var(--fs-b2); color: var(--text-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.top-actions { margin-top: 12px; display: flex; gap: 10px; align-items: center; }
+/* top result: see "Discovery" at the end (§10.1) */
 .play-round { width: 44px; height: 44px; border-radius: 50%; background: var(--accent); color: #fff; display: grid; place-items: center; box-shadow: 0 6px 18px var(--accent-glow); }
 .play-round .i { width: 20px; height: 20px; margin-left: 2px; }
 
@@ -1625,4 +1618,326 @@ body.is-loading #mini-play::after, body.is-loading #np-play::after {
   .row.trk.settling > :not(.row-under) { transition: none; }
   .row.trk.held, .card.held, .poster.held, .top-card.held, .qrow.held { transform: none; }
   .sb-in .i, .sl-bar i, .tg-ring circle { transition: none; }
+}
+
+
+/* ==========================================================================
+   Discovery (UI_REMAKE_PLAN §9, §10.1-10.3, step 5): search, album / playlist pages, the artist page, Home
+   ========================================================================== */
+
+/* the cookie shape (§1.3): artist portraits; the mask (--cookie) is drawn by app.js from discovery-core */
+.cookie { border-radius: 0 !important; -webkit-mask: var(--cookie) center / 100% 100% no-repeat; mask: var(--cookie) center / 100% 100% no-repeat; }
+/* a scope with its own cover colours (top result, album / artist pages): the accent and tonal follow them */
+.ptint {
+  --c-tonal: color-mix(in oklab, var(--c-base), white 16%);
+  --accent: var(--c-accent); --accent-soft: var(--c-accent); --on-accent: var(--c-on-accent);
+  transition: --c-base var(--t-colour) var(--ease-std), --c-accent var(--t-colour) var(--ease-std), --c-on-accent var(--t-colour) var(--ease-std);
+}
+.vh { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+.pill-out {
+  display: inline-flex; align-items: center; gap: 6px; height: 32px; padding: 0 14px; border-radius: var(--r-pill);
+  border: 1.5px solid var(--fill-3); color: var(--text); font-size: var(--fs-b2); font-weight: 600; white-space: nowrap;
+}
+.pill-out .i { width: 14px; height: 14px; }
+.pill-out:active { transform: scale(var(--press-scale)); opacity: var(--press-opacity); }
+
+/* ---------- search bar (§10.1): glass pill, back arrow, the magnifier turns into a spinner while loading ---------- */
+.searchbar .search-pill { background: rgb(255 255 255 / .05); border: 1px solid rgb(255 255 255 / .08); border-radius: var(--r-pill); }
+.search-pill .s-spin {
+  display: none; flex: none; width: 18px; height: 18px; margin: 0 2px; border-radius: 50%;
+  border: 2px solid rgb(255 255 255 / .18); border-top-color: var(--accent); animation: spin .8s linear infinite;
+}
+.search-pill.busy .s-spin { display: block; }
+.search-pill.busy .s-mag { display: none; }
+#search-back .i { width: 26px; height: 26px; }
+
+/* landing + suggestions: small uppercase section labels */
+.s-label { font-size: 11.5px; font-weight: 700; letter-spacing: 1.1px; text-transform: uppercase; color: rgb(245 245 247 / .55); margin: 0; }
+#view-search > .s-label { margin: 2px 0 6px; }
+.head-row.s-head { margin: 22px 0 8px; min-height: 24px; }
+.head-row.s-head:first-child { margin-top: 2px; }
+.chips.src-chips + .head-row.s-head { margin-top: 12px; }
+.recent-row { padding-top: 0; padding-bottom: 0; }
+.recent-row .row-main { min-height: 44px; gap: 14px; }
+.recent-row .icon-btn { color: var(--text-3); }
+.recent-row { -webkit-touch-callout: none; -webkit-user-select: none; user-select: none; }
+
+/* filter chips (§10.1): 38 px, radius 20; the picked one solid accent, the rest white .08; 200 ms */
+.chips.fchips { margin-bottom: 16px; }
+.fchips .chip {
+  height: 38px; padding: 0 16px; display: inline-flex; align-items: center; border-radius: 20px;
+  background: rgb(255 255 255 / .08); border-color: transparent; color: var(--text);
+  transition: background-color 200ms var(--ease-std), color 200ms var(--ease-std), transform var(--t-press) var(--ease-out);
+}
+.fchips .chip.on { background: var(--accent); color: var(--on-accent); border-color: transparent; }
+.chips.src-chips .chip { height: 34px; padding: 0 14px; display: inline-flex; align-items: center; }
+
+/* top result card (§10.1): radius 28, padding 20, the art's colours, 104 px art (cookie for artists), 24 px title */
+.top-card {
+  position: relative; display: grid; grid-template-columns: 104px minmax(0, 1fr); align-items: center; gap: 16px 16px;
+  padding: 20px; border-radius: 28px; isolation: isolate; overflow: hidden;
+  background: linear-gradient(150deg, color-mix(in oklab, var(--c-base) 92%, white 6%), color-mix(in oklab, var(--c-base) 70%, #000));
+  box-shadow: inset 0 0 0 1px rgb(255 255 255 / .06);
+}
+.top-card .tc-hit { position: absolute; inset: 0; z-index: 0; border-radius: inherit; }
+.top-card .tc-hit:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.top-card.linked:active { transform: scale(.99); }
+.top-art { position: relative; width: 104px; height: 104px; border-radius: 16px; overflow: hidden; background: rgb(0 0 0 / .3); pointer-events: none; }
+.top-art.wide { height: 59px; align-self: center; border-radius: 12px; }
+.top-art img { width: 100%; height: 100%; object-fit: cover; }
+.top-meta { min-width: 0; pointer-events: none; }
+.top-meta a { pointer-events: auto; position: relative; z-index: 1; }
+.top-type { display: block; font-size: var(--fs-b3); font-weight: 700; letter-spacing: .04em; text-transform: uppercase; color: var(--accent); }
+.top-t { margin-top: 2px; font-size: 24px; font-weight: 700; line-height: 1.15; letter-spacing: var(--ls-display); display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; overflow-wrap: anywhere; }
+.top-s { margin-top: 4px; font-size: var(--fs-b2); color: var(--text-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.top-actions { grid-column: 1 / -1; position: relative; z-index: 1; display: flex; gap: 8px; align-items: center; }
+.tc-play, .tc-btn {
+  display: inline-flex; align-items: center; justify-content: center; gap: 7px; height: 44px; padding: 0 20px; border-radius: var(--r-pill);
+  font-size: var(--fs-l3); font-weight: 700; white-space: nowrap;
+  transition: transform var(--t-press) var(--ease-out), opacity var(--t-press) var(--ease-out);
+}
+.tc-play { background: var(--c-accent); color: var(--c-on-accent); }
+.tc-btn { background: rgb(255 255 255 / .12); color: var(--text); }
+.tc-play .i, .tc-btn .i { width: 18px; height: 18px; }
+.tc-play:active, .tc-btn:active { transform: scale(var(--press-scale)); opacity: var(--press-opacity); }
+.top-actions .keep { width: 44px; height: 44px; background: rgb(255 255 255 / .12); }
+.top-actions .more-btn { width: 44px; height: 44px; margin-left: auto; color: var(--text); }
+.top-actions .keep.kept { color: var(--c-accent); }
+
+/* background glow (§10.1, P2): two soft glows from the top result's colours, gliding over 1.5 s */
+#view-search { position: relative; isolation: isolate; transition: --c-base 1.5s var(--ease-std), --c-accent 1.5s var(--ease-std); }
+#view-search::before {
+  content: ""; position: absolute; z-index: 0; pointer-events: none; left: calc(-1 * var(--pad)); right: calc(-1 * var(--pad));
+  top: calc(-18px - 56px - var(--st)); height: 560px; opacity: 0; transition: opacity 600ms var(--ease-std);
+  background: radial-gradient(60% 50% at 18% 22%, color-mix(in srgb, var(--c-accent) 18%, transparent), transparent 70%),
+    radial-gradient(55% 45% at 88% 10%, color-mix(in srgb, var(--c-base) 60%, transparent), transparent 70%);
+}
+#view-search.has-glow::before { opacity: 1; }
+#view-search > * { position: relative; } /* above the glow */
+
+/* result groups (§10.1): each a joined block with "Show all" */
+.s-group .head-row.sec { margin: 26px 0 10px; }
+.s-group .head-row.sec .link-btn { padding: 6px 0; }
+.s-note { margin-top: 18px; text-align: center; }
+
+/* joined rows (§1.3, §10.2): song rows as one block, 2 px apart, 16 / 4 corners */
+.rows.jrows { display: flex; flex-direction: column; gap: var(--join-gap); margin-top: 0; }
+.rows.jrows > .row { margin: 0; background: var(--s2); border-radius: var(--join-inner); padding: 8px 8px 8px 10px; }
+.rows.jrows > .row:first-child { border-top-left-radius: 16px; border-top-right-radius: 16px; }
+.rows.jrows > .row:last-child { border-bottom-left-radius: 16px; border-bottom-right-radius: 16px; }
+.rows.jrows > .row.playing { background: color-mix(in srgb, var(--accent) 22%, var(--s2)); }
+.rows.jrows > .row .row-num .eq { background: transparent; }
+.rows.jrows .empty { background: none; }
+.vrows .row-art { width: 92px; height: 52px; }
+/* album / artist / playlist rows: art, title, subtitle, chevron */
+.joined.crows > .row { margin: 0; padding: 8px 10px; border-radius: var(--join-inner); }
+.joined.crows > .row:first-child { border-top-left-radius: 16px; border-top-right-radius: 16px; }
+.joined.crows > .row:last-child { border-bottom-left-radius: 16px; border-bottom-right-radius: 16px; }
+.crow .row-art { width: 52px; height: 52px; display: grid; place-items: center; color: var(--text-3); }
+.crow .row-art .i { width: 24px; height: 24px; }
+.crow .row-chev { width: 18px; height: 18px; color: var(--text-4); }
+.crow .row-main:active { opacity: var(--press-opacity); }
+
+/* Charts cards (§10.1 charts entry; band style after §9.6): art with a curved colour band, the title on it */
+.scroller.charts { margin-top: 0; }
+.chart-card {
+  position: relative; flex: 0 0 min(65%, 270px); aspect-ratio: 16 / 10; border-radius: 25px; overflow: hidden; background: var(--s3);
+  transition: transform var(--t-press) var(--ease-out);
+}
+.chart-card:active { transform: scale(.97); }
+.chart-art, .chart-art img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+.chart-band {
+  position: absolute; left: 0; right: 0; bottom: 0; height: 42%; padding: 0 16px 12px; display: flex; flex-direction: column;
+  justify-content: flex-end; align-items: flex-end; text-align: right;
+  clip-path: ellipse(85% 100% at 70% 100%);
+}
+.chart-t { font-size: 22px; font-weight: 700; line-height: 1.05; letter-spacing: var(--ls-display); color: #fff; }
+.chart-s { font-size: var(--fs-b3); font-weight: 600; color: rgb(255 255 255 / .78); }
+.band0 .chart-band { background: linear-gradient(120deg, #ff3d7f, #b23cff); }
+.band1 .chart-band { background: linear-gradient(120deg, #2f80ed, #18c9ed); }
+.band2 .chart-band { background: linear-gradient(120deg, #f2994a, #eb5757); }
+.band3 .chart-band { background: linear-gradient(120deg, #22a874, #9be15d); }
+
+/* ---------- album / playlist page (§10.2) ---------- */
+/* the backdrop is the first positioned child (z-index 0); everything after it is positioned too, so it paints above */
+.pg { position: relative; isolation: isolate; }
+.pg > :not(.coll-bg) { position: relative; }
+.coll-bg {
+  position: absolute; z-index: 0; pointer-events: none; overflow: hidden;
+  left: calc(-1 * var(--pad)); right: calc(-1 * var(--pad)); top: calc(-18px - 56px - var(--st)); height: 620px;
+  background: radial-gradient(70% 45% at 50% 28%, color-mix(in srgb, var(--c-accent) 45%, transparent), transparent 70%),
+    linear-gradient(180deg, color-mix(in oklab, var(--c-base) 55%, #000) 0%, color-mix(in oklab, var(--c-base) 45%, #000) 45%, #000 100%);
+  -webkit-mask-image: linear-gradient(180deg, #000 60%, transparent); mask-image: linear-gradient(180deg, #000 60%, transparent);
+}
+.coll-bg img { position: absolute; inset: -10%; width: 120%; height: 70%; object-fit: cover; opacity: .35; filter: blur(40px) saturate(1.2); transform: translateZ(0); }
+.coll-head { display: flex; flex-direction: column; align-items: center; text-align: center; padding-top: 6px; --hp: 0; }
+.coll-art {
+  position: relative; width: clamp(180px, 55vw, 250px); aspect-ratio: 1; margin-bottom: 18px; border-radius: 24px; overflow: hidden;
+  display: grid; place-items: center; color: var(--text-3); background: rgb(255 255 255 / .06);
+  box-shadow: 0 20px 60px color-mix(in srgb, var(--c-accent) 35%, transparent), 0 8px 24px rgb(0 0 0 / .45);
+  outline: 1px solid rgb(255 255 255 / .14); outline-offset: -1px;
+  transform: scale(calc(1 - .14 * var(--hp))); opacity: calc(1 - .55 * var(--hp)); transform-origin: 50% 100%;
+}
+.coll-art > .i { width: 56px; height: 56px; stroke-width: 1.4; }
+.coll-art img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+/* blur-fill for 16:9 art: the same image fitted whole over a blurred copy under black .30 */
+.coll-art.wide .ca-img { object-fit: contain; }
+.coll-art .ca-fill { filter: blur(20px) brightness(.7); transform: scale(1.3); }
+.coll-type { font-size: 12px; font-weight: 600; color: var(--text-2); letter-spacing: .02em; }
+.coll-t {
+  margin-top: 4px; max-width: 100%; font-size: clamp(26px, 8.4vw, 34px); font-weight: 800; line-height: 1.08; letter-spacing: -.03em;
+  overflow-wrap: anywhere; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden;
+}
+.coll-t.long { font-size: clamp(22px, 6.6vw, 26px); letter-spacing: -.02em; }
+.coll-a { margin-top: 6px; max-width: 100%; font-size: var(--fs-l2); font-weight: 600; color: var(--c-accent); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.coll-a a { display: inline-block; padding: 6px 0; margin: -6px 0; }
+.coll-meta { margin-top: 4px; font-size: var(--fs-b2); color: var(--text-2); }
+.coll-desc { margin-top: 10px; max-width: 46ch; font-size: var(--fs-b2); line-height: 1.45; color: var(--text-2); overflow-wrap: anywhere; }
+.coll-desc.clamp { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.coll-head .about-more { padding: 6px 10px; }
+/* Play | Shuffle (accent | tonal, half each; outer radius 24, inner 8) */
+.coll-play.joined.h { margin-top: 20px; gap: 4px; }
+.coll-play > button {
+  flex: 1; height: 52px; display: flex; align-items: center; justify-content: center; gap: 8px; font-size: var(--fs-l2); font-weight: 700;
+  transition: transform var(--t-press) var(--ease-out), opacity var(--t-press) var(--ease-out);
+}
+.coll-play > button:active { transform: scale(var(--press-scale)); opacity: var(--press-opacity); }
+.coll-play.joined.h > :first-child { border-radius: 24px 8px 8px 24px; }
+.coll-play.joined.h > :last-child { border-radius: 8px 24px 24px 8px; }
+.coll-play .cp-play { background: var(--c-accent); color: var(--c-on-accent); }
+.coll-play .cp-shuf { background: var(--c-tonal); color: var(--text); }
+.coll-play .i { width: 19px; height: 19px; }
+/* icon row: Save · Keep (ring) · Share · ⋯ … Sort */
+.coll-icons { display: flex; align-items: flex-start; gap: 4px; margin: 14px -4px 0; }
+.cb {
+  position: relative; flex: none; width: 60px; display: flex; flex-direction: column; align-items: center; gap: 4px; padding: 4px 0;
+  color: var(--text); font-size: 11px; font-weight: 600; transition: transform var(--t-press) var(--ease-out), opacity var(--t-press) var(--ease-out);
+}
+.cb > .i, .cb > .kr { width: 26px; height: 26px; }
+.cb > .i { margin: 4px; }
+.cb:active { transform: scale(.94); opacity: var(--press-opacity); }
+.cb .cb-l { color: var(--text-2); white-space: nowrap; }
+.cb.on { color: var(--c-accent); }
+.cb-sort { margin-left: auto; }
+.cb-sort.set::after { content: ""; position: absolute; top: 4px; right: 14px; width: 7px; height: 7px; border-radius: 50%; background: var(--c-accent); }
+/* Keep album: a 28 px ring of the share kept, the + / ✓ inside */
+.keep-all.cb { width: 70px; height: auto; margin: 0; border: 0; background: none; border-radius: 0; }
+.keep-all .kr { position: absolute; top: 3px; left: 50%; margin-left: -15px; width: 30px; height: 30px; transform: rotate(-90deg); }
+.keep-all .kr circle { fill: none; stroke-width: 2.2; }
+.keep-all .kr-bg { stroke: rgb(255 255 255 / .16); }
+.keep-all .kr-fg { stroke: var(--c-accent); stroke-linecap: round; transition: stroke-dashoffset 500ms var(--ease-std); }
+.keep-all > .i { width: 16px; height: 16px; margin: 10px 0 10px; stroke-width: 2.4; }
+.keep-all.kept { color: var(--c-accent); }
+.keep-all.pending > .i { animation: kr-pulse 1.2s ease-in-out infinite alternate; }
+@keyframes kr-pulse { from { opacity: .4; } }
+/* sort chips + filter field */
+.coll-tools { margin-top: 10px; display: flex; flex-direction: column; gap: 10px; }
+.sort-chips { margin: 0; padding: 0; }
+.sort-chips .chip.on { background: var(--c-accent); color: var(--c-on-accent); border-color: transparent; }
+.coll-filter {
+  display: flex; align-items: center; gap: 8px; height: 42px; padding: 0 14px; border-radius: var(--r-pill);
+  background: rgb(255 255 255 / .07); border: 1px solid rgb(255 255 255 / .08); color: var(--text-3);
+}
+.coll-filter .i { width: 18px; height: 18px; }
+.coll-filter input { flex: 1; min-width: 0; height: 100%; border: 0; outline: 0; background: none; color: var(--text); font: inherit; font-size: 16px; -webkit-appearance: none; appearance: none; }
+.coll-filter input::-webkit-search-cancel-button { display: none; }
+.pg .d-rows { margin-top: 14px; }
+.pg .row.playing .row-t { color: var(--c-accent); }
+.pg .rows.jrows > .row.playing { background: color-mix(in srgb, var(--c-accent) 20%, var(--s2)); }
+.pg .eq i { background: var(--c-accent); }
+.pg #imp-line:not(:empty) { margin-top: 14px; }
+
+/* the header over a tinted / full-bleed page: clear until the page's title scrolls under it */
+body[data-page="artist"] .top:not(.title-on), body[data-page="album"] .top:not(.title-on),
+body[data-page="playlist"] .top:not(.title-on), body[data-page="local"] .top:not(.title-on) {
+  background: transparent; border-bottom-color: transparent; -webkit-backdrop-filter: none; backdrop-filter: none;
+}
+body[data-page="artist"] .top:not(.title-on) .top-back { background: rgb(0 0 0 / .32); border-radius: 50%; }
+
+/* ---------- artist page (§10.3) ---------- */
+.ahero {
+  position: relative; overflow: hidden; isolation: isolate;
+  margin: calc(-18px - 56px - var(--st)) calc(-1 * var(--pad)) 0; height: calc(min(100vw, 400px) + var(--st));
+  border-radius: 0 0 48px 48px; background: color-mix(in oklab, var(--c-base) 70%, #000);
+}
+.ahero-img { position: absolute; inset: 0; display: grid; place-items: center; color: var(--text-3); will-change: transform; }
+.ahero-img img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+.ahero-img > .i { width: 80px; height: 80px; stroke-width: 1.2; }
+/* black .42 at the top -> clear 18-42% -> the page .78 at 72% -> solid */
+.ahero-shade {
+  position: absolute; inset: 0;
+  background: linear-gradient(180deg, rgb(0 0 0 / .42) 0%, transparent 18%, transparent 42%, rgb(0 0 0 / .78) 72%, #000 100%);
+}
+.ahero-text { position: absolute; left: var(--pad); right: var(--pad); bottom: 22px; }
+.ahero-name { font-size: clamp(30px, 9.4vw, 36px); font-weight: 800; line-height: 1.05; letter-spacing: -.03em; overflow-wrap: anywhere;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; text-shadow: 0 2px 18px rgb(0 0 0 / .4); }
+.ahero-sub { margin-top: 6px; font-size: var(--fs-b2); color: rgb(245 245 247 / .62); }
+/* actions: a row that scrolls sideways under 20 px edge fades */
+.aact {
+  margin: 16px calc(-1 * var(--pad)) 0; overflow-x: auto; scrollbar-width: none; overscroll-behavior-x: contain;
+  -webkit-mask-image: linear-gradient(90deg, transparent, #000 20px, #000 calc(100% - 20px), transparent);
+  mask-image: linear-gradient(90deg, transparent, #000 20px, #000 calc(100% - 20px), transparent);
+}
+.aact::-webkit-scrollbar { display: none; }
+.aact-in { display: flex; gap: 8px; padding: 2px var(--pad); width: max-content; align-items: center; }
+.aa-play, .aa-btn {
+  display: inline-flex; align-items: center; gap: 8px; border-radius: var(--r-pill); white-space: nowrap; font-weight: 700;
+  transition: transform var(--t-press) var(--ease-out), opacity var(--t-press) var(--ease-out), background-color .2s;
+}
+.aa-play { height: 56px; padding: 0 26px; background: #fff; color: #000; font-size: var(--fs-l1); }
+.aa-btn { height: 48px; padding: 0 18px; background: var(--c-tonal); color: var(--text); font-size: var(--fs-l3); }
+.aa-btn.on { background: var(--c-accent); color: var(--c-on-accent); }
+.aa-play .i { width: 20px; height: 20px; }
+.aa-btn .i { width: 18px; height: 18px; }
+.aa-play:active, .aa-btn:active { transform: scale(var(--press-scale)); opacity: var(--press-opacity); }
+.artist-pg .shelf:first-of-type { margin-top: 26px; }
+.artist-pg .shelf > .rows.jrows { margin-top: 12px; }
+/* release / similar-artist cards: 38% of the width, 120-180 px */
+.scroller.rel .card, .scroller.rel .card.av { flex-basis: clamp(120px, 38vw, 180px); width: clamp(120px, 38vw, 180px); }
+.scroller.rel .card-art { width: 100%; height: auto; aspect-ratio: 1; }
+.scroller.rel .card.av .card-art { border-radius: 0; }
+.card-art.cookie { border-radius: 0; }
+/* 16:9 video cards */
+.card.vcard { flex-basis: 240px; width: 240px; }
+.card.vcard .card-art { width: 240px; height: 135px; }
+
+/* ---------- Home (§9) ---------- */
+.home-head { display: flex; align-items: center; justify-content: space-between; }
+/* mood chips (§9.2): tonal, scrolling sideways under the greeting */
+.chips.mood-chips { margin-top: 16px; padding-bottom: 2px; }
+.chip.mood {
+  height: 36px; padding: 0 15px; display: inline-flex; align-items: center; gap: 6px;
+  background: color-mix(in srgb, var(--c) 20%, #141416); border-color: color-mix(in srgb, var(--c) 34%, transparent); color: var(--text);
+}
+.chip.mood.all { background: var(--fill-1); border-color: var(--hairline); }
+.chip.mood .i { width: 15px; height: 15px; color: var(--accent); }
+.home-head + .chips.mood-chips + .shelf { margin-top: 26px; }
+/* shelves (§9.7): 20-22 px bold headers with one trailing action */
+.shelf-head h2 { font-size: 21px; }
+.shelf-head .pill-out.shelf-act, .shelf-head .link-btn.shelf-act { margin-left: auto; }
+/* Quick picks (§9.4): 4 rows of 64 px per column, joined, art 50 px radius 8, 16/700 title, 14/600 subtitle at .6 */
+.qp { grid-template-rows: repeat(4, 64px); row-gap: var(--join-gap); column-gap: 10px; margin-top: 12px;
+  grid-auto-columns: min(calc(100vw - 24px - 48px), 360px); padding: 0 var(--pad); scroll-padding: 0 var(--pad); }
+.qp > .row { background: var(--s2); border-radius: var(--join-inner); padding: 7px 4px 7px 8px; gap: 4px; }
+.qp > .row:nth-child(4n + 1) { border-top-left-radius: 16px; border-top-right-radius: 16px; }
+.qp > .row:nth-child(4n), .qp > .row:last-child { border-bottom-left-radius: 16px; border-bottom-right-radius: 16px; }
+.qp > .row.playing { background: color-mix(in srgb, var(--accent) 20%, var(--s2)); }
+.qp .row-art { width: 50px; height: 50px; border-radius: 8px; }
+.qp .row-t { font-size: 16px; font-weight: 700; }
+.qp .row-s { font-size: 14px; font-weight: 600; color: rgb(245 245 247 / .6); }
+.qp .keep { display: none; } /* ⋯ per row (§9.4); keeping is in the menu */
+/* cards: type pill top-right, rank badge, cookie artists */
+.tpill {
+  position: absolute; top: 8px; right: 8px; padding: 3px 8px; border-radius: 20px; background: rgb(0 0 0 / .55);
+  -webkit-backdrop-filter: blur(8px); backdrop-filter: blur(8px); color: #fff; font-size: 11px; font-weight: 700;
+}
+.rank {
+  position: absolute; left: 8px; bottom: 8px; min-width: 26px; height: 26px; padding: 0 7px; border-radius: 13px;
+  display: grid; place-items: center; background: rgb(0 0 0 / .62); color: #fff; font-size: 13px; font-weight: 800;
+}
+.card:active .card-art, a.card:active .card-art { transform: scale(.96); }
+@media (prefers-reduced-motion: reduce) {
+  .coll-art { transform: none; opacity: 1; }
+  .ahero-img { transform: none !important; }
+  #view-search, .ptint { transition: none; }
 }

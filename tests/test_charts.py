@@ -131,6 +131,7 @@ def test_warm_follows_the_setting_and_home_shelf(fake):
     shelf = charts.home_shelf()
     assert shelf["country"] == "US" and shelf["section"] == "Top 100 Songs United States"
     assert len(shelf["items"]) == charts.HOME_ITEMS and shelf["items"][0]["rank"] == 1
+    assert shelf["playlist_id"] and shelf["playlist_id"] == charts.get("US")["sections"][0]["playlist_id"]  # "See all"
     charts.get("DE")
     assert charts.home_shelf("DE")["section"] == "Top 100 Music Videos DE"  # no songs chart: the videos one
 

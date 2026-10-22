@@ -261,7 +261,8 @@ def _present(doc, source, stale, now, ytm=True):
     chart = charts.home_shelf() if ytmusic.enabled() else None
     if chart:
         stored["charts"] = {"id": "charts", "kind": "tracks", "items": chart["items"],
-                            "extra": {"country": chart["country"], "name": chart["name"], "section": chart["section"]}}
+                            "extra": {"country": chart["country"], "name": chart["name"], "section": chart["section"],
+                                      "playlist_id": chart.get("playlist_id")}}
     ytm_shelves = [s for s in doc.get("shelves") or [] if str(s.get("id", "")).startswith(YTM_PREFIX)]
     shelves, shown = [], set()
     for sid in SHELVES:

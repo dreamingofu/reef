@@ -1,6 +1,6 @@
 # Reef — handoff notes (resume on another machine)
 
-Last updated: 2026-10-22 (Round 16, UI remake step 4).
+Last updated: 2026-10-22 (Round 16, UI remake step 5).
 
 ## What's running
 
@@ -915,6 +915,103 @@ Settings / Stats / Recap screens. Prerequisite: serve Reef over HTTPS with `tail
   bitrate?, sample_rate?, bits?, channels?, length?, replaygain?} | null, test_audio}`; 404 for a malformed id.
 - `POST /api/match/candidates {title, artist?, duration?, album?, key?, q?}` → `{key, pinned (track) | null,
   candidates: [{track, score, ranked}], error?}`; 400 bad input.
+
+### UI remake step 5: Discovery (2026-10-22, accepted by root Codex; local commit on `dreamingofu/codebase-overview-and-risk`, not pushed or deployed)
+
+- `discovery-core` (`DC` in `static/app.js`, node check `scratchpad/u5/discovery_core_check.js`): search groups (§10.1
+  order, top result left out of its group, previews + "Show all"), filter chips per source, page sort / filter
+  (`viewTracks`: accent-folded words over title / artist / album; stable name / artist sort), Home plan (moods out,
+  Quick picks first, server order, device-local Jump back in), the cookie path + mask, `/api/thumb` URLs, Google art
+  resizing, header progress / parallax, collection lines, recent-search drop / undo, Keep album progress.
+- **Search** (§10.1): YouTube searches are one `GET /api/search/all` (other sources keep the songs-only search). Top
+  result card (radius 28, cover colours, cookie art for artists; songs Play / Keep / ⋯, artists Shuffle + Radio = YouTube's
+  RDAO / RDEM mixes via `/api/playlist`, albums / playlists Play + Shuffle; the card opens the page), then joined blocks
+  Songs · Artists · Albums · Videos · Playlists with "Show all" = the chip. Chips Top results · Songs · Videos · Albums ·
+  Artists · Playlists · In library (fetched once per query: songs = the 20-song search, others
+  `/api/search?filter=`). Background glow from the top result. No results: "Search Monochrome instead" (or YouTube).
+  Landing: Recent (✕ or long press removes, Undo), Charts cards (one per `/api/charts` playlist → `#playlist/<id>`),
+  moods tiles. Suggestions get a SUGGESTIONS label; the magnifier spins while a search / suggestions load. The bar's
+  home button is now a back arrow (history back, else Home). Pasted links unchanged.
+- **Album / playlist / Reef playlist pages** (§10.2): one `collectionPage` for `#album`, `#playlist`, `#local`. Page tinted
+  from the cover (`/api/thumb`, else the first song's `/api/art`): base 45-55% toward black, accent glow .45, the 64 px
+  copy blurred at .35; centred art (55% width, 180-250, radius 24, coloured shadow + rim, blur-fill for 16:9 thumbs,
+  shrinks a little as it scrolls away); type · year, title, artist links (accent), songs · length, 2-line description
+  with Show more; Play | Shuffle joined (24 / 8 radii); Save (YouTube pages → a Reef playlist; local → Pin) · Keep (28 px
+  ring of the share kept) · Share (YouTube Music link) · ⋯ (page menu card: Play next / Add to queue all shown, Go to
+  artist, Save, Copy link, Open on YouTube Music; local: .m3u) · Sort (playlists: Default / Name / Artist chips, a filter
+  field over 12 songs; what's shown is what plays). Joined numbered rows on albums. The header stays clear over the
+  tint until the title scrolls under it.
+- **Artist page** (§10.3): full-bleed hero under the clear header (min(W, 400) + safe area, bottom radius 48, the
+  plan's shade, parallax .4), name 30-36/800 + "N monthly audience · N subscribers"; Play (white pill) · Shuffle ·
+  Radio · Hide · Share in a sideways row with edge fades; Top songs (joined, Show all) · Albums · Singles & EPs ·
+  Videos (16:9) · Similar artists (cookie) · About; colours from the photo. Follow is not shown (needs a follow list).
+- **Home** (§9 1, 2, 4, 7): greeting, mood chips (YT Music moods → mood pages, + All), Quick picks as joined 4-row
+  columns (50 px art, 16/700 + 14/600, ⋯ per row; the + moved to the menu), then the server's shelves in its order,
+  including Charts (rank badges, See all → the chart playlist) and YouTube Music's `ytm:*` shelves (tracks → cards,
+  `cards` → typed cards with an Album / Playlist pill, round artists); cards are 150 px, radius 13. Recent searches and
+  the moods grid left Home (Search has them; the grid stays when YT Music browse is off).
+- Lists: `listItems(name)` resolves `h:<shelf>` / `hc:<shelf>` (Home) and the search / page lists; `startQueue()` plays a
+  list straight from data (cards, mixes) with its own "Playing from".
+- **Check on the iPhone**: the clear header over tinted / full-bleed pages (safe area, status bar legibility), hero
+  parallax and the art shrink while momentum-scrolling, the cookie mask (data-URI SVG `mask`) on Safari, horizontal
+  scrollers next to the back-swipe edge, the filter field and the keyboard, long press on recent searches vs text
+  selection, glow + blurred backdrops' cost.
+
+- **Supervision / state (2026-10-22)**: root Codex (Orca terminal `term_d731eb62-3bf8-4362-ad78-88c7e09366c4`) owns
+  review and acceptance; Claude (`term_bc7a30e2-cfdf-433d-95e9-470cd4a9d3f2`) implemented U5. **U5 accepted by root
+  Codex** and committed locally (one commit on top of `f8f09cd`, worktree `/Users/felipe/orca/workspaces/reef/larvacean`,
+  branch `dreamingofu/codebase-overview-and-risk`). **Not pushed, not deployed**: origin/main and the phone stay on
+  `f8f09cd`; root authorized the local commit only, not publication. U6 and further feature work are on hold.
+  Root acceptance checks: pytest 983 passed, 1 deselected (16.36 s); Ruff, JS syntax (`node --check`), discovery-core 17
+  checks and `git diff --check` pass; root's isolated WebKit runs: `cache-stale-blocklist.js` →
+  `{hidden: true, playlistCalls: 3, queuedTitles: []}`, failed-refresh queue empty, ✕-while-pending idle
+  (`{cleared: "", idle: true, spinnerBusy: false}`), "In library" full songs, filter Retry semantics, artist-video kept
+  state. Independent Codex review `review-codex-261564587e1a` reused (its 4 findings fixed) plus root-rendered evidence.
+  Real-device gaps for U5 are the "Check on the iPhone" list above.
+  Next: root-led codebase audit (report `/tmp/reef-codebase-audit-20261022.md`; first audit task settled; read-only
+  follow-up in `term_62492f92-3dea-4cc5-ac14-f76f76a4bdb7`, Run `run_644fd9908c5b`, Task `task_3936c3abab7f`, Dispatch
+  `ctx_fa0437ae058d`), then bounded refactor tasks that root assigns to a fresh Claude session. After the U5 commit
+  this session relinquishes checkout writer ownership.
+- **Post-U5 audit queue (root-reproduced, not yet fixed)**:
+  - `updater.check` (~L160-179) snapshots `update.json`, makes its network calls, then saves the stale full dict,
+    erasing a run record `updater.start` wrote meanwhile; that removes the active-update guard, so updates can
+    overlap. Fix later: merge only the check-owned fields into the latest JSON under the lock, with no network calls
+    while the store lock is held.
+  - `backup.validate` accepts a playlist with `updated_at: "oops"`; `restore(mode=replace)` succeeds, then
+    `playlists.all_playlists` raises TypeError (unary minus on a str). Validation must reject malformed metadata and
+    non-finite timestamps while good backups stay compatible.
+  - `store.seconds(10**400)` raises OverflowError instead of returning None.
+- **Review repairs (root)**: a failed filter chip (e.g. Albums 502) shows its error and waits for Retry (it used to
+  re-ask on every paint: `DC.kindAction`); a card's Play / Shuffle / Radio re-asks a page that a hide invalidated or
+  that expired (`loadPage` decides) and, if only an old copy is left, drops hidden artists' songs; "In library" asks
+  for the full songs search itself (`DC.keptPool` over the preview, those songs and the videos); artist-page videos
+  mark kept / liked; the search's top artist count is labelled "monthly audience" (`audience`, server; ytmusicapi
+  calls it `subscribers`); ✕ while a search is pending resets `searching` (`DC.clearedSearch`), so the spinner stops
+  and the late answer is still dropped as stale.
+  Follow-up (root msg_305d39f286a9): a hide / unhide the server confirmed (POST / DELETE 2xx) updates `state.blocked`
+  at once (`DC.blockAdd` / `DC.blockRemove`), whether or not the next GET /api/blocklist works.
+  Last repair (root msg_cf0e2a3ac9bd): a page a hide / unhide invalidated whose refresh then failed is never played
+  from (top card, Play / Shuffle, rows: an error toast instead; `DC.playableCopy`), and a GET /api/blocklist asked
+  before a later local hide / unhide is dropped (`blockGen`, `DC.genCurrent`); a merely expired copy still plays
+  minus hidden artists, a fresh one without a refetch, a successful refresh as usual.
+
+### API shapes (step 5)
+
+- `GET /api/search/all?q=` → `{top, songs, videos, albums, artists, playlists, fallback?}`: songs / videos are marked
+  tracks (videos `video: true`); cards `{type: album|artist|playlist, id, title, subtitle, thumb, …}` (albums `artists,
+  year, kind`; artists `audience` (monthly audience, top result only), `radio_id, shuffle_id`; playlists `author`,
+  "VL" dropped); `top` is a card or
+  `{type: "track", track}`. Hidden artists filtered (artist cards, albums by them, their songs); cached 10 min per
+  query. YouTube Music off / failing → the YouTube source's songs search, `fallback: true`; 502 only when that fails.
+- `GET /api/search?q=&filter=videos|albums|artists|playlists` → that kind (tracks or cards); 400 unknown filter, 502 YT
+  Music off / failing. No `filter` (or `songs`) = the old songs search.
+- `GET /api/thumb?u=<https URL>&size=64` (≤ 128): a small copy of a YouTube Music / YouTube image from Reef's origin
+  (cover colours). Only https on `*.googleusercontent.com`, `*.ggpht.com` (no query) or `i.ytimg.com` (+ i1-4, i9),
+  default port, no credentials; redirects not followed; JPEG / PNG / WebP / GIF only (never SVG / HTML), ≤ 512 KB,
+  shared LRU with `/api/art`'s tiny copies; `nosniff` + `default-src 'none'`. 400 refused URL, 404 upstream failure.
+- `/api/artist/<id>` adds `videos` (marked tracks, `video: true`), `subscribers`, `monthly_listeners`, `radio_id`,
+  `shuffle_id`; `/api/album/<id>` and `/api/playlist/<id>` add `description` (+ playlist `track_count`); Home's Charts
+  shelf adds `playlist_id`.
 
 ## Ideas / next steps
 
