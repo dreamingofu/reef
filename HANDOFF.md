@@ -1,7 +1,7 @@
 # Reef — handoff notes (resume on another machine)
 
-Last updated: 2026-10-22 (Round 16, UI remake step 5, audit batches 1, 2 and 3 accepted by the root and committed
-locally; batch 3 = credentials / API / CSRF).
+Last updated: 2026-10-22 (Round 16, UI remake step 5, audit batches 1-4 accepted by the root and committed locally;
+batch 3 = credentials / API / CSRF, batch 4 = updater health auth).
 
 ## CURRENT supervision (read first; 2026-10-22, written for a session rotation)
 
@@ -14,15 +14,22 @@ locally; batch 3 = credentials / API / CSRF).
   - U5 `bd5014d`.
   - Batch 1 `8fc8de93c619e1e674ade79fd5e2fe8eead4a698`.
   - Batch 2 `2ba24bbd0434e2b932cd44e7baf9c62628118d23` (accepted clean base of batch 3).
-  - Batch 3: the commit that adds this text (see `git log`).
+  - Batch 3 `4fbc2ea09c98d98602573910e0f8d3f7d116365d` (accepted clean base of batch 4).
+  - Batch 4: the commit that adds this text (see `git log`).
 - **Who's working**:
   - Root coordinator: `term_3c425302-cae4-4be9-97c0-cb65b1ba1535`, sole supervisor of Run `run_644fd9908c5b`
     generation 3 (replaced generation 2's `term_a1a35e94-ec0d-4c97-a320-2c6a2a95c78d`).
   - Claude writer (sole checkout writer): `term_8969653d-0e79-47c1-8e88-3ce3b86a64c6`.
     - Settled batch 3 Tasks: `task_f48c451fcebe` / `ctx_5ea180eba2eb` (implementation) and `task_4434847b17e2` /
       `ctx_8c5e9a8b2d1c` (long-userinfo repair).
-    - This milestone Task `task_e17f105b79e5` / `ctx_65bb1c6ba326` owned only this file and the local batch 3
-      commit, no other work. Afterwards Claude idles in the same tab awaiting the next bounded Task.
+    - Settled milestone Task `task_e17f105b79e5` / `ctx_65bb1c6ba326` (this file + the local batch 3 commit
+      `4fbc2ea09c98d98602573910e0f8d3f7d116365d`).
+    - Settled batch 4 Task `task_0a8f23021e6d` / `ctx_3e5028b3c2af` (updater health auth, F8, on base `4fbc2ea`).
+    - This milestone Task `task_6227f44ba099` / `ctx_5c4d5f9ab3e7` owned only this file and the local batch 4 commit,
+      no other work. After that commit this Claude **relinquishes checkout writer ownership** and idles; its tab is
+      kept. The root (sole coordinator until an explicit replacement RELEASE) rotates its own session; after that
+      RELEASE the replacement root starts a fresh Claude conversation for the next bounded JS batch. No duplicate
+      writers.
   - Old Claude `term_62492f92-3dea-4cc5-ac14-f76f76a4bdb7` relinquished writer ownership and stays idle (settled Tasks
     `task_a93a61d0b573` batch 1, `task_e630e35fb597` / `task_dd2cff493c45` batch 2, `task_3035a994e8c6` milestone).
   - No browser or server is running (the root closed its scratch WebKit browser and QA server).
@@ -86,14 +93,39 @@ locally; batch 3 = credentials / API / CSRF).
       import 201, no-body like 201, malformed array download 400, real cross-origin restore POST 403 (screenshot
       `api-browser-root3.png`).
   - Not proven: on-device Safari, real services, an actual Tailscale Serve deployment.
+- **Batch 4 (updater health with auth, F8)**: **accepted by the root** after its independent final diff review (no
+  remaining blockers), committed locally. Changed:
+  `updater.py`, `termux/update.sh`, `tests/test_updater.py`, `tests/test_update_sh.py`, new `tests/fake_reef.py` (a
+  loopback fake Reef: /api/health + /api/diagnostics behind werkzeug's Basic parsing, optional 302).
+  - `updater._auth_headers()`: Basic `reef:<password>` only when `config.OPEN` and `config.PASSWORD` (config's own
+    env-then-reef.env precedence). `_healthy` probes through an opener with no proxy and no redirects (a 3xx =
+    unhealthy, the other origin is never asked); version check, wait bound and rollback unchanged.
+  - `update.sh`: `env_file_value` reads reef.env as data like `config._load_env_file` (never sourced; first line of a
+    key wins, whitespace then quotes stripped; `export X=` isn't key X). Environment wins (`${REEF_OPEN-…}`,
+    `${REEF_PASSWORD-…}`: set-but-empty wins too; port keeps `${REEF_PORT:-…}`, now first-line-wins and digits-only,
+    else 5274). With OPEN=1 + a password the curl checks send `Authorization: Basic` via `-H @-` on stdin (not
+    argv / output); all probes `--noproxy '*'`, no `-L`. `REEF_UPDATE_HEALTH_CMD`, commit check, rollback unchanged.
+  - Regressions (password with spaces, `ü`, `$(touch PWNED)`, backticks, `;|&'"\` and `:`): 7 fail on a `git
+    archive` of `4fbc2ea` (Python auth, header accepted by the real app, proxy/redirect; shell env auth, rollback
+    health under auth, reef.env parsing, env-over-file) and 2 more fail on a copy without the proxy / redirect
+    hardening; all pass now. Preserved: no-auth default (no header sent, also with a password but OPEN=0), wrong /
+    missing password fails, wrong version / commit stays unhealthy, existing fake-origin / fake-pip / fake-boot tests.
+    No PWNED file, password or token in output.
+  - The root caught the first patch's redirect hole: an off-origin 302 got the Basic header and was taken as
+    healthy. The final no-proxy / no-redirect policy fixes it, with a committed regression.
+  - Root acceptance checks:
+    - `.venv/bin/python -m pytest -q tests/test_updater.py tests/test_update_sh.py` → 41 passed;
+    - full `.venv/bin/python -m pytest -q` → 1150 passed / 1 deselected (47.5 s: the shell rollback waits);
+    - `bash -n termux/update.sh`, `.venv/bin/ruff check .`, `git diff --check` clean;
+    - `/tmp/reef-codex-refactor-20261022/updater-auth-root3.py`: the actual Reef app with OPEN=True over scratch HTTP;
+      Python and shell health: right auth True, wrong auth False, wrong version False, wrong commit False, redirect
+      False, the redirect target got 0 requests. All scratch servers closed; no real update, service or phone.
 - **Next work for a fresh root / Claude** (none implemented yet; one bounded batch each, regressions first, no guessed
-  rewrites):
-  1. **Updater health with auth.** Health checks must authenticate under `REEF_OPEN=1` + `REEF_PASSWORD`, both in the
-     Python child (`updater._healthy`) and in `termux/update.sh`. Prove it with a scratch fake Basic-auth server; no
-     real updates.
-  2. **JS proof in CI.** Dependency-free `node:test` checks of the sentinel cores, plus `node --check static/app.js`.
-     No bundler, modules or new dependencies.
-  3. **Frontend correctness.**
+  rewrites, no survey redo, features, U6, deploy, push, phone, real services, or default / model / credential /
+  permission changes):
+  1. **JS proof in CI.** Dependency-free committed `node:test` checks of the sentinel cores, plus
+     `node --check static/app.js` in CI. No bundler, modules or new dependencies.
+  2. **Frontend correctness** (meaningful async regressions, then an independent WebKit check).
      - U-a: `api()` must reject an invalid 2xx JSON body instead of returning `{}`.
      - Root-confirmed (`/tmp/reef-codex-refactor-20261022/frontend-before.cjs` runs the actual functions):
        - `pinFix` has an async target race. An old selection waiting on a pending key POSTs under the new target's
@@ -102,10 +134,10 @@ locally; batch 3 = credentials / API / CSRF).
        - A successful restore refreshes settings / history / blocklist / Home but not likes / playlists. Cached
          detail and lyrics may need scoped invalidation that keeps playback going.
      - Add regressions first.
-  4. **U-b art byte budget (justified).** Root mocked 33 valid 512 KiB responses: 17,301,504 bytes retained; the
+  3. **U-b art byte budget (justified).** Root mocked 33 valid 512 KiB responses: 17,301,504 bytes retained; the
      400-entry count alone allows 209,715,200 bytes. Keep the count limit, add a sensible byte budget with race-safe
      accounting.
-  5. **Only with evidence:** F10 (finished-job cap) if shown necessary. J1–J3 / U-c / U-d performance and gesture
+  4. **Only with evidence:** F10 (finished-job cap) if shown necessary. J1–J3 / U-c / U-d performance and gesture
      hypotheses need measurements first. No cosmetic whole-file splits.
 - **Tooling note**: `worker-start --terminal` returns `agent_unconfigured`. The proven fallback is manual
   task-create, then `dispatch --return-preamble`, then terminal-send the exact preamble.

@@ -345,3 +345,78 @@ def test_stamped_marker_and_a_stored_wrong_result_are_corrected(client, spawned,
     monkeypatch.setattr(updater, "_alive", lambda pid: False)
     assert updater.status()["result"] == "ok"
     assert updater._file.load()["run"]["result"] == "ok"
+
+
+# ---------- the yt-dlp child's health check, with REEF_OPEN=1 + REEF_PASSWORD ----------
+
+# Spaces, non-ASCII, shell metacharacters, quotes, a backslash and a colon (Basic auth splits user:pass on the first).
+PASSWORD = "p w ü $(touch PWNED) `id` ;|&'\"\\ :x"
+
+
+@pytest.fixture
+def reef_on(monkeypatch):
+    """A fake restarted Reef on a loopback port, with config pointed at it."""
+    from fake_reef import FakeReef
+
+    def start(password=None, open_=False, configured=None, **kw):
+        fake = FakeReef(password=password, **kw).__enter__()
+        started.append(fake)
+        monkeypatch.setattr(config, "PORT", fake.port)
+        monkeypatch.setattr(config, "OPEN", open_)
+        monkeypatch.setattr(config, "PASSWORD", password if configured is None else configured)
+        return fake
+
+    started = []
+    yield start
+    for fake in started:
+        fake.__exit__(None, None, None)
+
+
+def test_healthy_authenticates_when_open_with_a_password(reef_on):
+    fake = reef_on(password=PASSWORD, open_=True, ytdlp="2026.10.01")
+    assert updater._healthy("2026.10.1", wait_s=2) is True  # PyPI's version without the leading zero still matches
+    assert fake.seen and all(h and h.startswith("Basic ") for _, h in fake.seen)
+
+
+@pytest.mark.parametrize("configured", ["", "wrong"])
+def test_healthy_fails_with_a_missing_or_wrong_password(reef_on, configured):
+    fake = reef_on(password=PASSWORD, open_=True, configured=configured)
+    assert updater._healthy("2026.10.01", wait_s=1.2) is False
+    assert fake.seen  # it did ask, and got 401s
+
+
+def test_healthy_without_a_password_sends_no_credentials(reef_on):
+    fake = reef_on()
+    assert updater._healthy("2026.10.01", wait_s=2) is True and fake.headers() == {None}
+    fake = reef_on(open_=False, configured=PASSWORD)  # default mode: loopback needs no password, so none is sent
+    assert updater._healthy("2026.10.01", wait_s=2) is True and fake.headers() == {None}
+
+
+def test_healthy_still_needs_the_expected_version(reef_on):
+    reef_on(password=PASSWORD, open_=True, ytdlp="2026.08.19")
+    assert updater._healthy("2026.10.01", wait_s=1.2) is False
+
+
+def test_the_probes_header_is_what_reef_itself_accepts(monkeypatch):
+    """The header the probe sends passes the real app's check (OPEN=1 makes loopback need the password)."""
+    monkeypatch.setattr(config, "OPEN", True)
+    monkeypatch.setattr(config, "PASSWORD", PASSWORD)
+    c = app.app.test_client()
+    assert c.get("/api/health", environ_base={"REMOTE_ADDR": "127.0.0.1"}).status_code == 401
+    r = c.get("/api/health", headers=updater._auth_headers(), environ_base={"REMOTE_ADDR": "127.0.0.1"})
+    assert r.status_code == 200
+    monkeypatch.setattr(config, "OPEN", False)
+    assert updater._auth_headers() == {}
+
+
+def test_healthy_never_sends_the_password_through_a_proxy_or_a_redirect(reef_on, monkeypatch):
+    from fake_reef import FakeReef
+    with FakeReef() as proxy, FakeReef() as elsewhere:
+        monkeypatch.setenv("http_proxy", f"http://127.0.0.1:{proxy.port}")
+        monkeypatch.setenv("HTTP_PROXY", f"http://127.0.0.1:{proxy.port}")
+        monkeypatch.setenv("no_proxy", "")
+        fake = reef_on(password=PASSWORD, open_=True)
+        assert updater._healthy("2026.10.01", wait_s=2) is True and not proxy.seen
+        fake.redirect = f"http://127.0.0.1:{elsewhere.port}/api/diagnostics"
+        # Another origin with the right version isn't the restarted Reef: unhealthy, and never asked at all.
+        assert updater._healthy("2026.10.01", wait_s=1.2) is False and not elsewhere.seen

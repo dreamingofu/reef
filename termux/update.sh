@@ -10,6 +10,9 @@
 # Test knobs: REEF_DIR (the checkout; default: this script's repo), REEF_UPDATE_BOOT_DIR (~/.termux/boot),
 # REEF_UPDATE_PIP (pip command), REEF_UPDATE_WAIT (seconds, 30), REEF_UPDATE_HEALTH_CMD (a command that succeeds
 # once Reef is up, instead of the curl checks).
+# REEF_PORT, REEF_OPEN and REEF_PASSWORD come from the environment, else from reef.env read like config.py does.
+# With REEF_OPEN=1 and a password, loopback needs it too, so the curl checks send it (as a header on curl's stdin:
+# never in argv or the output).
 
 # Everything runs inside main(), which bash reads whole before running it: `git pull` may rewrite this very file,
 # and bash reads a plain script while it executes it.
@@ -30,15 +33,22 @@ main() {
         TEE_PID=$!
     fi
 
-    local dir boot_dir pip wait_s port
+    local dir boot_dir pip wait_s port open password
     dir=${REEF_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}
     cd "$dir" || { echo "UPDATE_FAILED no Reef checkout at $dir"; return 1; }
     export REEF_DIR="$dir"  # reef-boot.sh starts the checkout it's told about (default ~/reef)
     boot_dir=${REEF_UPDATE_BOOT_DIR:-$HOME/.termux/boot}
     pip=${REEF_UPDATE_PIP:-pip}
     wait_s=${REEF_UPDATE_WAIT:-30}
-    port=${REEF_PORT:-$(sed -n 's/^REEF_PORT=["'\'']*\([0-9]*\).*/\1/p' reef.env 2>/dev/null | tail -n 1)}
-    port=${port:-5274}
+    port=${REEF_PORT:-$(env_file_value REEF_PORT)}
+    [[ $port =~ ^[0-9]+$ ]] || port=5274
+    open=${REEF_OPEN-$(env_file_value REEF_OPEN)}
+    password=${REEF_PASSWORD-$(env_file_value REEF_PASSWORD)}
+    # Only what the health checks need: the password, when REEF_OPEN=1 makes loopback ask for it (config.OPEN).
+    HEALTH_AUTH=""
+    if [ "$(trim "$open")" = 1 ] && [ -n "$password" ]; then
+        HEALTH_AUTH=$(printf 'reef:%s' "$password" | base64 | tr -d '\n')
+    fi
 
     echo "$(date '+%Y-%m-%d %H:%M:%S') reef update in $dir"
     local prev new
@@ -93,6 +103,31 @@ main() {
     return 1
 }
 
+trim() {
+    local s=$1
+    s=${s#"${s%%[![:space:]]*}"}
+    printf '%s' "${s%"${s##*[![:space:]]}"}"
+}
+
+# KEY's value in ./reef.env the way config.py reads it: data, never sourced; blank, "#" and "="-less lines skipped,
+# the first line of a key wins, whitespace and then any quotes around the value dropped. Fails without one.
+env_file_value() {
+    local line key value
+    [ -f reef.env ] || return 1
+    while IFS= read -r line || [ -n "$line" ]; do
+        line=$(trim "$line")
+        [ -z "$line" ] || [ "${line:0:1}" = "#" ] || [[ $line != *=* ]] && continue
+        key=$(trim "${line%%=*}")
+        [ "$key" = "$1" ] || continue
+        value=$(trim "${line#*=}")
+        while [[ $value == [\"\']* ]]; do value=${value:1}; done
+        while [[ $value == *[\"\'] ]]; do value=${value%?}; done
+        printf '%s' "$value"
+        return 0
+    done < reef.env
+    return 1
+}
+
 install_boot() {
     mkdir -p "$1" && cp termux/reef-boot.sh "$1/reef.sh" && chmod +x "$1/reef.sh"
 }
@@ -108,8 +143,18 @@ healthy() {
         bash -c "$REEF_UPDATE_HEALTH_CMD"
         return
     fi
-    curl -fsS -m 3 "http://127.0.0.1:$1/api/health" > /dev/null 2>&1 || return 1
-    curl -fsS -m 5 "http://127.0.0.1:$1/api/diagnostics" 2>/dev/null | grep -q "\"reef\": *\"$2\""
+    probe "http://127.0.0.1:$1/api/health" 3 > /dev/null 2>&1 || return 1
+    probe "http://127.0.0.1:$1/api/diagnostics" 5 2>/dev/null | grep -q "\"reef\": *\"$2\""
+}
+
+# curl of a loopback URL, never through a proxy (and, without -L, never redirected elsewhere); the Basic header (if
+# any) goes in through stdin, so `ps` and the log never see it.
+probe() {
+    if [ -n "$HEALTH_AUTH" ]; then
+        printf 'Authorization: Basic %s\n' "$HEALTH_AUTH" | curl -fsS --noproxy '*' -m "$2" -H @- "$1"
+    else
+        curl -fsS --noproxy '*' -m "$2" "$1"
+    fi
 }
 
 wait_healthy() {

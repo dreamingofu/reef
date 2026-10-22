@@ -16,6 +16,7 @@ Output goes to logs/update.log; its last `UPDATE_OK …` / `UPDATE_FAILED …` l
 start time sit in update.json, so the new process can report on an update the old one started. Only on Termux
 (or with REEF_ALLOW_SELF_UPDATE=1): a dev checkout is never git-pulled by surprise.
 """
+import base64
 import json
 import logging
 import os
@@ -375,13 +376,31 @@ def _restart():
     subprocess.call(["bash", str(script)])
 
 
+def _auth_headers():
+    """Basic auth for the loopback health probe when REEF_OPEN=1 makes loopback need REEF_PASSWORD too (config, so
+    the environment, then reef.env, as Reef itself reads them). Reef checks only the password. Never logged."""
+    if not (config.OPEN and config.PASSWORD):
+        return {}
+    token = base64.b64encode(f"reef:{config.PASSWORD}".encode()).decode("ascii")
+    return {"Authorization": f"Basic {token}"}
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *a, **kw):
+        return None  # the 3xx is raised as an HTTPError: whoever answers elsewhere isn't the restarted Reef
+
+
+# The probe talks to 127.0.0.1:PORT only: no proxy from the environment, no redirect followed (nor its password sent on).
+_local_opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
+
+
 def _healthy(version, wait_s=HEALTH_WAIT_S):
     """True once the restarted Reef answers /api/diagnostics with yt-dlp `version`."""
-    url = f"http://127.0.0.1:{config.PORT}/api/diagnostics"
+    req = urllib.request.Request(f"http://127.0.0.1:{config.PORT}/api/diagnostics", headers=_auth_headers())
     end = time.monotonic() + wait_s
     while time.monotonic() < end:
         try:
-            with urllib.request.urlopen(url, timeout=5) as r:
+            with _local_opener.open(req, timeout=5) as r:
                 running = json.loads(r.read().decode()).get("version", {}).get("ytdlp")
                 if version_key(running) == version_key(version):  # PyPI's metadata drops leading zeros
                     return True
