@@ -6,7 +6,9 @@
   const audio = $("#audio");
   const VIEWS = ["home", "search", "kept", "downloads"];
   const ACTIVE = ["queued", "downloading", "converting"];
-  const FROM = { results: "From search", history: "Kept", recent: "Recently played" };
+  const FROM = { results: "From search", history: "Kept", recent: "Recently played", quick: "Quick picks", on_repeat: "On repeat",
+    jump_back: "Jump back in", liked: "Liked songs" };
+  const HOME_TTL = 5 * 60 * 1000; // re-ask /api/home when Home is shown and the copy is older than this
   const AUTO_LIMIT = 20; // autoplay tracks appended per radio fetch
   const PAGE_TTL = 5 * 60 * 1000; // browse pages (album, artist, playlist, moods) stay in memory this long
   // Ids the server accepts for artist / album pages; anything else isn't linked.
@@ -22,6 +24,7 @@
     view: "home",
     parent: "home", // the main view a detail page (album, artist, ...) was opened from: its tab and bottom bar stay
     homeTab: "foryou",
+    home: store.get("home", null), // the last /api/home body: Home paints from it at once, then refreshes
     query: "",
     results: [],
     searching: false,
@@ -52,6 +55,10 @@
     history: () => state.history,
     recent: () => store.get("plays", []),
     page: () => pageTracks(), // the open album / playlist / artist page
+    quick: () => homeItems("quick"),
+    on_repeat: () => homeItems("on_repeat"),
+    jump_back: () => homeItems("jump_back"),
+    liked: () => homeItems("liked"),
   };
 
   // ---------- helpers ----------
@@ -445,9 +452,9 @@
   const eqIfPlaying = (id) => (cur()?.id === id ? `<span class="eq"><i></i><i></i><i></i></span>` : "");
 
   // ---------- pieces ----------
-  function shelf({ title, ic, sub, more, body }) {
+  function shelf({ title, ic, sub, more, action, body }) {
     return `<section class="shelf">
-      <div class="shelf-head"><h2>${ic ? icon(ic) : ""}${esc(title)}</h2>${more ? `<a class="more" href="${more}" aria-label="See all">${icon("chev-right")}</a>` : ""}</div>
+      <div class="shelf-head"><h2>${ic ? icon(ic) : ""}${esc(title)}</h2>${more ? `<a class="more" href="${more}" aria-label="See all">${icon("chev-right")}</a>` : ""}${action || ""}</div>
       ${sub ? `<p class="shelf-sub">${esc(sub)}</p>` : ""}
       ${body}
     </section>`;
@@ -521,9 +528,49 @@
     return `<div class="empty">${icon(ic)}<h3>${esc(title)}</h3><p>${esc(text)}</p>${action || ""}</div>`;
   }
 
+  // ---------- Home shelves (/api/home) ----------
+  const homeShelf = (id) => (state.home?.shelves || []).find((s) => s.id === id && Array.isArray(s.items) && s.items.length);
+  const homeItems = (id) => homeShelf(id)?.items || [];
+  const skeletonCards = () => `<div class="scroller">${'<div class="card"><div class="card-art sk"></div></div>'.repeat(4)}</div>`;
+
+  // Quick picks: columns of 4 rows, scrolled sideways one column at a time; the next column peeks in.
+  const quickRows = (items) => `<ul class="qp" data-shelf="quick">${items.map((t, i) => row(t, i, "quick")).join("")}</ul>`;
+
+  function trackCards(items, list) {
+    return `<div class="scroller" data-shelf="${list}">${items.map((t, i) => `
+      <div class="card" data-track="${esc(t.id)}">
+        <button class="card-art" data-play="${i}" data-list="${list}" aria-label="Play ${esc(t.title)}">${art(t.id)}${eqIfPlaying(t.id)}</button>
+        <div class="card-meta"><div class="card-text"><div class="card-t">${esc(t.title)}</div>
+          <div class="card-s">${esc(t.channel)}${t.plays > 1 ? ` · ${t.plays} plays` : ""}</div></div>${moreBtn(t, i, list)}</div>
+      </div>`).join("")}</div>`;
+  }
+
+  // Top artists: the artist page when the id is known, else a search for the name.
+  function topArtistCards(items) {
+    return `<div class="scroller" data-shelf="top_artists">${items.map((a) => {
+      const inner = `<span class="card-art">${a.cover_id ? art(a.cover_id) : icon("person")}</span>
+        <div class="card-t">${esc(a.name)}</div><div class="card-s">${a.count} play${a.count === 1 ? "" : "s"}</div>`;
+      return ARTIST_ID.test(a.id || "") ? `<a class="card av" href="#artist/${encodeURIComponent(a.id)}">${inner}</a>`
+        : `<button class="card av" data-search="${esc(a.name)}">${inner}</button>`;
+    }).join("")}</div>`;
+  }
+
+  // Mixed for you: one card per seed artist; a tap starts radio from that seed.
+  function mixCards(items) {
+    return `<div class="scroller" data-shelf="mixed">${items.map((m, i) => `
+      <button class="card mix" data-mix="${i}" aria-label="Start radio: ${esc(m.name)} mix">
+        <span class="card-art">${art(m.seed.id)}<span class="mix-tag">${icon("radio")}Radio</span></span>
+        <div class="card-t">${esc(m.name)} mix</div>
+        <div class="card-s">${esc(m.with?.length ? `With ${m.with.join(", ")}` : `From “${m.seed.title}”`)}</div>
+      </button>`).join("")}</div>`;
+  }
+
   // ---------- views ----------
   function renderHome() {
     const plays = store.get("plays", []);
+    const view = $("#view-home");
+    // Re-rendering (a dislike, a refresh) keeps each shelf's sideways scroll.
+    const scrolled = new Map($$("[data-shelf]", view).map((el) => [el.dataset.shelf, el.scrollLeft]));
     let html = `<h1 class="page-title">${greeting()}</h1>
       <div class="seg" role="tablist">
         <button role="tab" class="${state.homeTab === "foryou" ? "on" : ""}" data-home-tab="foryou">For you</button>
@@ -531,7 +578,20 @@
       </div>`;
 
     if (state.homeTab === "foryou") {
-      html += shelf({ title: "Jump back in", ic: "clock", body: posters(plays, "recent") });
+      let s;
+      if (!state.home) html += shelf({ title: "Quick picks", ic: "sparkle", body: skeletonCards() });
+      if ((s = homeShelf("quick"))) {
+        html += shelf({ title: s.title, ic: "sparkle", sub: "Based on what you've been playing", body: quickRows(s.items),
+          action: `<button class="link-btn shelf-act" data-play-all="quick">Play all</button>` });
+      }
+      if ((s = homeShelf("on_repeat"))) html += shelf({ title: s.title, ic: "repeat", sub: "Your most played this month", body: trackCards(s.items, "on_repeat") });
+      if ((s = homeShelf("mixed"))) html += shelf({ title: s.title, ic: "radio", sub: "Radio from artists you play", body: mixCards(s.items) });
+      // Old favourites once the log reaches back far enough; until then, what was played on this device.
+      html += (s = homeShelf("jump_back"))
+        ? shelf({ title: s.title, ic: "clock", sub: "Songs you loved a while ago", body: trackCards(s.items, "jump_back") })
+        : shelf({ title: "Jump back in", ic: "clock", body: posters(plays, "recent") });
+      if ((s = homeShelf("liked"))) html += shelf({ title: s.title, ic: "heart", body: trackCards(s.items, "liked") });
+      if ((s = homeShelf("top_artists"))) html += shelf({ title: s.title, ic: "person", body: topArtistCards(s.items) });
       if (state.history.length) {
         html += shelf({ title: "Recently kept", ic: "sparkle", sub: "Saved to Navidrome by Reef", more: "#kept", body: squares(state.history.slice(0, 15), "history") });
       }
@@ -553,7 +613,8 @@
       if (state.library.length > 10) html += shelf({ title: "More albums", ic: "note", body: albumCards(state.library.slice(10)) });
       if (state.history.length) html += shelf({ title: "Kept with Reef", ic: "sparkle", more: "#kept", body: squares(state.history.slice(0, 15), "history") });
     }
-    $("#view-home").innerHTML = html;
+    view.innerHTML = html;
+    for (const [k, x] of scrolled) { const el = $(`[data-shelf="${k}"]`, view); if (el) el.scrollLeft = x; }
   }
 
   // Source picker, shown only when there is more than one enabled source.
@@ -1083,6 +1144,11 @@
   function blockedChanged(hid) {
     for (const e of detail.cache.values()) e.at = 0; // any page may hold their songs: refetch on the next visit
     if (hid) {
+      dropFromHome((x, kind) => (kind === "artists" ? (hid.id && x.id === hid.id) || nameKey(x.name) === nameKey(hid.name) : byArtist(x, hid)));
+    } else {
+      loadHome();
+    }
+    if (hid) {
       if (state.results.some((t) => byArtist(t, hid))) {
         state.results = state.results.filter((t) => !byArtist(t, hid));
         if (state.view === "search") renderSearch();
@@ -1199,6 +1265,7 @@
       loadPage(r.key);
     } else {
       if (r.view === "home" && state.homeTab === "library" && state.library === null) loadLibrary();
+      if (r.view === "home" && homeDue()) loadHome();
       RENDER[r.view]();
       if (changed) window.scrollTo(0, y);
     }
@@ -1234,6 +1301,61 @@
   async function loadLibrary() {
     try { state.library = await api("/api/library/recent"); } catch { state.library = []; }
     if (state.view === "home") renderHome();
+  }
+
+  let homeAt = 0, homeTries = 0, homeTimer;
+  async function loadHome({ again = false } = {}) {
+    clearTimeout(homeTimer);
+    if (!again) homeTries = 0;
+    homeAt = Date.now();
+    let body;
+    try { body = await api("/api/home"); } catch { homeAt = 0; return; }
+    if (!body || !Array.isArray(body.shelves)) return;
+    for (const s of body.shelves) if (s.kind === "tracks") noteKept(s.items);
+    const moods = body.shelves.find((s) => s.kind === "moods");
+    if (moods?.items?.length) state.tiles = moods.items;
+    const same = JSON.stringify(body.shelves) === JSON.stringify(state.home?.shelves);
+    state.home = body;
+    store.set("home", body);
+    if (!same && state.view === "home") renderHome();
+    // The server is building (first start, or the copy was due): look again once the build had time to land.
+    if (body.stale && homeTries < 3) homeTimer = setTimeout(() => { homeTries++; loadHome({ again: true }); }, 8000 * (homeTries + 1));
+  }
+  const homeDue = () => Date.now() - homeAt > HOME_TTL;
+
+  // "Not interested": drop it from Home at once, then tell the server (14-day cooldown; a second song by the
+  // same artist hides the artist, which the answer's `blocked` says).
+  function dropFromHome(drop) {
+    if (!state.home) return;
+    let changed = false;
+    for (const s of state.home.shelves) {
+      if (!["tracks", "seeds", "artists"].includes(s.kind)) continue;
+      const left = s.items.filter((x) => !drop(s.kind === "seeds" ? x.seed : x, s.kind));
+      if (left.length !== s.items.length) { s.items = left; changed = true; }
+    }
+    if (!changed) return;
+    state.home.shelves = state.home.shelves.filter((s) => s.items.length);
+    store.set("home", state.home);
+    if (state.view === "home") renderHome();
+  }
+  async function notInterested(t) {
+    dropFromHome((x, kind) => kind !== "artists" && x.id === t.id);
+    let r;
+    try {
+      r = await api(`/api/dislikes/${encodeURIComponent(t.id)}`, {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(slim(t)),
+      });
+    } catch (e) {
+      toast(`Couldn't save that: ${e.message}`);
+      loadHome();
+      return;
+    }
+    if (r?.blocked) {
+      toast(`Hidden “${r.blocked.name}”: that's two of their songs you weren't into`);
+      blockedChanged(r.blocked);
+    } else {
+      toast("Got it. You won't see this song for a while");
+    }
   }
 
   async function loadTiles() {
@@ -2186,6 +2308,7 @@
 
   document.addEventListener("visibilitychange", () => {
     checkSleep();
+    if (document.visibilityState === "visible" && state.view === "home" && homeDue()) loadHome();
     if (document.visibilityState === "hidden" && cur()) saveSession();
     // iOS may kill a hidden Home Screen app without a pagehide: report the play so far (updated later if it goes on).
     if (document.visibilityState === "hidden" && lis) reportListen(false);
@@ -2607,8 +2730,9 @@
     const albumItem = ALBUM_ID.test(t.album_id || "") ? item("album", "disc", "Go to album", ` data-arg="${esc(t.album_id)}"`) : "";
     const ha = hideTarget(t);
     const hideItem = ha ? item("hide", "hide", as.length > 1 ? `Hide ${esc(ha.name)}` : "Hide artist") : "";
+    const dislikeItem = srcKey(t.id) !== "nd" ? item("dislike", "thumb-down", "Not interested") : "";
     $("#act-menu").innerHTML = item("next", "play-next", "Play next") + item("queue", "queue-add", "Add to queue") + radioItem + keepItem
-      + artistItems + albumItem + item("share", "share", "Share") + hideItem;
+      + artistItems + albumItem + item("share", "share", "Share") + dislikeItem + hideItem;
   }
   function runAction(act, arg) {
     const a = actTarget;
@@ -2621,6 +2745,7 @@
     else if (act === "artist" && arg) openRoute(`#artist/${encodeURIComponent(arg)}`);
     else if (act === "album" && arg) openRoute(`#album/${encodeURIComponent(arg)}`);
     else if (act === "hide") hideArtist(hideTarget(a.t));
+    else if (act === "dislike") notInterested(a.t);
   }
 
   // ---------- queue sheet ----------
@@ -2676,7 +2801,7 @@
 
   // ---------- events ----------
   document.addEventListener("click", (e) => {
-    const t = e.target.closest("[data-keep],[data-play],[data-search],[data-source],[data-home-tab],[data-filter],[data-dismiss],[data-play-all],[data-shuffle-all],[data-close],[data-clear-finished],[data-clear-searches],[data-more],[data-act],[data-q-jump],[data-q-remove],[data-q-clear],[data-q-mode],[data-sleep],[data-fill],[data-keep-all],[data-retry],[data-page-radio],[data-artist-hide],[data-unhide],[data-unhide-page],[data-open-hidden],[data-yt-reset],[data-copy-diag],[data-about]");
+    const t = e.target.closest("[data-keep],[data-play],[data-search],[data-source],[data-home-tab],[data-filter],[data-dismiss],[data-play-all],[data-shuffle-all],[data-close],[data-clear-finished],[data-clear-searches],[data-more],[data-act],[data-q-jump],[data-q-remove],[data-q-clear],[data-q-mode],[data-sleep],[data-fill],[data-keep-all],[data-retry],[data-page-radio],[data-artist-hide],[data-unhide],[data-unhide-page],[data-open-hidden],[data-yt-reset],[data-copy-diag],[data-about],[data-mix]");
     if (!t) return;
     const d = t.dataset;
     if ("keep" in d) { e.preventDefault(); if (d.keep) keep(d.keep, d.list); return; }
@@ -2684,6 +2809,7 @@
     if ("act" in d) { if (!t.disabled) runAction(d.act, d.arg); return; }
     if ("keepAll" in d) { keepAll(); return; }
     if ("retry" in d) { detail.errors.delete(detail.key); renderDetail(); loadPage(detail.key, { force: true }); return; }
+    if ("mix" in d) { const m = homeItems("mixed")[Number(d.mix)]; if (m?.seed) startRadio(m.seed); return; }
     if ("pageRadio" in d) { const s = pageTracks()[0]; if (s) startRadio(s); return; }
     if ("artistHide" in d) { toggleArtistHidden(); return; }
     if ("unhidePage" in d) {

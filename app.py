@@ -20,12 +20,14 @@ import config
 import downloader
 import errors
 import history
+import home
 import likes
 import listens
 import log
 import lyrics
 import navidrome
 import playlists
+import recommend
 import settings
 import sources
 import store
@@ -184,6 +186,7 @@ def api_diagnostics():
         "yt_backend": sources.youtube.last_backend,
         "yt_gates": sources.youtube.gates.snapshot(),
         "failover_cooling": sources.failover.cooling(),
+        "home": home.status(),
         "jobs": [{k: j.get(k) for k in ("id", "status", "error")} for j in downloader.list_jobs()][:20],
         "log": log.recent(),
     }))
@@ -667,6 +670,11 @@ def api_listens_add():
         entry, created = listens.record(body)
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
+    if entry["counted"]:
+        try:
+            home.listened()  # enough new listens: rebuild Home in the background
+        except Exception as e:
+            logger.warning(f"home: tick after listen failed: {str(e)[:200]}")
     return jsonify({"entry": entry, "created": created}), 201 if created else 200
 
 
@@ -728,6 +736,45 @@ def api_like(track_id):
 @app.delete("/api/likes/<track_id>")
 def api_unlike(track_id):
     if not likes.remove(_id_or_404(track_id)):
+        abort(404)
+    return "", 204
+
+
+# ---------- Home, "Not interested" ----------
+
+@app.get("/api/home")
+def api_home():
+    """Home shelves from home.json (rebuilt in the background); see home.py."""
+    body = home.serve()
+    for s in body["shelves"]:
+        if s["kind"] == "tracks":
+            _mark_kept(s["items"])
+    resp = jsonify(body)
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+@app.get("/api/dislikes")
+def api_dislikes():
+    return jsonify(recommend.dislikes())
+
+
+@app.post("/api/dislikes/<track_id>")
+def api_dislike(track_id):
+    """"Not interested": the track sits out 14 days; a second track by the same artist within 30 days hides
+    the artist (`blocked` in the answer, so the UI can say so). The body is the track as the client shows it."""
+    tid = _id_or_404(track_id)
+    body = request.get_json(silent=True) or {}
+    if not isinstance(body, dict) or store.track_id(body.get("id", tid)) != tid:
+        return jsonify({"error": "body id doesn't match the URL"}), 400
+    entry, created, blocked = recommend.dislike(store.clean_track({**body, "id": tid}))
+    return jsonify({"entry": entry, "created": created, "blocked": blocked}), 201 if created else 200
+
+
+@app.delete("/api/dislikes/<track_id>")
+def api_undislike(track_id):
+    """Undo "Not interested" (and the artist block it caused)."""
+    if not recommend.undislike(_id_or_404(track_id)):
         abort(404)
     return "", 204
 
@@ -1017,6 +1064,7 @@ def main():
     log.setup()
     downloader.start_worker()
     tiles.start_refresher()
+    home.start_refresher()
     server = "flask-dev" if config.DEV else "waitress"
     logger.info(f"reef start host={config.HOST} port={config.PORT} server={server} version={_version()} "
                 f"open={int(config.OPEN)} password={int(bool(config.PASSWORD))} downloads={config.DOWNLOAD_DIR}")

@@ -83,6 +83,9 @@ Pass the Navidrome password through the environment. Don't put it in a committed
   Entries with a `file` are never dropped (before Round 10 the file was cut to 500, so older keeps lost their kept
   state); reads use `store.JsonFile`'s cached copy.
   `navidrome.py`: Subsonic token auth, ping, startScan, newest albums, cover art, `find_song`.
+- `recommend.py` (Round 11): For you from local data: seeds, Quick picks scoring over YT Music radio lanes, artist
+  affinity, the shelves from the listen log, and "Not interested" marks (`dislikes.json`). `home.py`: `/api/home`
+  served from `home.json`, rebuilt by a background thread (`reef-home-tick`) when due.
 - `tiles.py`: the home mood/genre tiles + a daily background search that caches 4 video ids per tile in `tiles.json`.
 - `store.py`: `JsonFile` (in-memory copy re-read when the file changes, atomic `.tmp` + `os.replace` writes, a lock
   for read-modify-write) and `clean_track` (the only place client track dicts are trimmed before storing).
@@ -270,6 +273,52 @@ explicit?}`; lists from the server add `kept`, `liked`, and `nd_id` when kept + 
   default, label, help, choices?, overridden}]}`; `PATCH {key: value|null}` → same, 400 `{error}` (nothing written).
   Keys: default_source, ytmusic, prefer_library, autoplay_radio (default for new devices; not wired in the client
   yet), sponsorblock_keep, replaygain, lrc_sidecar, lyrics_providers (placeholder, not read yet), listenbrainz_token.
+
+## Round 11 (2026-10-22): For you shelves + Home from cache (production plan P1.10, P1.14)
+
+New files `dislikes.json`, `home.json` (git-ignored; `REEF_DISLIKES_FILE` / `REEF_HOME_FILE`, next to history.json).
+
+- **Quick picks** (`recommend.py`): seeds = newest counted listens (then newest keeps), one per lead artist, max 5,
+  YouTube ids only, none disliked/hidden. Each seed's `ytmusic.radio` (30 min cache) is a lane; a track scores
+  Σ (1 − i/8)(1 − s/n), where i is its place among the lane's *eligible* tracks (a lane of songs you just heard still
+  yields 8), times `max(0.2, 1 + affinity)` of its lead artist. Dropped: heard (any play) in 14 days, kept, disliked,
+  hidden artists, the seeds, and a second id of the same title + artist. Best 15, ≤ 3 per lead artist, then
+  interleaved lane by lane. A 429 stops the remaining lanes; other errors lose one lane.
+- **Affinity**: per artist, oldest → newest: decay ×0.85/day since its last update, then a counted play
+  `a += 0.15 (1 − a)`, a skip `a += 0.05 (−1 − a)`; decayed to now.
+- **Other shelves**: On repeat (≥ 2 counted plays in 30 days), Jump back in (≥ 2 plays 30-180 days ago, nothing in
+  the last 14), Liked songs (latest 10, read per request), Your top artists (90 days, else all time; `cover_id` =
+  their most played track for the art; channel id when any listen had it), Mixed for you (a card per seed: `seed`
+  track + up to 3 other artists from its lane), Moods (`tiles.load()`, read per request).
+- **Not interested**: `POST /api/dislikes/<id>` (body = the track) → 14-day cooldown; a second disliked *track* by
+  the same lead artist within 30 days adds the artist to the blocklist (channel id from either mark) and returns it
+  as `blocked` (only when it created the block; an artist already hidden stays the user's block). `DELETE` undoes the mark and a block it created. Marks older than 30 days are pruned on write.
+- **Home cache** (`home.py`): `GET /api/home` serves `home.json` (~1-5 ms) and filters it per request (hidden
+  artists, dislikes). Rebuild due: 6 h after a complete build, 30 min after lost lanes (`radio_failed`), 60 s or
+  the 429's `Retry-After` (`ytmusic` now records it with a session response hook; ytmusicapi's exception drops
+  headers) after `rate_limited`; also after 5 counted listens *reported* since the build (1 when there were no
+  seeds), except during a 429 wait; and when the YouTube Music setting flipped. One build at a time (lock). A build
+  that lost every lane keeps the previous Quick picks (`carried`). No file yet: the request waits ≤ 8 s for the build,
+  else returns the network-free shelves with `stale: true`, `reason: local_only`. Thread checks every 60 s (first
+  after 20 s). `/api/diagnostics` → `home` shows the state.
+- **Client**: Home renders /api/home (localStorage `reef.home` paints first, refetch when Home is shown and the copy
+  is > 5 min old, or the app comes back to the foreground; a `stale` answer is re-asked up to 3 times, 8/16/24 s).
+  Order: Quick picks (4-row columns, Play all), On repeat, Mixed for you, Jump back in (the old device-local
+  "recently played" posters until the server has one), Liked songs, Your top artists, Recently kept, Recent
+  searches, Moods. ⋯ → **Not interested** (all but `nd:` tracks): drops it at once, toasts, and toasts the hide when
+  it escalates. Hiding/unhiding an artist anywhere also drops/refetches Home.
+- Measured on the Mac (4 artists of seeded listens, live YT Music): cold `/api/home` 4.9 s (5 radio calls, fresh),
+  warm 1-5 ms, rebuild after 5 listens 3.1 s in the background.
+
+### API shapes
+
+- `GET /api/home` → `{generated_at, stale, source: "fresh"|"cache"|"fallback", reason?: "radio_failed"|
+  "rate_limited"|"local_only", shelves: [{id, title, kind, items}]}`. ids/kinds: `quick`, `on_repeat`, `jump_back`,
+  `liked` = tracks (marked `kept`/`liked`/`nd_id`; `plays` on on_repeat/jump_back); `mixed` = seeds `{name,
+  artist_id, seed: track, with: [names]}`; `top_artists` = artists `{name, id, count, cover_id}`; `moods` = tiles.
+- `POST /api/dislikes/<id>` → 201/200 `{entry: track + {at, until, artist_key, artist_id, blocked?}, created,
+  blocked: blocklist entry|null}`; 400 body id mismatch, 404 bad id. `DELETE` → 204/404. `GET /api/dislikes` → marks
+  of the last 30 days, newest first.
 
 ## Production plan (2026-10-21)
 

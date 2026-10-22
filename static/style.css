@@ -173,6 +173,29 @@ a.card { display: block; }
 .card.av .card-art { width: 120px; height: 120px; border-radius: 50%; display: grid; place-items: center; color: var(--faint); }
 .card.av .card-art .i { width: 44px; height: 44px; stroke-width: 1.5; }
 
+/* Home (/api/home): Quick picks as columns of 4 rows that scroll sideways, the next column peeking in;
+   track cards with a ⋯ under the art; Mixed for you cards with a radio tag */
+.shelf-head .shelf-act { margin-left: auto; }
+.qp {
+  display: grid; grid-auto-flow: column; grid-template-rows: repeat(4, auto);
+  grid-auto-columns: min(calc(100% - 2 * var(--pad) - 28px), 360px); column-gap: 6px;
+  overflow-x: auto; overscroll-behavior-x: contain; scroll-snap-type: x mandatory; scrollbar-width: none;
+  margin: 8px calc(-1 * var(--pad)) 0; padding: 0 calc(var(--pad) - 8px); scroll-padding: 0 calc(var(--pad) - 8px);
+}
+.qp::-webkit-scrollbar { display: none; }
+.qp > .row { margin: 0; min-width: 0; scroll-snap-align: start; }
+.card-meta { display: flex; align-items: flex-start; }
+.card-text { flex: 1; min-width: 0; }
+.card-meta .more-btn { margin: 6px -8px 0 0; color: var(--muted); }
+button.card { display: block; text-align: left; }
+button.card.av { text-align: center; }
+.card.mix .card-art::after { content: ""; position: absolute; inset: 0; background: linear-gradient(to top, rgba(0, 0, 0, .55), transparent 55%); }
+.mix-tag {
+  position: absolute; left: 10px; bottom: 10px; z-index: 1; display: flex; align-items: center; gap: 5px;
+  font-size: 13px; font-weight: 700; color: #fff;
+}
+.mix-tag .i { width: 16px; height: 16px; color: var(--accent-soft); }
+
 /* chips */
 .chips { display: flex; gap: 8px; overflow-x: auto; scrollbar-width: none; margin: 0 calc(-1 * var(--pad)); padding: 0 var(--pad); }
 .chips::-webkit-scrollbar { display: none; }

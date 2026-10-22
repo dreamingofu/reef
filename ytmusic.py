@@ -59,11 +59,31 @@ def enabled():
     return settings.get("ytmusic") and YTMusic is not None
 
 
+_last_429 = None  # (monotonic time, Retry-After header or None) of YouTube Music's last 429
+
+
+def _note_429(resp, *args, **kwargs):
+    """ytmusicapi's error keeps only the status line, so remember a 429's Retry-After for callers that back off."""
+    global _last_429
+    if resp.status_code == 429:
+        _last_429 = (time.monotonic(), resp.headers.get("Retry-After"))
+
+
+def retry_after(max_age=300):
+    """Seconds YouTube Music asked to wait in its last 429 (seen within `max_age` s), else None. Only the
+    delta-seconds form is read; an HTTP-date Retry-After counts as absent."""
+    hit = _last_429
+    if not hit or time.monotonic() - hit[0] > max_age or not hit[1] or not str(hit[1]).strip().isdigit():
+        return None
+    return int(str(hit[1]).strip())
+
+
 def _client():
     global _yt
     if _yt is None:
         session = requests.Session()
         session.request = partial(session.request, timeout=TIMEOUT)
+        session.hooks["response"].append(_note_429)
         _yt = YTMusic(requests_session=session)
     return _yt
 

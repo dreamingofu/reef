@@ -74,6 +74,10 @@ LISTENS_FILE = Path(os.environ.get("REEF_LISTENS_FILE") or HISTORY_FILE.with_nam
 LIKES_FILE = Path(os.environ.get("REEF_LIKES_FILE") or HISTORY_FILE.with_name("likes.json"))
 PLAYLISTS_FILE = Path(os.environ.get("REEF_PLAYLISTS_FILE") or HISTORY_FILE.with_name("playlists.json"))
 SETTINGS_FILE = Path(os.environ.get("REEF_SETTINGS_FILE") or HISTORY_FILE.with_name("settings.json"))
+# "Not interested" marks (14-day cooldowns; a second one for an artist hides it) and the cached Home shelves
+# (/api/home, refreshed in the background). Both default next to history.json.
+DISLIKES_FILE = Path(os.environ.get("REEF_DISLIKES_FILE") or HISTORY_FILE.with_name("dislikes.json"))
+HOME_FILE = Path(os.environ.get("REEF_HOME_FILE") or HISTORY_FILE.with_name("home.json"))
 # Search, suggestions, radio and link metadata via YouTube Music (ytmusicapi, anonymous).
 # 0 = yt-dlp search only (no suggestions or radio).
 YTMUSIC = os.environ.get("REEF_YTMUSIC", "1").strip() != "0"
