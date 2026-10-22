@@ -360,3 +360,68 @@ def test_enqueue_unique_under_concurrency(monkeypatch):
     for t in threads:
         t.join()
     assert results.count(True) == 1 and downloader._queue.qsize() == 1
+
+
+# ---------- post steps: loudness + lyrics after the file is final ----------
+
+def _fake_keep(monkeypatch, path):
+    def run(job):
+        job["file"] = str(path)
+        history.add({"id": job["video_id"], "title": "Song", "file": job["file"]})
+        return {"title": "Song", "artist": "Rick Astley", "album": "", "duration": 213.0}
+    monkeypatch.setattr(downloader, "_run_ytdlp", run)
+    monkeypatch.setattr(config, "REPLAYGAIN", True)
+    config.HISTORY_FILE.write_text("[]", encoding="utf-8")
+
+
+def test_post_step_failures_do_not_fail_the_keep(monkeypatch, tmp_path, capsys):
+    f = tmp_path / "song.opus"
+    f.write_bytes(b"x")
+    _fake_keep(monkeypatch, f)
+
+    def boom(*a, **k):
+        raise RuntimeError("nope")
+    monkeypatch.setattr(downloader.loudness, "measure", boom)
+    monkeypatch.setattr(downloader.lyrics, "for_track", boom)
+    job = downloader._new_job(VID, "Song", "")
+    downloader._run(job)
+    assert job["status"] == "done" and job["error"] is None and job["file"] == str(f)
+    entry = history.get(VID)
+    assert entry["lyrics"] is None and entry["gain_db"] is None
+    out = capsys.readouterr().out
+    assert "loudness skipped" in out and "lyrics skipped" in out
+
+
+def test_post_steps_record_lyrics_and_gain(monkeypatch, tmp_path):
+    f = tmp_path / "song.opus"
+    f.write_bytes(b"x")
+    _fake_keep(monkeypatch, f)
+    seen = {}
+    job = downloader._new_job(VID, "Song", "")
+
+    def for_track(tid, title, artist, album, duration):
+        seen.update(status=job["status"], args=(tid, title, artist, album, duration))
+        return {"synced": "[00:01.00] la", "plain": "la", "instrumental": False}
+    monkeypatch.setattr(downloader.loudness, "measure", lambda p: {"lufs": -9.3, "peak_dbtp": 0.5})
+    monkeypatch.setattr(downloader.loudness, "tag", lambda p, m: True)
+    monkeypatch.setattr(downloader.lyrics, "for_track", for_track)
+    monkeypatch.setattr(downloader.lyrics, "embed", lambda p, found: True)
+    downloader._run(job)
+    assert seen == {"status": "converting", "args": (VID, "Song", "Rick Astley", None, 213.0)}
+    assert job["status"] == "done"
+    entry = history.get(VID)
+    assert entry["lyrics"] == "synced" and entry["gain_db"] == -8.7
+    config.HISTORY_FILE.write_text("[]", encoding="utf-8")
+
+
+def test_replaygain_off_skips_measuring(monkeypatch, tmp_path):
+    f = tmp_path / "song.opus"
+    f.write_bytes(b"x")
+    _fake_keep(monkeypatch, f)
+    monkeypatch.setattr(config, "REPLAYGAIN", False)
+    monkeypatch.setattr(downloader.loudness, "measure", lambda p: pytest.fail("measured with REPLAYGAIN off"))
+    monkeypatch.setattr(downloader.lyrics, "for_track", lambda *a: None)
+    job = downloader._new_job(VID, "Song", "")
+    downloader._run(job)
+    assert job["status"] == "done" and history.get(VID)["gain_db"] is None
+    config.HISTORY_FILE.write_text("[]", encoding="utf-8")

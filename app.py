@@ -10,9 +10,11 @@ from flask import Flask, Response, abort, jsonify, redirect, render_template, re
 import config
 import downloader
 import history
+import lyrics
 import navidrome
 import sources
 import streamer
+import tagging
 import tiles
 
 VIDEO_ID = re.compile(r"^[A-Za-z0-9_-]{11}$")
@@ -20,6 +22,7 @@ TRACK_ID = re.compile(r"^(?:[a-z]{2}:)?[\w.-]{1,128}$")
 COVER_ID = re.compile(r"^[\w.-]{1,128}$")
 ART_CACHE = "public, max-age=86400"
 ART_LOOKUP_BACKOFF = 600  # seconds before retrying a Navidrome lookup that found nothing
+HINT_MAX = 200
 
 app = Flask(__name__)
 
@@ -227,6 +230,52 @@ def api_art(track_id):
         return Response(found[1], content_type=found[2], headers={"Cache-Control": ART_CACHE})
     resp = redirect(found[1], 302)
     resp.headers["Cache-Control"] = "public, max-age=3600"
+    return resp
+
+
+def _hint(value):
+    return str(value or "").strip()[:HINT_MAX]
+
+
+def _seconds(value):
+    """A plausible track length in seconds, else None (also for nan/inf, which float() accepts)."""
+    try:
+        d = float(value)
+    except (TypeError, ValueError):
+        return None
+    return d if 0 < d < 86400 else None
+
+
+@app.get("/api/lyrics/<track_id>")
+def api_lyrics(track_id):
+    """Lyrics for the Now Playing view. The client sends what it shows (title, artist, ...) as hints,
+    since only kept tracks are known server-side."""
+    t = _track(track_id)
+    if not t:
+        abort(404)
+    src, track_id, native = t
+    args = request.args
+    title, artist, album = _hint(args.get("title")), _hint(args.get("artist")), _hint(args.get("album"))
+    duration = _seconds(args.get("duration"))
+    found = None
+    if src.key == "nd":
+        found = navidrome.lyrics(native)  # what Navidrome reads from the file's tags (Reef embeds them on keep)
+    else:
+        entry = history.get(track_id)
+        if entry:  # normally a cache hit: the keep looked lyrics up under this id
+            title, artist = title or _hint(entry.get("title")), artist or _hint(entry.get("channel"))
+            album, duration = album or _hint(entry.get("album")), duration or _seconds(entry.get("duration"))
+        if src.key == "yt":
+            # "Artist - Song (Official Video)" from channel "ArtistVEVO" -> ("Song", "Artist"), as a keep tags it.
+            title, artist = tagging.guess(title, artist)
+    # No title means nothing to search by; for_track would cache that as a miss for a day.
+    if not found and title:
+        found = lyrics.for_track(track_id, title, artist, album or None, duration)
+    if not found:
+        return jsonify({"error": "No lyrics found"}), 404
+    resp = jsonify({"synced": found.get("synced"), "plain": found.get("plain"),
+                    "instrumental": bool(found.get("instrumental"))})
+    resp.headers["Cache-Control"] = "private, max-age=3600"
     return resp
 
 

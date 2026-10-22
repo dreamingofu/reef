@@ -124,7 +124,7 @@
 
   const navidromeUrl = (path) => `${location.protocol}//${location.hostname}:4533${path}`;
   const cur = () => state.queue[state.index];
-  const slim = (t) => ({ id: t.id, title: t.title, channel: t.channel, duration: t.duration, source: t.source || srcKey(t.id), ...(t.codec ? { codec: t.codec } : {}) });
+  const slim = (t) => ({ id: t.id, title: t.title, channel: t.channel, duration: t.duration, source: t.source || srcKey(t.id), ...(t.codec ? { codec: t.codec } : {}), ...(t.album ? { album: t.album } : {}) });
 
   // YouTube serves a 120x90 placeholder (sometimes with status 404) when maxres art is missing.
   function fallbackImg(img) {
@@ -534,6 +534,7 @@
     updatePlayer();
     markPlaying();
     setProgress(0, t.duration || 0);
+    resetLyrics();
     if ("mediaSession" in navigator) {
       const abs = (u) => new URL(u, location.href).href;
       navigator.mediaSession.metadata = new MediaMetadata({
@@ -651,7 +652,7 @@
     }
   }
 
-  audio.addEventListener("timeupdate", () => setProgress(audio.currentTime, duration()));
+  audio.addEventListener("timeupdate", () => { setProgress(audio.currentTime, duration()); if (lyr.times.length) syncLyrics(); });
   audio.addEventListener("loadedmetadata", () => setProgress(audio.currentTime, duration()));
   audio.addEventListener("play", updatePlayState);
   audio.addEventListener("pause", updatePlayState);
@@ -662,6 +663,7 @@
   audio.addEventListener("playing", () => {
     setLoading(false);
     if (prefetchNext) { prefetch([prefetchNext]); prefetchNext = null; }
+    if (lyr.on && cur()) fetchLyrics(cur()); // warm, so opening the player shows them at once
   });
   audio.addEventListener("pause", () => setLoading(false));
   audio.addEventListener("ended", () => setLoading(false));
@@ -699,6 +701,7 @@
     np.classList.add("open");
     np.setAttribute("aria-hidden", "false");
     document.documentElement.classList.add("lock");
+    if (lyr.on) showLyrics();
   }
   function closeNP() {
     const np = $("#np");
@@ -725,6 +728,151 @@
       });
     }
   })();
+
+  // ---------- lyrics ----------
+  // LRC text -> [{ t: seconds, text }] sorted by time. Handles several stamps per line, [mm:ss(.x|.xx|.xxx)],
+  // [offset:±ms] (positive = sooner), skips [ar:]/[ti:]-style metadata and strips enhanced <mm:ss.xx> word tags.
+  function parseLRC(lrc) {
+    const STAMP = /^\[(\d{1,3}):(\d{1,2})(?:[.:](\d{1,3}))?\]\s*/;
+    const out = [];
+    let offset = 0;
+    for (const raw of String(lrc || "").split(/\r?\n/)) {
+      let line = raw.trim(), m;
+      const off = /^\[offset:\s*([+-]?\d+)\s*\]$/i.exec(line);
+      if (off) { offset = Number(off[1]) / 1000; continue; }
+      const times = [];
+      while ((m = STAMP.exec(line))) {
+        times.push(Number(m[1]) * 60 + Number(m[2]) + (m[3] ? Number(m[3]) / 10 ** m[3].length : 0));
+        line = line.slice(m[0].length);
+      }
+      if (!times.length) continue;
+      const text = line.replace(/<\d{1,3}:\d{1,2}(?:[.:]\d{1,3})?>/g, "").replace(/\s+/g, " ").trim();
+      for (const t of times) out.push({ t, text });
+    }
+    for (const l of out) l.t = Math.max(0, l.t - offset); // [offset:] may come after the lines it shifts
+    return out.sort((a, b) => a.t - b.t);
+  }
+
+  const LYRIC_LEAD = 0.2; // Safari fires timeupdate ~4x/s; showing a line a beat early reads as on time
+  const lyr = {
+    on: store.get("lyricsOn", false),
+    cache: new Map(), // track id -> Promise of {synced, plain, instrumental} | null (misses too)
+    seq: 0, id: null, lines: [], times: [], els: [], active: -1, held: false, holdTimer: 0,
+  };
+  const lyricsPanel = $("#np-lyrics");
+  const npOpen = () => $("#np").classList.contains("open");
+
+  function fetchLyrics(t) {
+    let p = lyr.cache.get(t.id);
+    if (!p) {
+      const q = new URLSearchParams();
+      for (const [k, v] of [["title", t.title], ["artist", t.channel], ["album", t.album], ["duration", t.duration]]) if (v) q.set(k, v);
+      p = api(`/api/lyrics/${encodeURIComponent(t.id)}?${q}`).catch((e) => {
+        if (e.status !== 404) lyr.cache.delete(t.id); // a network blip shouldn't stick; a real miss should
+        return null;
+      });
+      lyr.cache.set(t.id, p);
+    }
+    return p;
+  }
+
+  function lyricsMsg(text, cls = "") {
+    lyricsPanel.innerHTML = `<div class="lyr-msg ${cls}">${cls ? icon("note") : ""}${esc(text)}</div>`;
+  }
+
+  function renderLyrics(data) {
+    const lines = data?.synced ? parseLRC(data.synced) : [];
+    lyr.lines = lines;
+    lyr.times = lines.map((l) => l.t);
+    lyr.active = -1;
+    if (lines.length) {
+      lyricsPanel.innerHTML = `<div class="lyr synced">${lines.map((l, i) => l.text
+        ? `<button class="lyr-line" data-i="${i}">${esc(l.text)}</button>`
+        : `<button class="lyr-line gap" data-i="${i}" aria-label="Instrumental break">♪</button>`).join("")}</div>`;
+    } else if (data?.plain || data?.synced) {
+      const text = data.plain || data.synced.replace(/^(\s*\[[^\]]*\])+/gm, ""); // unparseable synced: show its words
+      lyricsPanel.innerHTML = `<div class="lyr plain">${text.split(/\r?\n/).map((l) => (l.trim()
+        ? `<p>${esc(l.trim())}</p>` : `<p class="gap"></p>`)).join("")}</div>`;
+    } else if (data?.instrumental) {
+      lyricsMsg("Instrumental", "instrumental");
+    } else {
+      lyricsMsg("No lyrics for this track");
+    }
+    lyr.els = $$(".lyr-line", lyricsPanel);
+    lyricsPanel.scrollTop = 0;
+    syncLyrics(true);
+  }
+
+  // Show the current track's lyrics in the panel (no-op when they're already there).
+  async function showLyrics() {
+    const t = cur();
+    if (!lyr.on || !t) return;
+    if (lyr.id === t.id) { syncLyrics(true); return; }
+    lyr.id = t.id;
+    const seq = ++lyr.seq;
+    lyr.lines = []; lyr.times = []; lyr.els = []; lyr.active = -1;
+    lyricsPanel.innerHTML = `<div class="lyr-sk" role="status" aria-label="Loading lyrics…"><i class="sk"></i><i class="sk"></i><i class="sk"></i><i class="sk"></i></div>`;
+    const data = await fetchLyrics(t);
+    if (seq !== lyr.seq || cur()?.id !== t.id) return; // the track changed while this was loading
+    renderLyrics(data);
+  }
+
+  // New track: drop what the panel shows, then load if it's visible.
+  function resetLyrics() {
+    lyr.id = null; lyr.seq++;
+    lyr.lines = []; lyr.times = []; lyr.els = []; lyr.active = -1;
+    if (lyr.on && npOpen()) showLyrics();
+  }
+
+  function scrollToLine(el, smooth) {
+    if (!el || lyr.held || !npOpen() || !lyr.on) return;
+    const top = el.offsetTop + el.offsetHeight / 2 - lyricsPanel.clientHeight / 3;
+    const reduce = matchMedia("(prefers-reduced-motion: reduce)").matches;
+    lyricsPanel.scrollTo({ top: Math.max(0, top), behavior: smooth && !reduce ? "smooth" : "auto" });
+  }
+
+  // Highlight the line for audio.currentTime: binary search, and the DOM is touched only when the line changes.
+  function syncLyrics(force = false, smooth = !force) {
+    const ts = lyr.times;
+    if (!ts.length) return;
+    const now = audio.currentTime + LYRIC_LEAD;
+    let lo = 0, hi = ts.length - 1, i = -1;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      if (ts[mid] <= now) { i = mid; lo = mid + 1; } else hi = mid - 1;
+    }
+    if (i === lyr.active && !force) return;
+    lyr.els[lyr.active]?.classList.remove("on");
+    lyr.els[i]?.classList.add("on");
+    lyr.active = i;
+    if (i < 0) { if (force && !lyr.held) lyricsPanel.scrollTop = 0; return; }
+    scrollToLine(lyr.els[i], smooth);
+  }
+
+  function setLyricsOn(on) {
+    lyr.on = on;
+    store.set("lyricsOn", on);
+    $("#np").classList.toggle("show-lyrics", on);
+    $("#np-lyr").setAttribute("aria-pressed", String(on));
+    if (on) showLyrics();
+  }
+
+  // Reading ahead or back: let the user scroll for 4 s before following the song again.
+  function holdLyrics() {
+    lyr.held = true;
+    clearTimeout(lyr.holdTimer);
+    lyr.holdTimer = setTimeout(() => { lyr.held = false; syncLyrics(true, true); }, 4000);
+  }
+  for (const ev of ["touchstart", "touchmove", "wheel", "pointerdown"]) lyricsPanel.addEventListener(ev, holdLyrics, { passive: true });
+  lyricsPanel.addEventListener("click", (e) => {
+    const line = e.target.closest(".lyr-line");
+    if (!line || !lyr.lines[line.dataset.i]) return;
+    clearTimeout(lyr.holdTimer);
+    lyr.held = false;
+    audio.currentTime = lyr.lines[line.dataset.i].t;
+    if (audio.paused) audio.play().catch(() => {});
+    syncLyrics(true, true);
+  });
 
   // ---------- keep ----------
   async function keep(id, listName) {
@@ -879,6 +1027,7 @@
   $("#np-share").addEventListener("click", share);
   $("#np-share2").addEventListener("click", share);
   $("#np-dl").addEventListener("click", closeNP);
+  $("#np-lyr").addEventListener("click", () => setLyricsOn(!lyr.on));
   $("#np-shuffle").addEventListener("click", () => { state.shuffle = !state.shuffle; updateModes(); });
   $("#np-repeat").addEventListener("click", () => {
     state.repeat = { off: "all", all: "one", one: "off" }[state.repeat];
@@ -898,6 +1047,7 @@
   // ---------- boot ----------
   state.view = "";
   route();
+  setLyricsOn(lyr.on);
   loadSources();
   loadHealth();
   loadHistory();

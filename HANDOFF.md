@@ -104,7 +104,17 @@ result card, Songs rows with **+**, and filter chips. Design tokens are at the t
 - Keeps now tag artist (no "- Topic"/VEVO), album, album artist, year, track number and a cleaned title (filename
   unchanged), embed a center-cropped square JPEG cover, retry with backoff, and 409 on duplicates (`force` re-keeps).
 - New `reef.env` keys: `REEF_SPONSORBLOCK=1` (cut non-music segments, off by default), `REEF_YDL_EXTRA` (JSON yt-dlp options).
-- Next per the plan: Phase 2 lyrics (LRCLIB) + ReplayGain, then player, then YT Music via `ytmusicapi`.
+- iOS fix: YouTube m4a is fragmented MP4 with full durations in moov; iOS added them to the fragments (2x length,
+  no `ended`). `streamer.fix_fragmented_durations` zeroes them in the proxied head.
+
+## Round 4 (2026-10-21): lyrics + loudness (Phase 2)
+
+- Keeps measure loudness (ffmpeg ebur128) and write REPLAYGAIN_TRACK_GAIN/PEAK (+ R128_TRACK_GAIN on Opus), then
+  embed synced lyrics from LRCLIB (`lyrics.py`, cache in `lyrics.json` next to history.json; misses retried after 24 h).
+  `REEF_REPLAYGAIN=0` / `REEF_LRC_SIDECAR=1` toggle them. Title/artist cleanup lives in `tagging.py`.
+- `/api/lyrics/<id>`: Navidrome `getLyricsBySongId` for library tracks, else LRCLIB. Now Playing has a Lyrics button
+  (bottom row): synced highlight, tap a line to seek, auto-scroll pauses 4 s after you scroll.
+- Next per the plan: Phase 3 player (queue persistence, sleep timer, play next), then YT Music via `ytmusicapi`.
 
 ## Ideas / next steps
 

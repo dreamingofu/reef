@@ -1,7 +1,6 @@
 import base64
 import os
 import queue
-import re
 import shutil
 import subprocess
 import threading
@@ -24,10 +23,13 @@ from yt_dlp.utils import sanitize_filename, sanitize_path
 
 import config
 import history
+import loudness
+import lyrics
 import navidrome
 import sources
 import streamer
 from config import AUDIO_FORMAT, DOWNLOAD_DIR, TMP_DIR
+from tagging import music_tags
 
 ACTIVE = ("queued", "downloading", "converting")
 
@@ -87,76 +89,7 @@ def remove(job_id):
     return False
 
 
-# ---------- music tags: what Navidrome shows, without touching the filename ----------
-
-# A trailing (...) / [...] group made only of these words is video noise, not part of the song title.
-_NOISE_WORDS = {"official", "oficial", "music", "video", "audio", "lyric", "lyrics", "visualizer", "visualiser",
-                "hd", "hq", "4k", "mv"}
-_TRAILING_GROUP = re.compile(r"\s*(\(([^()]*)\)|\[([^\[\]]*)\])\s*$")
-_SEP = re.compile(r"\s+[-–]\s+")
-
-
-def _is_noise(group):
-    words = re.findall(r"[\w']+", group.lower())
-    if "4k" in words:  # "4K Remaster" is about the video; a bare "(Remastered 2009)" is about the recording
-        words = [w for w in words if w not in ("remaster", "remastered")]
-    return bool(words) and all(w in _NOISE_WORDS for w in words)
-
-
-def _strip_noise(title):
-    while True:
-        m = _TRAILING_GROUP.search(title)
-        if not m or not _is_noise(m.group(2) if m.group(2) is not None else m.group(3)) or not title[:m.start()].strip():
-            return title.strip()
-        title = title[:m.start()]
-
-
-def _clean_artist(name):
-    name = re.sub(r"\s+-\s+Topic$", "", str(name or "").strip(), flags=re.I)
-    return re.sub(r"\s*VEVO$", "", name).strip()
-
-
-def _names(value):
-    return [n for n in (_clean_artist(v) for v in (value if isinstance(value, list) else [value])) if n]
-
-
-def _year(info):
-    for v in (info.get("release_year"), (info.get("release_date") or "")[:4], (info.get("upload_date") or "")[:4]):
-        if v and re.fullmatch(r"\d{4}", str(v)):
-            return str(v)
-    return None
-
-
-def music_tags(info):
-    """`meta_*` overrides for FFmpegMetadataPP (it prefers them over the plain fields). Never touches
-    info["title"], which names the file."""
-    artists = _names(info.get("artists")) or _names(info.get("artist")) or _names(info.get("creators")) \
-        or _names(info.get("creator"))
-    known = bool(artists)
-    title = str(info.get("track") or info.get("title") or "").strip()
-    if not info.get("track"):
-        parts = _SEP.split(title, maxsplit=1)
-        if len(parts) == 2 and known:
-            # "Rick Astley - Never Gonna..." when yt-dlp already knows the artist is Rick Astley.
-            left, first = parts[0].lower(), artists[0].lower()
-            if left == ", ".join(artists).lower() or re.match(re.escape(first) + r"(\W|$)", left):
-                title = parts[1]
-        elif not known and len(_SEP.findall(title)) == 1:
-            artists, title = [parts[0].strip()], parts[1]
-    if not artists:
-        artists = _names(info.get("uploader")) or _names(info.get("channel"))
-    tags = {"meta_title": _strip_noise(title) or title}
-    if artists:
-        tags["meta_artist"] = ", ".join(artists)
-        tags["meta_album_artist"] = (_names(info.get("album_artists")) or _names(info.get("album_artist"))
-                                     or artists)[0]
-    if info.get("album"):
-        tags["meta_album"] = str(info["album"])
-    if info.get("track_number"):
-        tags["meta_track"] = str(info["track_number"])
-    tags["meta_date"] = _year(info)
-    return {k: v for k, v in tags.items() if v}
-
+# ---------- yt-dlp keep path ----------
 
 class _MusicTagsPP(PostProcessor):
     def run(self, info):
@@ -274,7 +207,6 @@ def _run_ytdlp(job):
     job["file"] = requested.get("filepath")
     job["title"] = info.get("title") or job["title"]
     job["percent"] = 100
-    job["status"] = "done"
     history.add({
         "id": job["video_id"],
         "title": job["title"],
@@ -283,6 +215,10 @@ def _run_ytdlp(job):
         "thumb": f"https://i.ytimg.com/vi/{job['video_id']}/mqdefault.jpg",
         "file": job["file"],
     })
+    # What the file was tagged with (_MusicTagsPP is deterministic); the post steps look lyrics up by it.
+    tags = music_tags(info)
+    return {"title": tags.get("meta_title") or job["title"], "artist": tags.get("meta_artist") or "",
+            "album": tags.get("meta_album") or "", "duration": _length(job["file"]) or info.get("duration")}
 
 
 # ---------- generic keep path (non-YouTube sources): fetch, ffmpeg, mutagen ----------
@@ -440,7 +376,7 @@ def _run_generic(job):
         _convert(raw, entry.get("ext"), out)
         cover, cover_mime = _cover_bytes(src, native)
         _tag(out, title, artist, album, cover, cover_mime, info.get("isrc") or "")
-        length = getattr(getattr(MutagenFile(out), "info", None), "length", None)
+        length = _length(out)
         dest = DOWNLOAD_DIR / f"{_filename(title)}.{ext}"
         part = dest.with_name(dest.name + ".part")
         shutil.move(str(out), str(part))  # may cross filesystems (tmp -> shared storage)
@@ -463,17 +399,57 @@ def _run_generic(job):
         "file": job["file"],
         "source": key,
     })
-    job["status"] = "done"
+    return {"title": title, "artist": artist, "album": album, "duration": info.get("duration") or length}
+
+
+def _length(path):
+    try:
+        return getattr(getattr(MutagenFile(path), "info", None), "length", None)
+    except Exception:
+        return None
+
+
+# ---------- after the keep: loudness and lyrics, best effort ----------
+
+def _post_steps(job, meta):
+    """Gain tags, then lyrics, on the final file. Each step only warns on failure: the track is already kept."""
+    path, tid = job["file"], job["video_id"]
+    gain_db = found = None
+    t0 = time.monotonic()
+    if config.REPLAYGAIN and path:
+        try:
+            m = loudness.measure(path)
+            if m and loudness.tag(path, m):
+                gain_db = loudness.track_gain(m["lufs"])
+        except Exception as e:
+            print(f"reef: loudness skipped for {tid}: {type(e).__name__}: {str(e)[:200]}")
+    t1 = time.monotonic()
+    try:
+        found = lyrics.for_track(tid, meta["title"], meta["artist"], meta.get("album") or None, meta.get("duration"))
+        if found and path and not lyrics.embed(path, found) and (found["synced"] or found["plain"]):
+            print(f"reef: lyrics found for {tid} but not embedded in {os.path.basename(path)}")
+    except Exception as e:
+        print(f"reef: lyrics skipped for {tid}: {type(e).__name__}: {str(e)[:200]}")
+    kind = None
+    if found:
+        kind = "synced" if found.get("synced") else "plain" if found.get("plain") else "instrumental"
+    try:
+        history.update(tid, lyrics=kind, gain_db=gain_db)
+    except Exception as e:
+        print(f"reef: couldn't record lyrics/gain for {tid}: {e}")
+    print(f"keep-post id={tid} loudness_ms={int((t1 - t0) * 1000)} lyrics_ms={int((time.monotonic() - t1) * 1000)} "
+          f"lyrics={kind} gain_db={gain_db}")
+
 
 def _run(job):
     job["status"] = "downloading"
     try:
         DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
         TMP_DIR.mkdir(parents=True, exist_ok=True)
-        if job["source"] == "yt":
-            _run_ytdlp(job)
-        else:
-            _run_generic(job)
+        meta = _run_ytdlp(job) if job["source"] == "yt" else _run_generic(job)
+        job["status"] = "converting"  # still busy: the post steps below rewrite the file's tags
+        _post_steps(job, meta)
+        job["status"] = "done"
         job["rescanned"] = navidrome.rescan()
     except Exception as e:
         job["status"] = "error"

@@ -50,6 +50,12 @@ INVIDIOUS_INSTANCES = [u.strip().rstrip("/") for u in os.environ.get("REEF_INVID
 YT_CLIENT = [c.strip() for c in os.environ.get("REEF_YT_CLIENT", "").split(",") if c.strip()]
 # Cut SponsorBlock segments (non-music, sponsor, intro, outro) out of kept YouTube tracks.
 SPONSORBLOCK = os.environ.get("REEF_SPONSORBLOCK", "0").strip() == "1"
+# LRCLIB lyrics cache. Defaults next to history.json, so a scratch REEF_HISTORY_FILE keeps it out of the repo too.
+LYRICS_FILE = Path(os.environ.get("REEF_LYRICS_FILE") or HISTORY_FILE.with_name("lyrics.json"))
+# Also write synced lyrics as a `<file>.lrc` sidecar next to each kept track (the tag alone is enough for Navidrome).
+LRC_SIDECAR = os.environ.get("REEF_LRC_SIDECAR", "0").strip() == "1"
+# Measure loudness (ffmpeg ebur128) of each kept track and write ReplayGain / R128 gain tags.
+REPLAYGAIN = os.environ.get("REEF_REPLAYGAIN", "1").strip() == "1"
 
 
 def _ydl_extra(raw):

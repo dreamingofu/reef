@@ -99,3 +99,33 @@ def cover_art(cover_id, size=300):
     )
     r.raise_for_status()
     return r.content, r.headers.get("Content-Type", "image/jpeg")
+
+
+def _lrc_stamp(ms):
+    ms = max(0, int(ms))
+    return f"[{ms // 60000:02d}:{ms // 1000 % 60:02d}.{ms % 1000 // 10:02d}]"
+
+
+def lyrics(song_id):
+    """{"synced", "plain", "instrumental": False} from OpenSubsonic getLyricsBySongId, or None when the song
+    has none or the server predates the extension. Synced lines come back as LRC text, so the client
+    parses one format whether lyrics came from here or LRCLIB."""
+    if not configured():
+        return None
+    try:
+        body = _call("getLyricsBySongId", id=song_id)
+        entries = [e for e in (body.get("lyricsList") or {}).get("structuredLyrics") or []
+                   if isinstance(e, dict) and isinstance(e.get("line"), list) and e["line"]]
+        synced = next((e for e in entries if e.get("synced")), None)
+        if synced:
+            # OpenSubsonic: a positive offset makes lyrics appear sooner, same as LRC's [offset:].
+            offset = float(synced.get("offset") or 0)
+            text = "\n".join(_lrc_stamp(float(ln["start"]) - offset) + str(ln.get("value") or "").strip()
+                             for ln in synced["line"] if isinstance(ln, dict) and ln.get("start") is not None)
+            return {"synced": text, "plain": None, "instrumental": False} if text else None
+        if entries:
+            text = "\n".join(str(ln.get("value") or "") for ln in entries[0]["line"] if isinstance(ln, dict)).strip()
+            return {"synced": None, "plain": text, "instrumental": False} if text else None
+    except Exception:
+        return None
+    return None

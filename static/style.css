@@ -366,6 +366,44 @@ body:not(.is-playing) .np-art { transform: scale(.86); }
 .round { width: 52px; height: 52px; border-radius: 50%; display: grid; place-items: center; color: var(--text); }
 .round.kept { color: var(--accent); }
 .round.pending { opacity: .6; }
+.round.glass[aria-pressed="true"] { background: rgba(255, 255, 255, .92); color: #000; }
+
+/* lyrics: replaces the artwork (same flexible slot), so the title row, seek bar and controls stay put */
+.np-lyrics {
+  display: none; flex: 1; min-height: 0; position: relative; margin: 8px -6px 14px; padding: 0 6px;
+  overflow-y: auto; overscroll-behavior: contain; touch-action: pan-y; scrollbar-width: none;
+  container-type: size;
+  -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 11%, #000 80%, transparent 100%);
+  mask-image: linear-gradient(to bottom, transparent 0, #000 11%, #000 80%, transparent 100%);
+}
+.np-lyrics::-webkit-scrollbar { display: none; }
+.np.show-lyrics .np-art-wrap { display: none; }
+.np.show-lyrics .np-lyrics { display: block; }
+/* room above the first line (out of the top fade) and below the last, so it can still rise to the 1/3 mark */
+.lyr { padding: 64px 0 260px; }
+.lyr-line, .lyr p {
+  display: block; width: 100%; text-align: left; padding: 7px 0;
+  font-size: clamp(22px, 6.4vw, 30px); font-weight: 700; line-height: 1.24; letter-spacing: -.022em;
+  overflow-wrap: anywhere;
+}
+.lyr-line { color: rgba(255, 255, 255, .34); transition: color .35s ease, opacity .35s ease; }
+.lyr-line.on { color: #fff; }
+.lyr-line.gap { font-size: 20px; }
+.lyr.plain p { color: rgba(255, 255, 255, .88); }
+.lyr.plain p.gap { padding: 0; height: 18px; }
+.lyr-msg { height: 100%; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px; color: var(--faint); font-size: 17px; font-weight: 600; text-align: center; }
+.lyr-msg.instrumental { color: var(--text); font-size: 22px; font-weight: 700; }
+.lyr-msg .i { width: 30px; height: 30px; color: var(--faint); }
+.lyr-sk { padding-top: 64px; display: flex; flex-direction: column; gap: 22px; }
+.lyr-sk i { display: block; height: 24px; opacity: .7; }
+.lyr-sk i:nth-child(1) { width: 78%; }
+.lyr-sk i:nth-child(2) { width: 62%; }
+.lyr-sk i:nth-child(3) { width: 86%; }
+.lyr-sk i:nth-child(4) { width: 54%; }
+@supports (height: 1cqh) {
+  .lyr { padding: 13cqh 0 62cqh; }
+  .lyr-sk { padding-top: 13cqh; }
+}
 
 /* status sheet */
 .sheet-wrap { position: fixed; inset: 0; z-index: 60; }
@@ -407,6 +445,8 @@ body:not(.is-playing) .np-art { transform: scale(.86); }
   .row.playing:hover { background: var(--surface); }
   .tab:hover { color: var(--text); }
   .tab.active:hover { color: var(--accent); }
+  .lyr-line:hover { color: rgba(255, 255, 255, .6); }
+  .lyr-line.on:hover { color: #fff; }
 }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }
