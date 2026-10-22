@@ -1751,6 +1751,7 @@ ART_MIN, ART_MAX = 64, 1000
 ART_TINY = 128
 ART_TINY_BYTES = 512 * 1024  # bigger upstream images aren't proxied (the redirect is kept)
 ART_TINY_KEEP = 400  # tiny images kept in memory (a 64 px YT Music cover is ~2-4 KB, a mqdefault ~15 KB)
+ART_TINY_BUDGET = 16 * 1024 * 1024  # ...and at most this many payload bytes of them (400 x 512 KB would be 200 MB)
 _tiny_art = OrderedDict()  # upstream url -> (bytes, mime)
 _tiny_lock = threading.Lock()
 _art_session = requests.Session()
@@ -1783,9 +1784,11 @@ def _tiny_bytes(url, redirects=True):
         return None
     hit = (bytes(buf), mime)
     with _tiny_lock:
-        _tiny_art[url] = hit
-        while len(_tiny_art) > ART_TINY_KEEP:
-            _tiny_art.popitem(last=False)
+        _tiny_art[url] = hit  # a concurrent fill of the same url replaces it, never adds to it
+        _tiny_art.move_to_end(url)
+        kept = sum(len(data) for data, _ in _tiny_art.values())  # at most ART_TINY_KEEP + 1 entries
+        while len(_tiny_art) > ART_TINY_KEEP or kept > ART_TINY_BUDGET:
+            kept -= len(_tiny_art.popitem(last=False)[1][0])
     return hit
 
 
