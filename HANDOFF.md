@@ -1,6 +1,6 @@
 # Reef — handoff notes (resume on another machine)
 
-Last updated: 2026-10-22 (Round 16, UI remake step 3).
+Last updated: 2026-10-22 (Round 16, UI remake step 4).
 
 ## What's running
 
@@ -859,6 +859,62 @@ Settings / Stats / Recap screens. Prerequisite: serve Reef over HTTPS with `tail
   2 / 5 px blur on up to 8 rows plus the static background blur stays smooth while rows glide; momentum scroll → Resync
   timing; `background-clip: text` rendering of word gradients (and the glow) in Safari; the open transition at 60 fps;
   single tap on art vs double-tap seek feel; safe areas of the pill / bar in the Home Screen app.
+
+### UI remake step 4: Sheets (2026-10-22, uncommitted on `dreamingofu/codebase-overview-and-risk`)
+
+- `sheet-core` (`SH` in `static/app.js`, node check `scratchpad/u4/sheet_core_check.js`): the track menu's item rules
+  (`menuModel`, `canFix`, `fixKey`), row swipe thresholds (115 px or 45% of the row, flick 900 px/s past the 60 px band),
+  swipe prefs, sheet drag-to-dismiss (min(140 px, 35%) or a 700 px/s flick), sleep timer numbers (clock parts, steppers,
+  +5 min capped at 12 h) and Song info formatting.
+- **Sheet system**: one stack (`sheetStack`; each sheet above the last, z-index 60 + depth), Escape / scrim close the top
+  one, focus moves into a sheet and back to its opener (or the same song's ⋯ after a list repaint), Tab wraps in the
+  top sheet, the top of every sheet drags it down (pointer events via `drag()`, rubber up), touchmove outside a
+  sheet's scrolling parts (`[data-scroll]`, `.sheet-body`) is cancelled so the page behind can't scroll, 40 × 4
+  grabbers. Reduced motion: sheets fade, sub-pages swap, rows jump back.
+- **Track menu** (§8.1): a floating card (inset 10, radius 24, scrim .72, max 85% height, ✕) tinted with the song's
+  cover (`--c-*` set on the card from `paletteFor`; neutral for Accent only / Pure black). Header: 56 px art, title,
+  artist, source badge (YouTube / Monochrome · FLAC / Library / Not matched yet / Replacement), Share + Info. Quick grid
+  (3 columns, 2 for 2 or 4 tiles): Play next · Add to queue (Remove from the queue) · Start radio · Keep (In library /
+  Keeping…) · Add to playlist · Like (Liked). Joined groups: Go to (artist; a picker sub-page with several; album, not on
+  that album's own page) · Recommendations (Not interested, Hide <artist>; both toast with Undo) · More (Song info, Fix
+  wrong match, Copy link, Open on YouTube, Player background in the player). Placeholders get Play next / Add to queue /
+  Song info / Fix only; library (`nd:`) tracks no radio / dislike / copy / fix; Monochrome no radio / copy. Add to
+  playlist is a sub-page with an inline "New playlist" field (no `prompt()`; Save as playlist in Up next still prompts).
+  Opens from ⋯ (search, Home cards / Quick picks, album / artist / playlist / import pages, Kept songs), a 500 ms long
+  press on any song row, card, poster, top result or Up next row (the release's click is swallowed; right-click too),
+  and Now Playing's ⋯ / long-press Like (straight to the playlist picker). Play next / Add to queue from the menu and
+  from swipes toast with Undo (the song leaves the queue again, or goes back where it was).
+- **Row swipes** (§8.2) on `.rows > .row.trk` (not the Quick picks grid, which scrolls sideways; `touch-action: pan-y`):
+  default right = Play next, left = Add to queue; Server sheet → Row swipes picks Next / Queue / Like / Keep / Off per
+  direction (`reef.swipe`). A coloured band with the icon opens under the row, the label shows once armed; an action
+  that can't apply (the playing song, a placeholder's Like / Keep, a kept song's Keep) only resists. A mouse drag on a
+  row's link / art no longer starts a native drag (it ended swipes and presses).
+- **Song info** (§8.3): Details, Technical, Ids (copy buttons), Copy link / YouTube. New `GET /api/stream/<id>/info`
+  never resolves: the resolve cache's codec / bitrate / sample rate / size / client (YouTube resolves now record
+  yt-dlp's `acodec` / `abr` / `asr`; an itag table fills older entries), the kept file (path relative to the music
+  folder, format, size, codec, sample rate, bits, ReplayGain via mutagen; the Monochrome upgrade of a YouTube keep
+  too), `test_audio`. Lyrics: the provider only when already loaded (no lookup).
+- **Fix wrong match** (§8.4): for placeholders, songs an import / the placeholder lookup matched (they now carry
+  `mkey`, the match key, through `slim`), dead-track replacements, and the song in the player / queue. Paste a YouTube /
+  YT Music link, or pick from new `POST /api/match/candidates` (key + current pin + YT Music's top 5 with raw and
+  ranked scores; the key comes back even when the search fails). `PUT /api/match/<key>` pins it; the queue entry is
+  swapped in place (the current one plays on), an import page refetches (its row materialises).
+- **Sleep timer** (§8.5): 15/30/45/60 chips, End of this song, Custom hour / minute steppers (`reef.sleepCustom`);
+  running: Pausing at <time>, HH:MM:SS boxes (only the digits update, once a second while open), progress bar, +5 min,
+  Stop, Change the timer. The Now Playing toggle shows minutes left inside a ring of the share left. The deadline
+  logic (wall clock, 5 s checks, fade where volume works) is unchanged.
+- **Check on the iPhone**: long press vs iOS text selection / link previews (`-webkit-touch-callout: none` on rows,
+  cards); row swipes vs vertical scrolling and Safari's back swipe; sheet drag-down from the header card vs taps on
+  Share / Info; the touchmove guard (no page scroll behind sheets, lists inside still scroll); `inert` sub-pages and
+  focus return with VoiceOver; copy buttons over plain http (textarea fallback inside the tap).
+
+### API shapes (step 4)
+
+- `GET /api/stream/<id>/info` → `{id, source, stream: {client, itag, mime, ext, codec, bitrate (kbps), sample_rate,
+  duration, size, ttl_s} | null, kept: {id, kept_at, nd_id, upgraded_from, file?, format?, exists?, size?, codec?,
+  bitrate?, sample_rate?, bits?, channels?, length?, replaygain?} | null, test_audio}`; 404 for a malformed id.
+- `POST /api/match/candidates {title, artist?, duration?, album?, key?, q?}` → `{key, pinned (track) | null,
+  candidates: [{track, score, ranked}], error?}`; 400 bad input.
 
 ## Ideas / next steps
 

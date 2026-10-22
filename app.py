@@ -11,12 +11,14 @@ import time
 from collections import OrderedDict
 from datetime import timedelta
 from datetime import timezone as dt_timezone
+from pathlib import Path
 from urllib.parse import parse_qs, parse_qsl, quote, urlsplit, urlunsplit
 from zoneinfo import ZoneInfo
 
 import requests
 import yt_dlp
 from flask import Flask, Response, abort, jsonify, redirect, render_template, request, send_file
+from mutagen import File as MutagenFile
 from werkzeug.exceptions import BadRequest, RequestEntityTooLarge
 
 import aliases
@@ -507,6 +509,44 @@ def api_match_fix(key):
     return _match_body({**track, **entry["track"]}, None, key, True, False)
 
 
+CANDIDATES_MAX = 5
+
+
+@app.post("/api/match/candidates")
+def api_match_candidates():
+    """"Fix wrong match" (UI_REMAKE_PLAN §8.4): {title, artist?, duration?, album?, key?, q?} -> {key, pinned
+    (the manual fix for `key`, or null), candidates: [{track, score, ranked}] (YouTube Music's top 5 for `q`, else
+    title + artist, scored like /api/match: `score` raw, `ranked` minus the version-word penalty, which orders them),
+    error?}. The key and pin come back even when the search fails."""
+    body = request.get_json(silent=True)
+    query = _match_query(body)
+    if not query:
+        return jsonify({"error": "title is required (artist and album must be text)"}), 400
+    key = body.get("key")
+    if key is not None and not matching.valid_key(key):
+        return jsonify({"error": f"key must be 1-{matching.KEY_MAX} printable characters without /"}), 400
+    key = key or matching.key_for(query["title"], query["artist"])
+    hit = matching.cached(key)
+    pinned = _mark_kept([dict(hit["track"])])[0] if hit and hit.get("manual") and hit.get("track") else None
+    out = {"key": key, "pinned": pinned, "candidates": []}
+    q = _hint(body.get("q")) or matching.search_text(query)
+    if not ytmusic.enabled():
+        return jsonify({**out, "error": "YouTube Music is off"})
+    try:
+        found = blocklist.filter_tracks(ytmusic.search(q, MATCH_LIMIT))
+    except Exception as e:
+        return jsonify({**out, "error": errors.payload(e).get("error") or "YouTube Music didn't answer"})
+    scored = []
+    for k, c in enumerate(found or []):
+        if isinstance(c, dict) and store.track_id(c.get("id")):
+            raw, ranked = matching.score(query, c)
+            scored.append((ranked, -k, raw, c))
+    scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    tracks = _mark_kept([dict(x[3]) for x in scored[:CANDIDATES_MAX]])
+    out["candidates"] = [{"track": t, "score": x[2], "ranked": max(0.0, x[0])} for t, x in zip(tracks, scored)]
+    return jsonify(out)
+
+
 @app.post("/api/replace")
 def api_replace():
     """{track, exclude?: [ids], key?} for a track that can't play (GONE / REGION / MEMBERS_OR_PAID) -> the same song
@@ -757,6 +797,75 @@ def api_stream(track_id):
         return streamer.proxy(t[1], fresh=fresh if fresh not in ("", "0") else None)
     except Exception as e:
         return jsonify(errors.payload(e)), 502
+
+
+def _file_info(path):
+    """A kept file's format for Song info: {file (relative to the music folder), format, size, codec, bitrate (kbps),
+    sample_rate, bits, channels, length, replaygain}. Local reads only; missing parts are left out."""
+    p = Path(str(path))
+    try:
+        rel = str(p.relative_to(config.MUSIC_DIR))
+    except ValueError:
+        rel = p.name
+    out = {"file": rel, "format": p.suffix.lstrip(".").lower() or None, "exists": p.is_file()}
+    if not out["exists"]:
+        return out
+    try:
+        out["size"] = p.stat().st_size
+        f = MutagenFile(str(p))
+    except Exception:
+        return out
+    meta = getattr(f, "info", None)
+    if meta is not None:
+        codec = getattr(meta, "codec", None) or type(meta).__module__.rsplit(".", 1)[-1]
+        out["codec"] = str(codec).split(".")[0].lower() or None
+        for key, attr in (("sample_rate", "sample_rate"), ("bits", "bits_per_sample"), ("channels", "channels")):
+            v = getattr(meta, attr, None)
+            if isinstance(v, int) and v > 0:
+                out[key] = v
+        br = getattr(meta, "bitrate", None)
+        if isinstance(br, (int, float)) and br > 0:
+            out["bitrate"] = round(br / 1000)
+        length = getattr(meta, "length", None)
+        if isinstance(length, (int, float)) and length > 0:
+            out["length"] = round(length, 2)
+    tags = getattr(f, "tags", None)
+    if tags is not None:
+        for k in ("REPLAYGAIN_TRACK_GAIN", "replaygain_track_gain", "TXXX:REPLAYGAIN_TRACK_GAIN",
+                  "----:com.apple.iTunes:replaygain_track_gain"):
+            try:
+                v = tags.get(k)
+            except Exception:
+                v = None
+            if v:
+                v = v[0] if isinstance(v, list) else getattr(v, "text", [v])[0]
+                out["replaygain"] = (v.decode() if isinstance(v, bytes) else str(v))[:32]
+                break
+    return out
+
+
+@app.get("/api/stream/<track_id>/info")
+def api_stream_info(track_id):
+    """Song info's technical part (UI_REMAKE_PLAN §8.3) without touching the network: what the resolve cache knows
+    about the stream (codec, bitrate, sample rate, client; null when it isn't cached), the kept file (path, format,
+    size, codec, ReplayGain) and whether test audio stands in for it."""
+    if not isinstance(track_id, str) or not TRACK_ID.match(track_id):
+        abort(404)
+    key, native = sources.parse(track_id)
+    if key == "yt" and not VIDEO_ID.match(native):
+        abort(404)
+    tid = sources.track_id(key, native)
+    entry = _kept_entry(tid)
+    kept = None
+    if entry:
+        kept = {"kept_at": entry.get("kept_at"), "nd_id": entry.get("nd_id"), "upgraded_from": entry.get("upgraded_from"),
+                "id": entry.get("id")}
+        if entry.get("file"):
+            kept.update(_file_info(entry["file"]))
+    nd_id = (entry or {}).get("nd_id")
+    stream = streamer.info(tid) or (streamer.info(f"nd:{nd_id}") if nd_id else None)
+    return jsonify({"id": tid, "source": key, "stream": stream, "kept": kept,
+                    "test_audio": testaudio.covers(key)})
 
 
 @app.post("/api/yt/reset")

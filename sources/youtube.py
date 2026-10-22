@@ -263,6 +263,10 @@ def _extract(video_id, turn=None):
             "mime": _MIME.get(fmt.get("ext"), "application/octet-stream"),
             "ext": fmt.get("ext"),
             "duration": info.get("duration"),
+            # what Song info shows (UI_REMAKE_PLAN §8.3): yt-dlp's view of the chosen format
+            "codec": (fmt.get("acodec") or "").split(".")[0] or None,
+            "bitrate": fmt.get("abr") or fmt.get("tbr"),
+            "sample_rate": fmt.get("asr"),
         }
     if preview is not None:
         raise errors.StreamError("MEMBERS_OR_PAID", f"only a preview is available for {video_id}")

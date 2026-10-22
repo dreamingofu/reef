@@ -154,6 +154,9 @@ def _extract(track_id, foreground):
         "mime": entry.get("mime"),
         "ext": entry.get("ext"),
         "duration": _num(entry.get("duration"), float) or meta["dur"],
+        "codec": entry.get("codec") if isinstance(entry.get("codec"), str) else None,
+        "bitrate": _num(entry.get("bitrate"), float),
+        "sample_rate": _num(entry.get("sample_rate")),
         "client": meta["client"],
         "has_pot": meta["has_pot"],
         "itag": meta["itag"],
@@ -368,6 +371,30 @@ def stats():
                    "ttl_s": int(e["expires"] - now), "duration": e["duration"]}
                   for tid, e in list(_cache.items())[-10:]]
         return {"entries": len(_cache), **_stats, "recent": recent}
+
+
+# YouTube audio itags -> (codec, kbps, Hz), for entries whose source didn't say (fallback resolvers).
+_ITAGS = {"139": ("aac", 48, 22050), "140": ("aac", 128, 44100), "141": ("aac", 256, 44100),
+          "249": ("opus", 50, 48000), "250": ("opus", 70, 48000), "251": ("opus", 160, 48000),
+          "18": ("aac", 96, 44100)}
+_EXT_CODEC = {"flac": "flac", "opus": "opus", "webm": "opus", "mp3": "mp3", "m4a": "aac", "ogg": "vorbis"}
+
+
+def info(track_id):
+    """What the resolve cache knows about `track_id`'s stream (Song info, §8.3), or None when it isn't cached.
+    Never resolves: no network, no yt-dlp."""
+    now = _now()
+    with _lock:
+        e = _cache.get(track_id)
+        if not e or e.get("dead"):
+            return None
+        e = dict(e)
+    guess = _ITAGS.get(str(e.get("itag") or ""), (None, None, None))
+    bitrate = e.get("bitrate") or guess[1]
+    return {"client": e.get("client"), "itag": e.get("itag"), "mime": e.get("mime"), "ext": e.get("ext"),
+            "codec": e.get("codec") or guess[0] or _EXT_CODEC.get(e.get("ext") or ""),
+            "bitrate": round(bitrate) if bitrate else None, "sample_rate": e.get("sample_rate") or guess[2],
+            "duration": e.get("duration"), "size": e.get("clen"), "ttl_s": max(0, int(e["expires"] - now))}
 
 
 # ---------- fragmented MP4 duration fix ----------
