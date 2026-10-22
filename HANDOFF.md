@@ -1,8 +1,8 @@
 # Reef — handoff notes (resume on another machine)
 
-Last updated: 2026-10-22 (Round 16, UI remake step 5, audit batches 1-6 accepted by the root and committed locally;
+Last updated: 2026-10-22 (Round 16, UI remake step 5, audit batches 1-7 accepted by the root and committed locally;
 batch 3 = credentials / API / CSRF, batch 4 = updater health auth, batch 5 = JS proof in CI, batch 6 = frontend
-async correctness).
+async correctness, batch 7 = tiny-art cache byte budget). The required audit / refactor work is complete.
 
 ## CURRENT supervision (read first; 2026-10-22, written for a session rotation)
 
@@ -11,6 +11,7 @@ async correctness).
   - Root acceptance allows a local commit only. No push, deploy or U6 is authorized (not even after acceptance)
     unless the owner says so.
   - No real services, phone, secrets, permissions or model changes.
+  - **Status: complete.** All required batches (B1-B7) are accepted and committed; see Completion below.
 - **Commits on `dreamingofu/codebase-overview-and-risk`** (local only, none pushed):
   - U5 `bd5014d`.
   - Batch 1 `8fc8de93c619e1e674ade79fd5e2fe8eead4a698`.
@@ -18,12 +19,21 @@ async correctness).
   - Batch 3 `4fbc2ea09c98d98602573910e0f8d3f7d116365d` (accepted clean base of batch 4).
   - Batch 4 `e920c5714c7bc19e8c484e5cc0e29d6e04feaec4` (accepted clean base of batch 5).
   - Batch 5 `afbcffeb5c535a59669784612193a25a51a5b2f8` (accepted clean base of batch 6).
-  - Batch 6: the local commit directly on top of `afbcffeb5c535a59669784612193a25a51a5b2f8` that adds this text
-    (`git log -1`; its hash is in the milestone's worker_done report to the root).
+  - Batch 6 `4f87f8bc7dc2108495820d7b57a8abe5055c9417` (accepted clean base of batch 7).
+  - Batch 7 `3fb3a90519a1969eef9debd869013bbcffa82d34` (art cache byte budget, parent `4f87f8b`; `app.py` +
+    `tests/test_artcache.py` only).
+  - Final documentation milestone: the local commit directly on top of `3fb3a90` that adds this text (`HANDOFF.md`
+    only; `git log -1`; its hash is in the milestone's worker_done report to the root).
 - **Who's working**:
   - Root coordinator: `term_d76429bc-6214-450e-8f42-08b9079686d6`, sole supervisor and sole review / acceptance owner of
     Run `run_644fd9908c5b` generation 4 (replaced generation 3's `term_3c425302-cae4-4be9-97c0-cb65b1ba1535`).
-  - Claude writer (batch 6): `term_0f126efc-cb50-4555-a543-c524e4c799da`, sole writer of Task `task_fd512d52fe1c` /
+  - Claude writer (batch 7): `term_a04672b3-ae4f-4038-a702-8e1fffe71717`, sole writer of Task `task_e8438201fabe` /
+    Dispatch `ctx_ff17d4d9ba8a` (art cache byte budget, base `4f87f8bc7dc2108495820d7b57a8abe5055c9417`; settled),
+    then the final milestone Task `task_aa16cca11953` / Dispatch `ctx_6d49e79e35f1` (the batch 7 commit of `app.py`
+    and `tests/test_artcache.py`, then this file's final commit, nothing else). After that commit this Claude
+    **positively relinquishes checkout writer ownership** and idles (tab kept, shell open). No writer work follows.
+  - Previous Claude writer (batch 6): `term_0f126efc-cb50-4555-a543-c524e4c799da`, relinquished writer ownership after
+    the batch 6 commit and idles (tab kept). It was the sole writer of Task `task_fd512d52fe1c` /
     Dispatch `ctx_90a49cc91a95` (frontend correctness, base `afbcffeb5c535a59669784612193a25a51a5b2f8`), then the
     root review repair Task `task_1af4fce8fc0b` / Dispatch `ctx_f45a568106c1` and the search follow-up Task
     `task_6754636a7a42` / Dispatch `ctx_a9fbd9e30396` (all settled), then this milestone Task `task_3dcc97804933` /
@@ -31,7 +41,7 @@ async correctness).
     `tests/js/app-async.test.js`, `HANDOFF.md`, nothing else). After that commit this Claude **relinquishes
     checkout writer ownership** and idles (tab kept, shell open). A fresh Claude owns the next batch only after the
     root confirms its readiness and sends a new Dispatch. No duplicate writers.
-  - Batches 1-6 are closed (accepted, committed); their proof stands and isn't re-reviewed or re-run.
+  - Batches 1-7 are closed (accepted, committed); their proof stands and isn't re-reviewed or re-run.
   - Previous Claude writer `term_52e489b5-69d0-4ab7-bf9e-78308462b9b3` relinquished writer ownership after the batch 5
     commit and idles (tab kept).
     - Settled batch 5 Task `task_c3403283cf1f` / Dispatch `ctx_5b4db1c2fe75` (JS proof in CI, on base
@@ -50,7 +60,8 @@ async correctness).
       `e920c5714c7bc19e8c484e5cc0e29d6e04feaec4`), after which it relinquished writer ownership.
   - Old Claude `term_62492f92-3dea-4cc5-ac14-f76f76a4bdb7` relinquished writer ownership and stays idle (settled Tasks
     `task_a93a61d0b573` batch 1, `task_e630e35fb597` / `task_dd2cff493c45` batch 2, `task_3035a994e8c6` milestone).
-  - No browser or server is running (the root closed its scratch WebKit browser and QA server).
+  - All prior Claude writers stay idle with their tabs kept. No browser or server is running (the root closed its
+    scratch WebKit browsers and QA servers).
 - **Audit**: `/tmp/reef-codebase-audit-20261022.md`, report plus a superseding ADDENDUM. Don't redo the survey.
   - Root-confirmed findings:
     - F1 / F5 / F6 / F7 / F11 (synthetic repros);
@@ -258,27 +269,49 @@ async correctness).
     restore) keep their old last-answer-wins behavior. An old pick's error toast still shows after a reopen; an old
     pick's success is silent. Restored `matches` don't re-resolve placeholders already in the queue. Every read that calls
     `noteKept` (Home, pages, search, chip lists, refetch) is now restore-gated; mutation replies aren't (by design).
-- **Next work for a fresh root / Claude** (one bounded batch each, regressions first, no guessed
-  rewrites, no survey redo, features, U6, deploy, push, phone, real services, or default / model / credential /
-  permission changes):
-  1. **Frontend correctness**: done, accepted and committed as batch 6 above; the notes below were its brief.
-     - ROOT3-confirmed double-selection race: `/tmp/reef-codex-refactor-20261022/pin-double-root3.cjs` runs the
-       actual `pinFix`. Two selections waiting on the same pending key issue TWO PUTs (`first-pick`, then
-       `second-pick`): `busy` is set after the await, with no recheck. The frontend batch needs a committed
-       regression for it. Not fixed in batch 5.
-     - U-a: `api()` must reject an invalid 2xx JSON body instead of returning `{}`.
-     - Root-confirmed (`/tmp/reef-codex-refactor-20261022/frontend-before.cjs` runs the actual functions):
-       - `pinFix` has an async target race. An old selection waiting on a pending key POSTs under the new target's
-         key after the target switches, and `applyFix` attaches the wrong key. The mutable `fix.key` is also read
-         after an API await.
-       - A successful restore refreshes settings / history / blocklist / Home but not likes / playlists. Cached
-         detail and lyrics may need scoped invalidation that keeps playback going.
-     - Add regressions first.
-  2. **First remaining required task: U-b art byte budget (justified).** Root mocked 33 valid 512 KiB responses:
-     17,301,504 bytes retained; the 400-entry count alone allows 209,715,200 bytes. Keep the 400-entry count limit and
-     add a 16 MiB byte budget alongside it, with race-safe accounting. Scope: `app.py` and tests only.
-  3. **Only with evidence:** F10 (finished-job cap) if shown necessary. J1–J3 / U-c / U-d performance and gesture
-     hypotheses need measurements first. No cosmetic whole-file splits.
+- **Batch 7 (U-b: tiny-art cache byte budget)**: **accepted by the root** (generation 4) after its independent review
+  (no blockers), committed locally as `3fb3a90519a1969eef9debd869013bbcffa82d34` on `4f87f8b`. Changed: `app.py`
+  (the tiny-art constants and the insert in `_tiny_bytes` only), new `tests/test_artcache.py`.
+  - `ART_TINY_BUDGET = 16 MiB` beside the unchanged `ART_TINY_KEEP = 400`. On insert, under `_tiny_lock`: the entry is
+    set (a same-url fill replaces, never adds) and moved to most recent; the retained payload total is summed from
+    the entries (at most 401, so no persistent counter to drift after the tests' `_tiny_art.clear()`); least recent
+    entries are dropped while count > 400 or bytes > budget. Hits still refresh LRU order. The fetch stays outside
+    the lock. The fetched (bytes, mime) is always returned, even when it isn't kept (only possible if one image were
+    bigger than the budget). Per-response 512 KiB cap, status / mime checks, redirects / `/api/thumb` no-redirect and
+    off-origin behavior unchanged; failures still cache nothing.
+  - `tests/test_artcache.py` (9 tests): real defaults with 33 × 512 KiB (all returned, ≤ 32 kept, ≤ 16,777,216 bytes,
+    the oldest evicted); byte vs count boundary with hits refreshing LRU (KEEP 4, budget 10 bytes); one image over
+    the budget is served but not kept; 404 / text/html / oversize / OSError leave a filled cache unchanged (4 cases);
+    concurrent fills (4 fills of one URL with different lengths + 4 new URLs, all released together by a
+    `threading.Barrier(timeout=5)` inside the fetch, joins bounded at 10 s) with real defaults over a 15.5 MiB prefill,
+    and with KEEP 3 / 40 bytes: each caller gets the bytes its own fetch read, both limits hold, a retained same-url
+    entry is one of the fetched payloads, and a later fill still keeps both limits.
+  - Before (accepted base, 3 runs, identical): 5 failed / 4 passed (failure cases are preserved behavior).
+    Assertions: `33 <= 32` (count of 33 × 512 KiB); `['b', 'c', 'a', 'd'] == ['c', 'a', 'd']` (no byte eviction);
+    `4 <= 3` (over-budget image kept); `17188864 <= 16777216` (concurrent, defaults); `52 <= 40` (concurrent, small).
+  - After, checks by Claude: `.venv/bin/python -m pytest -q tests/test_artcache.py tests/test_ui_foundation.py
+    tests/test_discovery_ui.py` → 72 passed (existing art / thumb proxy, redirect and bounded-memory tests included);
+    the two concurrent cases re-run 20 times, all passed; `.venv/bin/ruff check .` and `git diff --check` clean. Full
+    pytest and node not re-run by Claude (the root runs them at acceptance).
+  - Root acceptance checks (root generation 4, on the exact working code):
+    - `.venv/bin/python -m pytest -q` → 1159 passed / 1 deselected (47.97 s); `node --test --test-reporter=dot
+      tests/js/` → 210 passed; `node --check static/app.js`, `.venv/bin/ruff check .`, `git diff --check` pass;
+    - accepted blobs: `app.py` `0f1f836839c9b33e255bb4da4a8ff65dc0dacf00`, `tests/test_artcache.py`
+      `5efe572c32bf7b8a219ae90d9bde5794928820c7` (the committed blobs);
+    - independent `/tmp/reef-codex-refactor-20261022/art-budget-root4.py`: 33 allowed 512 KiB responses → 32 entries
+      / 16,777,216 payload bytes; 72 more concurrent fills → max observed 16,777,216, final 32 entries with the same
+      bytes, every served bytes / mime correct; no external network, stores, services or workers;
+    - Claude's 72 focused checks reused; batch 6's WebKit evidence stands (no product JS change in batch 7).
+- **Completion / remaining gaps** (root generation 4, 2026-10-22):
+  - All required, root-confirmed audit batches B1-B7 are accepted and committed locally; the scoped audit has no
+    confirmed actionable defect left. The audit / refactor supervision is complete; no further writer work planned.
+  - Deferred hypotheses (no work without new evidence): F10 (finished-job cap) stays inspection-only, with no shown
+    user-facing failure or need; J1-J3 / U-c / U-d are unmeasured performance / gesture hypotheses and don't justify
+    guessed refactors. No cosmetic whole-file splits.
+  - Not planned: features, U6, push, deploy / publication, real data, devices / phone, real services, default /
+    model / credential / permission / billing changes.
+  - Not validated (no claim of a perfect codebase): live Safari / on-device behavior, real services, performance.
+  - Root's final next action: verify the clean HEAD and the product blob hashes, then the final Orca accounting.
 - **Tooling note**: `worker-start --terminal` returns `agent_unconfigured`. The proven fallback is manual
   task-create, then `dispatch --return-preamble`, then terminal-send the exact preamble.
 
