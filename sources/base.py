@@ -29,7 +29,15 @@ class Source:
         raise NotImplementedError
 
     def forget(self, native_id):
-        """Called when a resolved URL failed upstream, before resolving it again."""
+        """Called when a resolved URL failed upstream (or the player asked for a fresh one), before resolving again."""
+
+    def failed(self, native_id, entry, verdict):
+        """A resolved URL failed upstream. `verdict` (streamer._verdict): expired | denied (403, URL still valid,
+        no PO token) | token (403 with a PO token) | missing (404/410/416) | other. Called before forget()."""
+
+    def usable(self, native_id, entry):
+        """False when a cached entry must not be reused (YouTube: its client is gated)."""
+        return True
 
     def art(self, native_id, size):
         """("redirect", url) | ("bytes", data, mime) | None."""

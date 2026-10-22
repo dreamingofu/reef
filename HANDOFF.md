@@ -69,6 +69,7 @@ Pass the Navidrome password through the environment. Don't put it in a committed
 - `search.py`: yt-dlp flat search (one shared `YoutubeDL`, video ids only). `streamer.py`: source-agnostic resolve cache
   (1 h TTL, concurrent calls for one id share one extraction, 2-thread prefetch pool that yields to the player), keep-alive
   `requests.Session`, Range proxy, per-request timing log line (`stream id=… cache=hit|wait|miss resolve_ms=… ttfb_ms=…`).
+  The proxy fetches every client range upstream as bounded pieces (2 MiB, then 4 MiB; googlevideo throttles open-ended `bytes=N-` to ~2× realtime), answers with the client's exact range, and logs `stream-body … pieces=…`.
 - `downloader.py`: in-memory job queue + worker. YouTube: yt-dlp → Opus, tags, cover, blank description. Other sources:
   fetch → ffmpeg → mutagen tags + cover. Both → `history.add` → Navidrome rescan → try to record the Navidrome cover id.
 - `history.py`: `history.json` (git-ignored); entries gain `nd_cover`/`nd_id` once Navidrome has scanned the file.
@@ -146,6 +147,18 @@ result card, Songs rows with **+**, and filter chips. Design tokens are at the t
 - Hidden artists: `blocklist.json` (`/api/blocklist`), filtered server-side from search, radio, playlists, tiles;
   managed from ⋯ → Hide artist, the artist page, and the status sheet.
 - Tap an artist name in any row (or in Now Playing) to open the artist page.
+
+## Round 8 (2026-10-22): playback reliability (production plan P0.1-P0.5)
+
+- googlevideo throttles open-ended `Range: bytes=N-` to ~32 KB/s (2× realtime); bounded ranges run at MB/s. The proxy
+  now fetches upstream in 2 MiB / 4 MiB pieces while answering the client's exact range: a 44 MB track streams in ~3 s,
+  and a 45-min track starts on iOS in ~3 s (before: never reached `loadedmetadata`).
+- Stream cache TTL comes from the URL's `expire`; 403s are classified (expiry / client denied / token) and gate that
+  client (`player_client` exclusion); same-file URL swap mid-song; mid-stream resume on dropped connections.
+- Failures are typed (`errors.py`: BOT_WALL, NETWORK, REGION, GONE, …) with user hints; `POST /api/yt/reset` and a
+  status-sheet button reset the YouTube session. Piped/Invidious hosts get cooldowns.
+- Player recovery: reload with `?fresh=<token>` and seek back (3 tries, 1/2/4 s), skip unplayable tracks, stop after 3
+  dead tracks in a row, resume on `online`. Test hook: `REEF_FAKE_WALL=1`.
 
 ## Production plan (2026-10-21)
 

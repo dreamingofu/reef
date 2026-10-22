@@ -135,7 +135,7 @@ def stream(monkeypatch):
         up = FakeUpstream(body, status, headers)
         entry = {"url": "https://example.invalid/a", "headers": {}, "mime": mime, "ext": "m4a"}
         monkeypatch.setattr(streamer, "_resolve", lambda tid, foreground=True: (entry, "hit"))
-        monkeypatch.setattr(streamer, "_open", lambda e: (up, 0))
+        monkeypatch.setattr(streamer, "_open", lambda e, rng=None: (up, 0))
         resp = app.app.test_client().get("/api/stream/FGBhQbmPwH8",
                                          headers={"Range": req_range} if req_range else {})
         return resp, up
@@ -170,7 +170,7 @@ def test_proxy_two_byte_probe_passes_through(stream):
 def test_proxy_leaves_other_ranges_alone(stream):
     # A body that would be patched if it started at byte 0; a non-zero range start must keep it intact.
     src = mp4()
-    resp, _ = stream(src, 206, {"Content-Range": f"bytes 1000-{999 + len(src)}/9999"}, req_range="bytes=1000-")
+    resp, _ = stream(src, 206, {"Content-Range": f"bytes 1000-{999 + len(src)}/{1000 + len(src)}"}, req_range="bytes=1000-")
     assert resp.data == src
 
 

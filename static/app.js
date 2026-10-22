@@ -261,6 +261,62 @@
   })();
   // ==== queue-core:end ====
 
+  // ---------- recovery core ----------
+  // The player's recovery decisions as pure functions (no DOM, no state); the machine that acts on them is in
+  // "recovery" below. Unit-checked from node by slicing the text between these two sentinel comments.
+  // ==== recovery-core:start ====
+  const R = (() => {
+    const MAX_TRIES = 3; // reloads per track before giving up on it
+    const MAX_DEAD = 3; // tracks given up on in a row before stopping
+    const SETTLE_S = 15; // seconds a recovered track must play past where it resumed before its tries reset
+    // Blocks where reloading the same track can't help: skip it at once.
+    const FINAL = ["GONE", "REGION", "MEMBERS_OR_PAID", "LOGIN_REQUIRED"];
+    const isFinal = (block) => FINAL.includes(block);
+    const FALLBACK = "Couldn't play this one";
+    const OFFLINE = "Check your connection";
+    // Wait before reload #attempt: 1 s, 2 s, 4 s (capped at 10 s).
+    const backoff = (attempt) => Math.min(10000, 1000 * 2 ** Math.max(0, attempt - 1));
+    // How long the playhead may stand still while playing before it counts as a failure. Once the track has metadata, 8 s;
+    // before that the server may still be resolving a cold stream (yt-dlp), and a reload would only restart that.
+    const stallLimit = (readyState) => (readyState >= 1 ? 8000 : 20000);
+    // A probe's answer (`Range: bytes=0-1` on the stream) -> {ok, block, hint}. ok: the stream answers again.
+    // status 0 = the fetch itself failed (offline, timeout).
+    function probeVerdict(status, body) {
+      if (status === 200 || status === 206) return { ok: true, block: null, hint: "" };
+      if (!status) return { ok: false, block: "NETWORK", hint: "" };
+      if (status === 404) return { ok: false, block: "GONE", hint: "" }; // the server doesn't know this id
+      const block = typeof body?.block === "string" && body.block ? body.block : "UNKNOWN";
+      return { ok: false, block, hint: typeof body?.hint === "string" ? body.hint : "" };
+    }
+    // The current track failed. `block`: from the probe (null when the stream answers again); `tries`: reloads
+    // already made for it; `online`: navigator.onLine; `early`: a stall before the element had metadata.
+    // -> {do: "retry", attempt, delay} | {do: "wait"} (offline: pause until `online`) | {do: "give-up"}
+    //  | {do: "keep"} (an early stall on a stream that answers: it's slow, not dead; a reload would start over)
+    function onFailure({ block = null, tries = 0, online = true, early = false } = {}) {
+      if (isFinal(block)) return { do: "give-up" };
+      if (online === false) return { do: "wait" };
+      if (early && !block) return { do: "keep" };
+      if (tries < MAX_TRIES) return { do: "retry", attempt: tries + 1, delay: backoff(tries + 1) };
+      return { do: "give-up" };
+    }
+    // The reloads counted against a track after the playhead reached `at`; its last recovery resumed it at `from`.
+    // `playing` alone proves nothing (a stream can play a few seconds after each reload and fail again, forever):
+    // only SETTLE_S of progress past the resume point clears them.
+    const settledTries = ({ tries = 0, from = 0, at = 0 } = {}) => (tries > 0 && at - from >= SETTLE_S ? 0 : tries);
+    // After giving up on a track. `dead`: tracks given up on in a row, this one included; `content`: how many of
+    // them failed for a FINAL block. Stop after MAX_DEAD in a row, or once every track in the queue failed (so
+    // repeat-all can't spin). A run of only removed / blocked tracks isn't a connection problem: it says so.
+    // -> {do: "next", message} | {do: "stop", outage, message}; `outage`: `online` may resume it.
+    function afterGiveUp({ dead = 1, content = 0, queueLength = 1, block = null, hint = "" } = {}) {
+      if (dead < MAX_DEAD && dead < queueLength) return { do: "next", message: hint || FALLBACK };
+      if (block === "BOT_WALL") return { do: "stop", outage: true, message: hint || OFFLINE };
+      if (content >= dead) return { do: "stop", outage: false, message: dead > 1 ? `Couldn't play ${dead} songs in a row` : hint || FALLBACK };
+      return { do: "stop", outage: true, message: OFFLINE };
+    }
+    return { MAX_TRIES, MAX_DEAD, SETTLE_S, FALLBACK, OFFLINE, isFinal, backoff, stallLimit, probeVerdict, onFailure, settledTries, afterGiveUp };
+  })();
+  // ==== recovery-core:end ====
+
   const navidromeUrl = (path) => `${location.protocol}//${location.hostname}:4533${path}`;
   const cur = () => state.queue[state.index];
   // What a queued / remembered track keeps (queue, session, "plays"). `auto` (an autoplay item) is dropped
@@ -581,7 +637,7 @@
       case "downloading": return `Downloading · ${j.percent}%`;
       case "converting": return "Converting to Opus…";
       case "done": return j.rescanned ? "Saved · Navidrome is rescanning" : "Saved to library";
-      case "error": return j.error || "Failed";
+      case "error": return j.hint || j.error || "Failed";
       default: return j.status;
     }
   }
@@ -600,7 +656,8 @@
             <span class="row-art">${art(j.video_id)}</span>
             <span class="row-text">
               <span class="row-t">${esc(j.title || j.video_id)}</span>
-              <span class="row-s">${esc(jobLabel(j))}</span>
+              <span class="row-s"${j.status === "error" && j.error ? ` title="${esc(j.error)}"` : ""}>${esc(jobLabel(j))}</span>
+              ${j.status === "error" && j.hint && j.error && j.error !== j.hint ? `<span class="row-e">${esc(j.error)}</span>` : ""}
               ${j.status === "downloading" ? `<span class="bar"><i style="width:${j.percent}%"></i></span>` : ""}
             </span>
           </span>
@@ -1337,6 +1394,7 @@
     const t = cur();
     if (!t) return;
     resume = null;
+    newTrack(streamUrl(t));
     audio.src = streamUrl(t);
     audio.play().catch(() => {});
     // Resolve the next track once this one is playing, so it doesn't compete for the extractor.
@@ -1358,17 +1416,19 @@
   function playAudio() {
     const t = cur();
     if (!t) return;
-    if (!resume) { audio.play().catch(() => {}); return; }
+    if (!resume) {
+      // A src that failed and wasn't reloaded (Reef stopped on it, or it's mid-recovery): retry it now.
+      if (rec.broken && !rec.busy) { retryNow(true); return; }
+      if (rec.busy) { rec.want = true; setLoading(true); } // the pending reload will play
+      audio.play().catch(() => {});
+      return;
+    }
     const pos = resume.position;
     resume = null;
+    rec.pos = pos;
+    rec.seekTo = pos > 0 ? pos : null; // applied once metadata is in (applySeek)
+    rec.src = streamUrl(t);
     audio.src = streamUrl(t);
-    if (pos > 0) {
-      audio.addEventListener("loadedmetadata", () => {
-        if (cur()?.id !== t.id || audio.getAttribute("src") !== streamUrl(t)) return;
-        const d = audio.duration;
-        if (!isFinite(d) || pos < d - 1) audio.currentTime = pos;
-      }, { once: true });
-    }
     prefetched = null;
     prefetchNext = upcomingId();
     audio.play().catch(() => {});
@@ -1400,16 +1460,13 @@
 
   function stopAtEnd() {
     audio.pause();
-    if (resume) { resume.position = 0; setProgress(0, duration()); saveSession(); } else audio.currentTime = 0;
+    seekTo(0);
   }
 
   function prev() {
-    const pos = resume ? resume.position : audio.currentTime;
+    const pos = playPos();
     const i = Q.prevIndex(state.queue.length, state.index);
-    if (pos > 3 || i < 0) {
-      if (resume) { resume.position = 0; setProgress(0, duration()); saveSession(); } else audio.currentTime = 0;
-      return;
-    }
+    if (pos > 3 || i < 0) { seekTo(0); return; }
     state.index = i;
     load();
   }
@@ -1664,7 +1721,7 @@
   let posSavedAt = 0;
   function saveSession(position) {
     const t = cur();
-    if (position == null) position = resume ? resume.position : (t && audio.getAttribute("src") ? audio.currentTime || 0 : 0);
+    if (position == null) position = t ? playPos() : 0;
     posSavedAt = Date.now();
     store.set("session", {
       v: 1, rev: ++sessionRev,
@@ -1779,26 +1836,228 @@
     }).join("");
   }
 
+  // ---------- recovery ----------
+  // `rec.token` (the play token) changes on every track change; each async step of a recovery checks it and
+  // drops stale work, so only the track that failed is ever retried. A failure is an `error`, an `ended` well
+  // before the track's length, or a playhead that stood still past R.stallLimit while playing (`waiting` /
+  // `stalled`, or a silent freeze, which WebKit does when a mid-song request fails): remember the position,
+  // probe the stream for its block, then (after a backoff) reload it with ?fresh=<token>-<n> (the server
+  // re-resolves once per distinct token), seek back once metadata is in and play if it was playing. R decides
+  // when to give up, skip, or stop.
+  // Prefetches go through /api/prefetch, never the element, so their failures never land here.
+  const rec = {
+    token: Math.floor(Math.random() * 1e6), // the play token (random start: ?fresh= tokens differ across page loads)
+    tries: 0, // reloads made for the current track (R.onFailure); cleared by R.settledTries, not by `playing`
+    from: 0, // where the last reload resumed the track (R.settledTries)
+    reloads: 0, // ?fresh= counter within a token (never reused, unlike `tries`, which a user retry resets)
+    dead: 0, content: 0, // tracks given up on in a row / of those, for a FINAL block (R.afterGiveUp)
+    busy: false, // probing, or waiting out the backoff before a reload
+    broken: false, // the element's src failed and hasn't been reloaded yet (play reloads it)
+    outage: false, // Reef paused because of a failure: `online` (or a YouTube reset) resumes
+    want: false, // the user wants playback (follows play / pause); a reload plays only if set
+    pos: 0, // last known position (timeupdate / seeking); a reload seeks back to it
+    seekTo: null, // position still to restore once the current src has metadata
+    src: "", // the src the player set for the current track
+    timer: 0,
+    lastT: 0, movedAt: 0, // the stall watchdog: the playhead seen last, and when it last moved
+    skipping: false, // the next load() is a recovery skip: keep the dead-track count
+    fromEnd: false, // the failure was an early `ended`: if the reloaded src really ends there, move on
+  };
+
+  // Where playback is (or will resume from): a restored session, a pending seek, a broken src, the element.
+  function playPos() {
+    if (resume) return resume.position;
+    if (!audio.getAttribute("src")) return 0;
+    if (rec.seekTo != null) return rec.seekTo;
+    return rec.busy || rec.broken ? rec.pos : audio.currentTime || 0;
+  }
+
+  function seekTo(t) {
+    if (resume) { resume.position = t; setProgress(t, duration()); saveSession(); return; }
+    if (rec.busy || rec.broken || rec.seekTo != null) {
+      rec.pos = t;
+      if (rec.seekTo != null) rec.seekTo = t;
+      setProgress(t, duration());
+      saveSession();
+      return;
+    }
+    audio.currentTime = t;
+  }
+
+  // load(): a new track gets a new token; everything pending for the old one is dropped.
+  function newTrack(src) {
+    rec.token++;
+    clearTimeout(rec.timer);
+    Object.assign(rec, { tries: 0, from: 0, reloads: 0, busy: false, broken: false, outage: false, pos: 0, seekTo: null, src, timer: 0, movedAt: Date.now(), fromEnd: false });
+    if (!rec.skipping) { rec.dead = 0; rec.content = 0; } // the user picked it: a fresh run
+    rec.skipping = false;
+  }
+
+  // Once the src the player set has metadata, seek back to where it was.
+  function applySeek() {
+    if (rec.seekTo == null || audio.getAttribute("src") !== rec.src || audio.readyState < 1) return;
+    const pos = rec.seekTo, d = audio.duration, fromEnd = rec.fromEnd;
+    rec.seekTo = null;
+    rec.fromEnd = false;
+    if (pos > 0 && (!isFinite(d) || pos < d - 1)) audio.currentTime = pos;
+    else if (fromEnd && pos > 0) next(); // the stream really is that short (its listed length was off)
+  }
+
+  async function probe(t) {
+    const url = audio.getAttribute("src") || streamUrl(t); // same ?fresh= token: the probe never evicts
+    const ctl = typeof AbortController === "function" ? new AbortController() : null;
+    const timer = ctl ? setTimeout(() => ctl.abort(), 15000) : 0;
+    try {
+      const r = await fetch(url, { headers: { Range: "bytes=0-1" }, cache: "no-store", ...(ctl ? { signal: ctl.signal } : {}) });
+      let body = null;
+      if (r.ok) { try { r.body?.cancel().catch(() => {}); } catch { /* nothing to cancel */ } } else body = await r.json().catch(() => null);
+      return R.probeVerdict(r.status, body);
+    } catch {
+      return R.probeVerdict(0, null);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  async function fail(why) {
+    const t = cur();
+    if (!t || resume || !audio.getAttribute("src") || rec.busy) return;
+    if (why === "error" && (!audio.error || audio.error.code === 1)) return; // stale (src replaced) or aborted
+    const token = rec.token;
+    if (why === "ended") { rec.want = true; rec.fromEnd = true; } // it was playing: `pause` fired just before `ended`
+    // Some engines reset currentTime on an error: fall back to the last position seen.
+    if (rec.seekTo != null) rec.pos = rec.seekTo; else if (audio.currentTime > 0) rec.pos = audio.currentTime;
+    rec.busy = true;
+    rec.broken = true;
+    rec.seekTo = null;
+    setLoading(true);
+    updatePlayState();
+    const v = await probe(t);
+    if (token !== rec.token || !rec.busy) return;
+    console.info("recovery:", why, t.id, `try ${rec.tries}/${R.MAX_TRIES}`, v.ok ? "stream answers" : v.block);
+    const d = R.onFailure({ block: v.ok ? null : v.block, tries: rec.tries, online: navigator.onLine, early: why === "stall" && audio.readyState < 1 });
+    if (d.do === "keep") { rec.busy = false; rec.broken = false; rec.movedAt = Date.now(); return; }
+    if (d.do === "retry") {
+      rec.tries = d.attempt;
+      rec.timer = setTimeout(() => reload(token), d.delay);
+      return;
+    }
+    rec.busy = false;
+    if (d.do === "wait") { // offline: stop here, `online` picks it up
+      if (rec.want) { rec.outage = true; audio.pause(); toast(R.OFFLINE); }
+      setLoading(false);
+      return;
+    }
+    giveUp(v);
+  }
+
+  function giveUp(v) {
+    setLoading(false);
+    // Paused by the user, or the sleep timer's "end of track": don't start the next one, just say why.
+    if (!rec.want || sleep.mode === "end") {
+      if (sleep.mode === "end" && rec.want) { setSleep("off", { quiet: true }); audio.pause(); }
+      toast(v.hint || R.FALLBACK);
+      return;
+    }
+    rec.dead++;
+    if (R.isFinal(v.block)) rec.content++;
+    const d = R.afterGiveUp({ dead: rec.dead, content: rec.content, queueLength: state.queue.length, block: v.block, hint: v.hint });
+    toast(d.message);
+    if (d.do === "next") { rec.skipping = true; next(); rec.skipping = false; return; }
+    audio.pause(); // stop on the failed track; play (or `online`, if it's an outage) retries it
+    rec.outage = d.outage;
+  }
+
+  // Reload the current track's src with a fresh token, seek back, play if wanted.
+  function reload(token) {
+    const t = cur();
+    if (!t || token !== rec.token) return;
+    clearTimeout(rec.timer);
+    rec.timer = 0;
+    rec.busy = false;
+    rec.broken = false;
+    rec.reloads++;
+    const src = `${streamUrl(t)}?fresh=${token}-${rec.reloads}`;
+    rec.src = src;
+    rec.seekTo = rec.pos > 0 ? rec.pos : null;
+    rec.from = rec.pos > 0 ? rec.pos : 0;
+    rec.movedAt = Date.now();
+    audio.src = src;
+    setLoading(true);
+    if (!rec.want) return; // canplay clears the spinner; play reuses this src
+    audio.play().catch((e) => {
+      if (token !== rec.token || audio.getAttribute("src") !== src) return;
+      // iOS refusing a play() outside a gesture: show the paused state (a tap plays this src) instead of looping.
+      if (e && e.name === "NotAllowedError") { rec.want = false; setLoading(false); updatePlayState(); }
+    });
+  }
+
+  // A user (play on a broken src), `online`, or a YouTube reset: reload the current track now.
+  function retryNow(play) {
+    if (!cur() || resume) return;
+    clearTimeout(rec.timer);
+    Object.assign(rec, { tries: 0, busy: false, outage: false, timer: 0 });
+    if (play) rec.want = true;
+    if (rec.seekTo == null && audio.getAttribute("src")) rec.pos = playPos();
+    reload(rec.token);
+  }
+
+  // `ended` well before the track's known length, e.g. at 1:10 of a 5:21 song. The element's own duration
+  // can't tell: WebKit shortens it to what it managed to load when the rest of the stream fails.
+  function endedEarly() {
+    const len = Number(cur()?.duration) || 0;
+    return len > 0 && audio.currentTime < len - Math.max(10, len * 0.05);
+  }
+
+  // The stall watchdog. `waiting` / `stalled` aren't reliable: WebKit can also freeze the playhead with
+  // readyState 4 and fire nothing when a mid-song request fails. So: while playing, a playhead that hasn't moved
+  // for R.stallLimit is a failure. Wall-clock based, so a throttled (background) timer only fires late.
+  setInterval(() => {
+    const now = Date.now();
+    if (audio.currentTime !== rec.lastT) { rec.lastT = audio.currentTime; rec.movedAt = now; return; }
+    if (!cur() || resume || rec.busy || rec.broken || audio.paused || audio.ended || !audio.getAttribute("src")) { rec.movedAt = now; return; }
+    if (now - rec.movedAt > R.stallLimit(audio.readyState)) fail("stall");
+  }, 2000);
+
+  // Back online: resume only what Reef itself paused for the outage.
+  window.addEventListener("online", () => { if (rec.outage && cur() && !resume) retryNow(true); });
+
   // ---------- audio events ----------
   audio.addEventListener("timeupdate", () => {
-    setProgress(audio.currentTime, duration());
-    if (lyr.times.length) syncLyrics();
+    if (rec.seekTo == null && !rec.busy && !rec.broken) {
+      rec.pos = audio.currentTime;
+      if (rec.tries) rec.tries = R.settledTries({ tries: rec.tries, from: rec.from, at: rec.pos });
+      setProgress(audio.currentTime, duration());
+      if (lyr.times.length) syncLyrics();
+    }
     if (sleep.mode === "time") checkSleep();
     if (!audio.paused && Date.now() - posSavedAt >= 5000) saveSession();
   });
-  audio.addEventListener("loadedmetadata", () => setProgress(audio.currentTime, duration()));
-  audio.addEventListener("play", updatePlayState);
-  audio.addEventListener("pause", () => { updatePlayState(); if (cur()) saveSession(); });
+  audio.addEventListener("seeking", () => {
+    if (rec.seekTo != null || rec.busy || rec.broken) return;
+    rec.pos = audio.currentTime;
+    if (rec.tries) rec.from = rec.pos; // a jump isn't progress: count it from where the playhead landed
+  });
+  audio.addEventListener("loadedmetadata", () => { applySeek(); setProgress(playPos(), duration()); });
+  audio.addEventListener("canplay", () => { applySeek(); if (audio.paused) setLoading(false); });
+  audio.addEventListener("play", () => { rec.want = true; updatePlayState(); });
+  audio.addEventListener("pause", () => { rec.want = false; updatePlayState(); if (cur()) saveSession(); });
   audio.addEventListener("ended", () => {
     updatePlayState();
     if (sleep.mode === "end") { setSleep("off", { quiet: true }); saveSession(); return; } // pause instead of advancing
+    // WebKit can end a track early when its stream dies mid-song (it gives up after the 403s): recover instead.
+    if (endedEarly()) { fail("ended"); return; }
     next();
   });
-  audio.addEventListener("error", () => { setLoading(false); if (audio.getAttribute("src")) toast("Couldn't play this one"); updatePlayState(); });
+  audio.addEventListener("error", () => { fail("error"); });
   audio.addEventListener("loadstart", () => { if (audio.getAttribute("src")) setLoading(true); });
   audio.addEventListener("waiting", () => setLoading(true));
   audio.addEventListener("playing", () => {
     setLoading(false);
+    rec.movedAt = Date.now();
+    if (rec.busy) { clearTimeout(rec.timer); rec.timer = 0; rec.busy = false; } // a stall that sorted itself out
+    // It plays: the run of unplayable tracks is over. Its own tries wait for sustained progress (timeupdate).
+    Object.assign(rec, { dead: 0, content: 0, outage: false, broken: false });
     if (prefetchNext) { prefetch([prefetchNext]); prefetched = prefetchNext; prefetchNext = null; }
     if (lyr.on && cur()) fetchLyrics(cur()); // warm, so opening the player shows them at once
   });
@@ -1825,8 +2084,7 @@
     const d = duration();
     seeking = false;
     if (!d) return;
-    const t = (seek.value / 1000) * d;
-    if (resume) { resume.position = t; setProgress(t, d); saveSession(); } else audio.currentTime = t;
+    seekTo((seek.value / 1000) * d);
   });
 
   if ("mediaSession" in navigator) {
@@ -1837,8 +2095,7 @@
     set("previoustrack", prev);
     set("nexttrack", next);
     set("seekto", (e) => {
-      if (e.seekTime == null) return;
-      if (resume) { resume.position = e.seekTime; setProgress(e.seekTime, duration()); } else audio.currentTime = e.seekTime;
+      if (e.seekTime != null) seekTo(e.seekTime);
     });
   }
 
@@ -2019,8 +2276,7 @@
     if (!line || !lyr.lines[line.dataset.i]) return;
     clearTimeout(lyr.holdTimer);
     lyr.held = false;
-    const at = lyr.lines[line.dataset.i].t;
-    if (resume) resume.position = at; else audio.currentTime = at;
+    seekTo(lyr.lines[line.dataset.i].t);
     if (audio.paused) playAudio();
     syncLyrics(true, true);
   });
@@ -2093,7 +2349,35 @@
     ];
     const n = state.blocked?.length;
     $("#status-list").innerHTML = rows.map(([k, v, c]) => `<li><span class="k">${esc(k)}</span><span class="v ${c}">${esc(v)}</span></li>`).join("")
-      + `<li class="st-link"><button data-open-hidden><span class="k">Hidden artists</span><span class="v">${n == null ? "" : n}${icon("chev-right")}</span></button></li>`;
+      + `<li class="st-link"><button data-open-hidden><span class="k">Hidden artists</span><span class="v">${n == null ? "" : n}${icon("chev-right")}</span></button></li>`
+      + `<li class="st-link"><button data-yt-reset${ytResetting ? " disabled" : ""}><span class="k">Reset YouTube session</span><span class="v">${ytResetting ? "Resetting…" : icon("repeat")}</span></button></li>`
+      + (streamNote(h) ? `<li class="st-note">${esc(streamNote(h))}</li>` : "");
+  }
+  // "Last stream: visionos · 2 clients gated (tv, web)": the client of the last play and the gated ones.
+  function streamNote(h) {
+    const client = h?.stream_timing?.client;
+    const gated = Object.keys(h?.yt_gates?.global || {});
+    const parts = [];
+    if (client && client !== "-") parts.push(`Last stream: ${client}`);
+    if (h?.yt_gates) parts.push(gated.length ? `${gated.length} client${gated.length === 1 ? "" : "s"} gated (${gated.join(", ")})` : "No clients gated");
+    return parts.join(" · ");
+  }
+  // POST /api/yt/reset: yt-dlp's cache, client gates, the resolve cache. A failing track gets another go.
+  let ytResetting = false;
+  async function resetYouTube() {
+    if (ytResetting) return;
+    ytResetting = true;
+    renderStatus();
+    try {
+      await api("/api/yt/reset", { method: "POST" });
+      toast("YouTube session reset");
+      if (cur() && !resume && (rec.broken || rec.busy || rec.outage)) retryNow(rec.want || rec.outage);
+    } catch (e) {
+      toast(`Couldn't reset: ${e.message}`);
+    }
+    ytResetting = false;
+    await loadHealth();
+    renderStatus();
   }
   async function openStatus() {
     renderStatus();
@@ -2229,12 +2513,12 @@
     el.textContent = msg;
     el.classList.add("show");
     clearTimeout(toastTimer);
-    toastTimer = setTimeout(() => el.classList.remove("show"), 2600);
+    toastTimer = setTimeout(() => el.classList.remove("show"), Math.max(2600, String(msg).length * 55)); // long hints stay longer
   }
 
   // ---------- events ----------
   document.addEventListener("click", (e) => {
-    const t = e.target.closest("[data-keep],[data-play],[data-search],[data-source],[data-home-tab],[data-filter],[data-dismiss],[data-play-all],[data-shuffle-all],[data-close],[data-clear-finished],[data-clear-searches],[data-more],[data-act],[data-q-jump],[data-q-remove],[data-q-clear],[data-q-mode],[data-sleep],[data-fill],[data-keep-all],[data-retry],[data-page-radio],[data-artist-hide],[data-unhide],[data-unhide-page],[data-open-hidden],[data-about]");
+    const t = e.target.closest("[data-keep],[data-play],[data-search],[data-source],[data-home-tab],[data-filter],[data-dismiss],[data-play-all],[data-shuffle-all],[data-close],[data-clear-finished],[data-clear-searches],[data-more],[data-act],[data-q-jump],[data-q-remove],[data-q-clear],[data-q-mode],[data-sleep],[data-fill],[data-keep-all],[data-retry],[data-page-radio],[data-artist-hide],[data-unhide],[data-unhide-page],[data-open-hidden],[data-yt-reset],[data-about]");
     if (!t) return;
     const d = t.dataset;
     if ("keep" in d) { e.preventDefault(); if (d.keep) keep(d.keep, d.list); return; }
@@ -2251,6 +2535,7 @@
     }
     if ("unhide" in d) { unhideArtists([{ id: d.unhide, name: d.name }]); return; }
     if ("openHidden" in d) { openHidden(); return; }
+    if ("ytReset" in d) { resetYouTube(); return; }
     if ("about" in d) {
       detail.about = !detail.about;
       $("#about")?.classList.toggle("clamp", !detail.about);

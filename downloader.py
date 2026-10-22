@@ -22,6 +22,7 @@ from yt_dlp.postprocessor.sponsorblock import SponsorBlockPP
 from yt_dlp.utils import sanitize_filename, sanitize_path
 
 import config
+import errors
 import history
 import loudness
 import lyrics
@@ -51,6 +52,8 @@ def _new_job(track_id, title, channel, hints=None):
         "percent": 0,
         "file": None,
         "error": None,
+        "block": None,  # errors.py block + hint for a failed keep, shown in the Downloads tab
+        "hint": None,
         "rescanned": False,
         "created": time.time(),
     }
@@ -484,7 +487,8 @@ def _run(job):
         job["rescanned"] = navidrome.rescan()
     except Exception as e:
         job["status"] = "error"
-        job["error"] = str(e)[:300]
+        typed = errors.payload(e)
+        job["error"], job["block"], job["hint"] = typed["error"], typed["block"], typed["hint"]
         return
     # The scan is async, so this usually misses; /api/art retries lazily.
     try:

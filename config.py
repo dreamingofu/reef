@@ -80,10 +80,18 @@ def _ydl_extra(raw):
 YDL_EXTRA = _ydl_extra(os.environ.get("REEF_YDL_EXTRA"))
 
 
-def yt_extractor_args(clients=None):
-    """yt-dlp `extractor_args` for YouTube. `clients=None` means YT_CLIENT; [] means yt-dlp's default."""
+# Test hook: the stream proxy answers 403 for Range starts past ~60 s of audio on a track's first URL,
+# like YouTube walling a client mid-song, so the player's recovery can be tried without YouTube.
+FAKE_WALL = os.environ.get("REEF_FAKE_WALL", "0").strip() == "1"
+
+
+def yt_extractor_args(clients=None, exclude=()):
+    """yt-dlp `extractor_args` for YouTube. `clients=None` means YT_CLIENT; [] means yt-dlp's default.
+
+    `exclude` drops clients (yt-dlp's `-name` syntax), e.g. ones YouTube is currently denying.
+    """
     clients = YT_CLIENT if clients is None else clients
     args = {"skip": ["hls", "dash", "translated_subs"]}
-    if clients:
-        args["player_client"] = list(clients)
+    if clients or exclude:
+        args["player_client"] = list(clients or ["default"]) + [f"-{c}" for c in exclude]
     return {"youtube": args}

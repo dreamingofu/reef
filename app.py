@@ -11,6 +11,7 @@ from flask import Flask, Response, abort, jsonify, redirect, render_template, re
 import blocklist
 import config
 import downloader
+import errors
 import history
 import lyrics
 import navidrome
@@ -78,6 +79,9 @@ def health():
         "yt_backend": sources.youtube.last_backend,
         "yt_fallbacks": sources.youtube.fallback_names(),
         "stream_timing": streamer.last_timing,
+        "stream_cache": streamer.stats(),
+        "yt_gates": sources.youtube.gates.snapshot(),
+        "failover_cooling": sources.failover.cooling(),
         "sources": list(sources.SOURCES),
         "ytmusic": {"enabled": ytmusic.enabled(), "version": ytmusic.VERSION},
     })
@@ -409,10 +413,19 @@ def api_stream(track_id):
     t = _track(track_id)
     if not t:
         abort(404)
+    # ?fresh=<token>: evict the cached URL and resolve again (the player's recovery). The first request
+    # carrying a given token evicts; the reloaded element's later Range requests repeat it harmlessly.
+    fresh = request.args.get("fresh", "").strip()[:64]
     try:
-        return streamer.proxy(t[1])
+        return streamer.proxy(t[1], fresh=fresh if fresh not in ("", "0") else None)
     except Exception as e:
-        return jsonify({"error": str(e)[:300]}), 502
+        return jsonify(errors.payload(e)), 502
+
+
+@app.post("/api/yt/reset")
+def api_yt_reset():
+    """Reset the YouTube session: yt-dlp cache dir, YoutubeDL instances, client gates, resolve cache."""
+    return jsonify({"ok": True, "cleared": streamer.reset_youtube()})
 
 
 def _keep_hints(item):
