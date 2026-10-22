@@ -269,3 +269,60 @@ def test_settings_still_validate_the_new_keys():
     assert settings.get("tracks_api") == ["https://a.example", "https://b.example"]
     settings.update({"tracks_api": ""})
     assert settings.get("tracks_api") == list(config.TRACKS_API)
+
+
+# ---------- the outcome after a restart in the middle of the run ----------
+
+def _run_child(monkeypatch, healthy, log):
+    """Run the real yt-dlp child (`python updater.py ytdlp`) with pip / restart / health stubbed, its stdout
+    going to the update log as when spawned."""
+    import contextlib
+    versions = iter(["2026.8.19", "2026.10.21"])
+    monkeypatch.setattr(updater, "_dist_version", lambda: next(versions))
+    monkeypatch.setattr(updater, "_pip", lambda *a: 0)
+    monkeypatch.setattr(updater, "_restart", lambda: None)
+    monkeypatch.setattr(updater, "_healthy", lambda v, wait_s=0: healthy)
+    with open(log, "a", encoding="utf-8") as out, contextlib.redirect_stdout(out):
+        return updater._child("ytdlp")
+
+
+@pytest.mark.parametrize("healthy, code, result", [(True, 0, "ok"), (False, 1, "failed")])
+def test_restart_mid_run_reports_the_childs_outcome(client, termux, monkeypatch, healthy, code, result):
+    # The old process starts the child: a real process that outlives "the restart".
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    monkeypatch.setattr(updater, "_spawn", lambda cmd, path: (path.parent.mkdir(parents=True, exist_ok=True),
+                                                              path.write_text(""), child.pid)[2])
+    try:
+        assert client.post("/api/update", json={"what": "ytdlp", "confirm": True}).status_code == 202
+        # The restart: a new process with no handle on the child, only update.json and the log.
+        monkeypatch.setattr(updater, "_proc", None)
+        s = client.get("/api/update/status").get_json()
+        assert s["running"] is True and s["result"] is None  # alive (kill 0), so still running
+        assert _run_child(monkeypatch, healthy, updater.log_path()) == code
+        assert client.get("/api/update/status").get_json()["running"] is True  # marker written, child not gone yet
+    finally:
+        child.kill()
+        child.wait()  # reaped: kill(pid, 0) now fails, as for an orphan init reaped
+    s = client.get("/api/update/status").get_json()
+    assert s["running"] is False and s["result"] == result and s["finished_at"]
+    assert s["log_tail"][-1].startswith("UPDATE_OK yt-dlp 2026.10.21" if healthy else "UPDATE_FAILED")  # bare marker
+
+
+def test_child_gone_without_an_outcome_is_failed(client, spawned, termux, monkeypatch):
+    client.post("/api/update", json={"what": "ytdlp", "confirm": True})
+    updater.log_path().write_text("2026-10-22 03:00:00 yt-dlp update (installed 2026.8.19)\n")  # killed mid-pip
+    monkeypatch.setattr(updater, "_alive", lambda pid: False)
+    assert updater.status()["result"] == "failed"
+
+
+def test_stamped_marker_and_a_stored_wrong_result_are_corrected(client, spawned, termux, monkeypatch):
+    """What a phone that ran f484a75 has: the stamped UPDATE_OK, and "failed" already stored for it."""
+    client.post("/api/update", json={"what": "ytdlp", "confirm": True})
+    updater.log_path().write_text("2026-10-22 03:00:00 yt-dlp 2026.8.19 -> 2026.10.21\n"
+                                  "2026-10-22 03:00:09 UPDATE_OK yt-dlp 2026.10.21\n")
+    data = dict(updater._file.load())
+    data["run"] = {**data["run"], "finished_at": time.time(), "result": "failed"}
+    updater._file.save(data)
+    monkeypatch.setattr(updater, "_alive", lambda pid: False)
+    assert updater.status()["result"] == "ok"
+    assert updater._file.load()["run"]["result"] == "ok"

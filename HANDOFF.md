@@ -352,7 +352,8 @@ New files `scrobbles.json`, `update.json`, `backups/` (git-ignored; `REEF_SCROBB
   403), `confirm: true`, one run at a time (409), and Termux only (`PREFIX`/`TERMUX_VERSION`/the Termux files dir)
   unless `REEF_ALLOW_SELF_UPDATE=1` — for **both** targets, not just reef (the restart needs the Termux supervisor).
   The run (pid, start) is in `update.json`, so the restarted process still reports it; result = the log's last
-  `UPDATE_OK` / `UPDATE_FAILED` line. The client polls `/api/update/status` every 2 s, polls `/api/health` while the
+  `UPDATE_OK` / `UPDATE_FAILED` line (bare or after a time stamp; re-read on every status call, so a
+  restart mid-run can't freeze a wrong result: f484a75 reported a successful yt-dlp update as failed). The client polls `/api/update/status` every 2 s, polls `/api/health` while the
   server is down, toasts the result and reloads the page after a Reef update. "Skip this version" =
   `PATCH /api/settings {skipped_version: <latest sha>}`.
 - **Backup / restore** (`backup.py`). `GET /api/backup` builds `{"format": "reef-backup", "schemaVersion": 1,

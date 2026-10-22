@@ -278,12 +278,20 @@ def _tail(path, n=TAIL):
     return [log.redact(ln)[:300] for ln in lines[-n:]]
 
 
-def _result(lines):
+# The outcome line: update.sh prints it bare, older yt-dlp children printed it after a "YYYY-MM-DD HH:MM:SS " stamp.
+_MARKER = re.compile(r"^(?:\d{4}-\d\d-\d\d \d\d:\d\d:\d\d )?(UPDATE_OK|UPDATE_FAILED)\b")
+
+
+def _result(path):
+    """"ok" / "failed" from the last outcome line of the whole log (not just the tail), else None."""
+    try:
+        lines = Path(path).read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return None
     for ln in reversed(lines):
-        if ln.startswith("UPDATE_OK"):
-            return "ok"
-        if ln.startswith("UPDATE_FAILED"):
-            return "failed"
+        m = _MARKER.match(ln.strip())
+        if m:
+            return "ok" if m.group(1) == "UPDATE_OK" else "failed"
     return None
 
 
@@ -294,16 +302,22 @@ def status(now=None):
     if not run:
         return {"running": False, "what": None, "started_at": None, "finished_at": None, "result": None,
                 "log_tail": []}
-    tail = _tail(run.get("log") or log_path())
+    path = run.get("log") or log_path()
+    tail = _tail(path)
     running = (not run.get("finished_at") and _alive(run.get("pid"))
                and now - (run.get("started_at") or 0) < RUN_MAX_S)
-    if not running and not run.get("finished_at"):
-        with _file.lock:
-            data = dict(_file.load())
-            if (data.get("run") or {}).get("pid") == run.get("pid"):
-                run.update(finished_at=now, result=_result(tail) or "failed")
-                data["run"] = run
-                _file.save(data)
+    if not running:
+        # The log decides, also after a restart in the middle of the run (this process never saw the child start):
+        # an outcome line = that outcome; a child gone without one = failed. Re-read each time, so a result stored
+        # wrongly by an older Reef (it missed stamped markers) corrects itself.
+        result = _result(path) or "failed"
+        if not run.get("finished_at") or run.get("result") != result:
+            with _file.lock:
+                data = dict(_file.load())
+                if (data.get("run") or {}).get("pid") == run.get("pid"):
+                    run.update(finished_at=run.get("finished_at") or now, result=result)
+                    data["run"] = run
+                    _file.save(data)
     return {"running": running, "what": run.get("what"), "started_at": run.get("started_at"),
             "finished_at": run.get("finished_at"), "result": None if running else run.get("result"),
             "log_tail": tail}
@@ -335,7 +349,9 @@ def start(what, confirm, now=None):
 # ---------- the yt-dlp child (python updater.py ytdlp|both) ----------
 
 def _say(msg):
-    print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}", flush=True)
+    """A progress line with a time stamp; the outcome line (UPDATE_OK / UPDATE_FAILED) bare, like update.sh's."""
+    marker = msg.startswith(("UPDATE_OK", "UPDATE_FAILED"))
+    print(msg if marker else f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}", flush=True)
 
 
 def _dist_version():
