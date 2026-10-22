@@ -1,3 +1,5 @@
+import re
+import struct
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -12,6 +14,8 @@ from sources.youtube import ydl_options  # noqa: F401  (re-exported for scripts/
 _TTL = 3600
 _CHUNK = 64 * 1024
 _YIELD_S = 30  # longest a prefetch waits for interactive resolves before it extracts anyway
+_HEAD_CAP = 512 * 1024  # most bytes held back while waiting for a whole moov
+_MP4 = {"audio/mp4", "video/mp4"}
 
 
 # One keep-alive pool for the upstream media hosts, so Safari's Range requests skip the TLS handshake.
@@ -170,6 +174,118 @@ def resolve(track_id):
     return _resolve(track_id)[0]
 
 
+# ---------- fragmented MP4 duration fix ----------
+# YouTube's m4a (format 140) is fragmented: every sample lives in moof/mdat fragments, yet moov's
+# mvhd/tkhd/mdhd still carry the full track duration. Apple's media stack adds that to the fragment
+# durations, so iOS Safari reports twice the length and never fires `ended` (the queue stalls).
+# Zeroing those fields (as a fragmenter normally writes them) gives the true length; sizes never change.
+
+def _boxes(buf, start, end):
+    """Yield (type, body, box_end) for the boxes in buf[start:end]; stops at the first incomplete one."""
+    pos = start
+    while pos + 8 <= end:
+        size, kind = struct.unpack_from(">I4s", buf, pos)
+        hdr = 8
+        if size == 1:
+            if pos + 16 > end:
+                return
+            size, hdr = struct.unpack_from(">Q", buf, pos + 8)[0], 16
+        elif size == 0:
+            size = end - pos  # extends to the end of its parent
+        if size < hdr or pos + size > end:
+            return
+        yield kind, pos + hdr, pos + size
+        pos += size
+
+
+# box type -> (offset of the duration field from the box body, per version 0 / 1)
+_DUR_AT = {b"mvhd": (16, 24), b"tkhd": (20, 28), b"mdhd": (16, 24)}
+
+
+def _duration_fields(buf, body, end):
+    """(offset, width) of the moov duration fields to zero, or None if any of them is malformed."""
+    fields = []
+
+    def visit(kind, body, end):
+        if kind in _DUR_AT:
+            if body >= end or buf[body] > 1:
+                return False
+            ver = buf[body]
+            at, width = body + _DUR_AT[kind][ver], 8 if ver else 4
+            if at + width > end:
+                return False
+            fields.append((at, width))
+        elif kind in (b"trak", b"mdia"):
+            return all(visit(*child) for child in _boxes(buf, body, end))
+        return True
+
+    return fields if all(visit(*child) for child in _boxes(buf, body, end)) else None
+
+
+def fix_fragmented_durations(buf):
+    """Zero the moov durations of a fragmented MP4 (one with mvex) whose moov is wholly inside buf.
+
+    Anything else (no moov yet, no mvex, malformed) comes back unchanged; the length never changes.
+    """
+    try:
+        for kind, body, end in _boxes(buf, 0, len(buf)):
+            if kind != b"moov":
+                continue
+            if not any(k == b"mvex" for k, _, _ in _boxes(buf, body, end)):
+                return buf  # not fragmented: its durations are real
+            fields = _duration_fields(buf, body, end)
+            if not fields:
+                return buf
+            out = bytearray(buf)
+            for at, width in fields:
+                out[at:at + width] = bytes(width)
+            return bytes(out)
+    except (struct.error, IndexError, TypeError):
+        pass
+    return buf
+
+
+def _head_ready(buf):
+    """True once buf holds the whole moov, or the file is not one whose moov comes before the media."""
+    pos = 0
+    while True:
+        if pos + 8 > len(buf):
+            return False
+        size, kind = struct.unpack_from(">I4s", buf, pos)
+        hdr = 8
+        if size == 1:
+            if pos + 16 > len(buf):
+                return False
+            size, hdr = struct.unpack_from(">Q", buf, pos + 8)[0], 16
+        if kind in (b"moof", b"mdat") or (size and size < hdr):
+            return True  # media first or garbage: nothing worth waiting for
+        if size == 0:
+            return False  # runs to EOF; the cap or EOF ends the wait
+        pos += size
+        if kind == b"moov":
+            return pos <= len(buf)
+
+
+def _patched_head(chunks):
+    """Pass chunks through, holding back the start until moov is whole so its durations can be fixed."""
+    buf = bytearray()
+    it = iter(chunks)
+    for chunk in it:
+        buf += chunk
+        if len(buf) >= _HEAD_CAP or _head_ready(buf):
+            break
+    if buf:
+        yield fix_fragmented_durations(bytes(buf))
+    yield from it
+
+
+def _from_start(upstream):
+    if upstream.status_code == 200:
+        return True
+    m = re.match(r"\s*bytes\s+(\d+)-", upstream.headers.get("Content-Range", ""))
+    return upstream.status_code == 206 and m is not None and int(m.group(1)) == 0
+
+
 def proxy(track_id):
     key, native = sources.parse(track_id)
     timing = {"id": track_id, "src": key, "cache": "-", "resolve_ms": 0, "ttfb_ms": 0, "status": 0,
@@ -214,11 +330,15 @@ def proxy(track_id):
         if name in upstream.headers:
             out_headers[name] = upstream.headers[name]
 
+    # Only a body that starts at byte 0 carries moov; every other range passes through untouched.
+    is_mp4 = any((m or "").split(";")[0].strip().lower() in _MP4
+                 for m in (entry["mime"], upstream.headers.get("Content-Type")))
+    fix_head = is_mp4 and _from_start(upstream)
+
     def generate():
         try:
-            for chunk in upstream.iter_content(_CHUNK):
-                if chunk:
-                    yield chunk
+            chunks = (c for c in upstream.iter_content(_CHUNK) if c)
+            yield from _patched_head(chunks) if fix_head else chunks
         finally:
             upstream.close()  # fully read -> connection goes back to the pool
 
