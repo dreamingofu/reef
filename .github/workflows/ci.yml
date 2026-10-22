@@ -30,3 +30,15 @@ jobs:
       # Offline suite; `-m live` tests (real YouTube) are deselected by pyproject.toml and skip on Actions anyway.
       - run: python -m pytest -q
       - run: ruff check .
+
+  js:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "26"
+      # Dependency-free: no package.json, no npm install. The tests run the pure cores sliced from static/app.js.
+      - run: node --check static/app.js
+      - run: node --test tests/js/

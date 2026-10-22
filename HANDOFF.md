@@ -1,7 +1,7 @@
 # Reef — handoff notes (resume on another machine)
 
-Last updated: 2026-10-22 (Round 16, UI remake step 5, audit batches 1-4 accepted by the root and committed locally;
-batch 3 = credentials / API / CSRF, batch 4 = updater health auth).
+Last updated: 2026-10-22 (Round 16, UI remake step 5, audit batches 1-5 accepted by the root and committed locally;
+batch 3 = credentials / API / CSRF, batch 4 = updater health auth, batch 5 = JS proof in CI).
 
 ## CURRENT supervision (read first; 2026-10-22, written for a session rotation)
 
@@ -15,21 +15,28 @@ batch 3 = credentials / API / CSRF, batch 4 = updater health auth).
   - Batch 1 `8fc8de93c619e1e674ade79fd5e2fe8eead4a698`.
   - Batch 2 `2ba24bbd0434e2b932cd44e7baf9c62628118d23` (accepted clean base of batch 3).
   - Batch 3 `4fbc2ea09c98d98602573910e0f8d3f7d116365d` (accepted clean base of batch 4).
-  - Batch 4: the commit that adds this text (see `git log`).
+  - Batch 4 `e920c5714c7bc19e8c484e5cc0e29d6e04feaec4` (accepted clean base of batch 5).
+  - Batch 5: the local commit directly on top of `e920c57` that adds this text (`git log -1`; its hash is in the
+    milestone's worker_done report to the root).
 - **Who's working**:
-  - Root coordinator: `term_3c425302-cae4-4be9-97c0-cb65b1ba1535`, sole supervisor of Run `run_644fd9908c5b`
-    generation 3 (replaced generation 2's `term_a1a35e94-ec0d-4c97-a320-2c6a2a95c78d`).
-  - Claude writer (sole checkout writer): `term_8969653d-0e79-47c1-8e88-3ce3b86a64c6`.
+  - Root coordinator: `term_d76429bc-6214-450e-8f42-08b9079686d6`, sole supervisor and sole review / acceptance owner of
+    Run `run_644fd9908c5b` generation 4 (replaced generation 3's `term_3c425302-cae4-4be9-97c0-cb65b1ba1535`).
+  - Claude writer: `term_52e489b5-69d0-4ab7-bf9e-78308462b9b3`.
+    - Settled batch 5 Task `task_c3403283cf1f` / Dispatch `ctx_5b4db1c2fe75` (JS proof in CI, on base
+      `e920c5714c7bc19e8c484e5cc0e29d6e04feaec4`).
+    - This milestone Task `task_fb5a4400ad3c` / Dispatch `ctx_ba1c6274faa3` owns only this file and the local batch 5
+      commit (`.github/workflows/ci.yml`, `tests/js/**`, `HANDOFF.md`), no other work. After that commit this Claude
+      **relinquishes checkout writer ownership** and idles (tab kept, shell open). A fresh Claude owns the next
+      frontend batch only after the root confirms its readiness and sends a new Dispatch. No duplicate writers.
+  - Batches 1-5 are closed (accepted, committed); their proof stands and isn't re-reviewed or re-run.
+  - Previous Claude writer `term_8969653d-0e79-47c1-8e88-3ce3b86a64c6` relinquished writer ownership and idles (tab kept).
     - Settled batch 3 Tasks: `task_f48c451fcebe` / `ctx_5ea180eba2eb` (implementation) and `task_4434847b17e2` /
       `ctx_8c5e9a8b2d1c` (long-userinfo repair).
     - Settled milestone Task `task_e17f105b79e5` / `ctx_65bb1c6ba326` (this file + the local batch 3 commit
       `4fbc2ea09c98d98602573910e0f8d3f7d116365d`).
     - Settled batch 4 Task `task_0a8f23021e6d` / `ctx_3e5028b3c2af` (updater health auth, F8, on base `4fbc2ea`).
-    - This milestone Task `task_6227f44ba099` / `ctx_5c4d5f9ab3e7` owned only this file and the local batch 4 commit,
-      no other work. After that commit this Claude **relinquishes checkout writer ownership** and idles; its tab is
-      kept. The root (sole coordinator until an explicit replacement RELEASE) rotates its own session; after that
-      RELEASE the replacement root starts a fresh Claude conversation for the next bounded JS batch. No duplicate
-      writers.
+    - Settled milestone Task `task_6227f44ba099` / `ctx_5c4d5f9ab3e7` (this file + the local batch 4 commit
+      `e920c5714c7bc19e8c484e5cc0e29d6e04feaec4`), after which it relinquished writer ownership.
   - Old Claude `term_62492f92-3dea-4cc5-ac14-f76f76a4bdb7` relinquished writer ownership and stays idle (settled Tasks
     `task_a93a61d0b573` batch 1, `task_e630e35fb597` / `task_dd2cff493c45` batch 2, `task_3035a994e8c6` milestone).
   - No browser or server is running (the root closed its scratch WebKit browser and QA server).
@@ -120,12 +127,47 @@ batch 3 = credentials / API / CSRF, batch 4 = updater health auth).
     - `/tmp/reef-codex-refactor-20261022/updater-auth-root3.py`: the actual Reef app with OPEN=True over scratch HTTP;
       Python and shell health: right auth True, wrong auth False, wrong version False, wrong commit False, redirect
       False, the redirect target got 0 requests. All scratch servers closed; no real update, service or phone.
-- **Next work for a fresh root / Claude** (none implemented yet; one bounded batch each, regressions first, no guessed
+- **Batch 5 (JS proof in CI)**: **accepted by the root** after its independent final review of the JS harness / tests
+  and the CI diff (no blockers), committed locally. Implementation Task `task_c3403283cf1f` / `ctx_5b4db1c2fe75`.
+  Changed:
+  `.github/workflows/ci.yml` (new `js` job, Node 26 via `actions/setup-node@v4`: `node --check static/app.js`,
+  `node --test tests/js/`; the Python job is unchanged), new `tests/js/`. No product source changed.
+  - `tests/js/harness.js`: `load(name)` slices the text between `// ==== <name>:start ====` / `:end ====` (whole
+    lines, exactly one of each, start first, else a clear error naming the marker and counts), checks that the slice
+    starts with `const <ID> = `, and compiles it with `node:vm` (`runInThisContext`, strict mode, `lineOffset` so stack
+    traces name static/app.js lines). It runs in this realm so `deepStrictEqual` works on its results. `snapshot()` =
+    structuredClone check that inputs weren't mutated.
+  - `tests/js/index.js`: newer Node resolves `node --test tests/js/` to this file (without it: MODULE_NOT_FOUND on
+    Node 26); it requires every `*.test.js`. `node --test tests/js/*.test.js` gives the same 186.
+  - One `*.test.js` per core (Q, R, L, M, LY, LV, P, PC, SH, DC) plus `harness.test.js` (app.js declares exactly these
+    ten cores; missing / duplicate / reversed / inline markers, wrong declaration, strict mode and line numbers).
+    Ported from the scratchpad u1-u5 / b2 / b5 / b6 / p0c / p4d checks (they passed on `e920c57` first), with added
+    cases: exports and constants at their boundaries, inputs never mutated, results never aliasing inputs, seeded and
+    mocked `Math.random` (`t.mock.method`), mocked `Date` (`t.mock.timers`), exhaustive `moveTrack` / `reinsert`
+    round-trips, binary search versus a linear scan, 60 seeded random covers through `P.derive` (roles valid, base
+    dark, accent and on-accent >= 4.5:1, deterministic). No production logic copied.
+  - Checks by Claude: `node --check static/app.js` exit 0; `node --test tests/js/` 186 passed / 0 failed (an
+    injected failing canary made it exit 1, then removed); `.venv/bin/python -m pytest -q` 1150 passed / 1 deselected;
+    `.venv/bin/ruff check .` and `git diff --check` clean. Two assertions failed while writing; both were the tests'
+    own wrong expectations (`L.counts(99.9, 200)` is true by the 30 s rule; library-core has 4 functions), fixed in
+    the tests. No product failure found.
+  - Root acceptance checks (root generation 4):
+    - `node --check static/app.js` and `node --test --test-reporter=dot tests/js/` → 186 passed, exit 0;
+    - `.venv/bin/ruff check .` and `git diff --check` clean;
+    - Claude's full pytest (1150 passed / 1 deselected) reused: no Python product change;
+    - all ten cores are the actual source; no dependencies, bundler, modules or product split; `static/app.js` and
+      `app.py` unchanged.
+  - Limits: only Node 26 was run locally (CI pins 26). Tests run in Node's realm, not a browser; a core that silently
+    used a Node global of the same name as a browser one wouldn't be caught. Not proven: Safari / WebKit, the DOM
+    code around the cores.
+- **Next work for a fresh root / Claude** (one bounded batch each, regressions first, no guessed
   rewrites, no survey redo, features, U6, deploy, push, phone, real services, or default / model / credential /
   permission changes):
-  1. **JS proof in CI.** Dependency-free committed `node:test` checks of the sentinel cores, plus
-     `node --check static/app.js` in CI. No bundler, modules or new dependencies.
-  2. **Frontend correctness** (meaningful async regressions, then an independent WebKit check).
+  1. **Frontend correctness** (meaningful async regressions, then an independent WebKit check).
+     - ROOT3-confirmed double-selection race: `/tmp/reef-codex-refactor-20261022/pin-double-root3.cjs` runs the
+       actual `pinFix`. Two selections waiting on the same pending key issue TWO PUTs (`first-pick`, then
+       `second-pick`): `busy` is set after the await, with no recheck. The frontend batch needs a committed
+       regression for it. Not fixed in batch 5.
      - U-a: `api()` must reject an invalid 2xx JSON body instead of returning `{}`.
      - Root-confirmed (`/tmp/reef-codex-refactor-20261022/frontend-before.cjs` runs the actual functions):
        - `pinFix` has an async target race. An old selection waiting on a pending key POSTs under the new target's
@@ -134,10 +176,10 @@ batch 3 = credentials / API / CSRF, batch 4 = updater health auth).
        - A successful restore refreshes settings / history / blocklist / Home but not likes / playlists. Cached
          detail and lyrics may need scoped invalidation that keeps playback going.
      - Add regressions first.
-  3. **U-b art byte budget (justified).** Root mocked 33 valid 512 KiB responses: 17,301,504 bytes retained; the
+  2. **U-b art byte budget (justified).** Root mocked 33 valid 512 KiB responses: 17,301,504 bytes retained; the
      400-entry count alone allows 209,715,200 bytes. Keep the count limit, add a sensible byte budget with race-safe
      accounting.
-  4. **Only with evidence:** F10 (finished-job cap) if shown necessary. J1–J3 / U-c / U-d performance and gesture
+  3. **Only with evidence:** F10 (finished-job cap) if shown necessary. J1–J3 / U-c / U-d performance and gesture
      hypotheses need measurements first. No cosmetic whole-file splits.
 - **Tooling note**: `worker-start --terminal` returns `agent_unconfigured`. The proven fallback is manual
   task-create, then `dispatch --return-preamble`, then terminal-send the exact preamble.
