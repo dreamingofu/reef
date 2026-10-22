@@ -119,7 +119,15 @@ def api_download():
         return jsonify({"error": "invalid track id"}), 400
     if not t[0].can_keep:
         return jsonify({"error": f"{t[0].name} tracks are already in your library"}), 400
-    return jsonify(downloader.enqueue(t[1], str(body.get("title", ""))[:200], str(body.get("channel", ""))[:200])), 202
+    # `force` re-keeps a library track (e.g. to pick up better tags), but never runs alongside a keep
+    # of the same track that's still going: both would write the same file.
+    entry = history.get(t[1])
+    if entry and not body.get("force") and entry.get("file") and os.path.exists(entry["file"]):
+        return jsonify({"error": "Already in your library", "entry": entry}), 409
+    job, created = downloader.enqueue_unique(t[1], str(body.get("title", ""))[:200], str(body.get("channel", ""))[:200])
+    if not created:
+        return jsonify({"error": "Already keeping", "job": job}), 409
+    return jsonify(job), 202
 
 
 @app.get("/api/jobs")

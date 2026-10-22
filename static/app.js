@@ -105,7 +105,7 @@
     const r = await fetch(path, opts);
     if (r.status === 204) return null;
     const body = await r.json().catch(() => ({}));
-    if (!r.ok) throw new Error(body.error || r.statusText || "Request failed");
+    if (!r.ok) throw Object.assign(new Error(body.error || r.statusText || "Request failed"), { status: r.status, body });
     return body;
   }
 
@@ -745,6 +745,12 @@
       toast(`Keeping “${t.title || "song"}”`);
       pollJobs();
     } catch (e) {
+      if (e.status === 409) {
+        // The server already has it (another tab or device kept it): catch up before saying so.
+        await loadHistory();
+        if (e.body?.job) await pollJobs();
+        refreshKeepButtons();
+      }
       toast(e.message);
     }
   }

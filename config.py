@@ -1,3 +1,4 @@
+import json
 import os
 from pathlib import Path
 
@@ -47,6 +48,23 @@ INVIDIOUS_INSTANCES = [u.strip().rstrip("/") for u in os.environ.get("REEF_INVID
 # yt-dlp innertube client(s) used to resolve stream URLs, e.g. "ios" or "android_vr,web_safari".
 # Empty = yt-dlp's own default. Pick with scripts/bench_resolve.py on the phone.
 YT_CLIENT = [c.strip() for c in os.environ.get("REEF_YT_CLIENT", "").split(",") if c.strip()]
+# Cut SponsorBlock segments (non-music, sponsor, intro, outro) out of kept YouTube tracks.
+SPONSORBLOCK = os.environ.get("REEF_SPONSORBLOCK", "0").strip() == "1"
+
+
+def _ydl_extra(raw):
+    try:
+        extra = json.loads(raw or "{}")
+    except ValueError:
+        extra = None
+    if not isinstance(extra, dict):
+        print("reef: ignoring REEF_YDL_EXTRA, it isn't a JSON object")
+        return {}
+    return extra
+
+
+# Extra yt-dlp options (a JSON object) merged into the keep options, e.g. {"cookiefile": "/path"}.
+YDL_EXTRA = _ydl_extra(os.environ.get("REEF_YDL_EXTRA"))
 
 
 def yt_extractor_args(clients=None):
