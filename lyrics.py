@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import threading
 import time
 from pathlib import Path
@@ -547,7 +548,29 @@ def embed(path, found):
         return False
     if settings.get("lrc_sidecar") and found.get("synced"):
         try:
-            Path(path).with_suffix(".lrc").write_text(found["synced"], encoding="utf-8")
+            _write_new(Path(path).with_suffix(".lrc"), found["synced"])  # never through a link left there
         except OSError as e:
             logger.warning(f"reef: couldn't write the .lrc sidecar: {e}")
     return True
+
+
+def _write_new(path, text):
+    """Write `text` to `path` through a temporary file created exclusively (an existing file or link named like it is
+    never opened, so its target is never written), then swapped in: os.replace replaces a link or hard link at `path`
+    itself, never what it points at. The temporary file is removed when anything fails."""
+    path = Path(path)
+    for _ in range(100):
+        tmp = path.with_name(f".{path.name[:150]}.{secrets.token_hex(4)}.tmp")
+        try:
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+        except FileExistsError:
+            continue
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(text)
+            os.replace(tmp, path)
+        except BaseException:
+            tmp.unlink(missing_ok=True)
+            raise
+        return
+    raise FileExistsError(f"no free temporary name next to {path.name}")

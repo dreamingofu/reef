@@ -227,6 +227,119 @@ def test_export_name_sanitizing():
     assert len(playlists.export_name("x" * 400)) <= 180
 
 
+# ---------- exports that share a name (audit F9) ----------
+
+def _export(client, pid):
+    r = client.post(f"/api/playlists/{pid}/export")
+    assert r.status_code == 200, r.get_json()
+    return r.get_json()["path"]
+
+
+@pytest.fixture
+def two_kept(monkeypatch):
+    monkeypatch.setattr(navidrome, "rescan", lambda: False)
+    keep(A, "One.opus")
+    keep(B, "Two.opus")
+
+
+def test_same_name_exports_get_their_own_files(client, two_kept):
+    p1, p2 = make(client, "Mix", [track(A)]), make(client, "Mix", [track(B)])
+    p3, p4 = make(client, "AC/DC", [track(A)]), make(client, "AC⧸DC", [track(A), track(B)])  # sanitise alike
+    assert playlists.export_name("AC/DC") == playlists.export_name("AC⧸DC")
+    a, b, c, d = (_export(client, p["id"]) for p in (p1, p2, p3, p4))
+    assert (a, b) == ("Reef/Playlists/Mix.m3u", f"Reef/Playlists/Mix [{p2['id']}].m3u")
+    assert (c, d) == ("Reef/Playlists/AC⧸DC.m3u", f"Reef/Playlists/AC⧸DC [{p4['id']}].m3u")
+    read = lambda rel: (config.MUSIC_DIR / rel).read_text().splitlines()[3:]  # noqa: E731  (the paths)
+    assert read(a) == ["../One.opus"] and read(b) == ["../Two.opus"] and read(c) == ["../One.opus"]
+    assert read(d)[::2] == ["../One.opus", "../Two.opus"]
+    assert _export(client, p1["id"]) == a and read(b) == ["../Two.opus"]  # a re-export keeps its own file
+
+
+def test_rename_and_reexport_never_deletes_another_playlists_file(client, two_kept):
+    p1, p2 = make(client, "Mix", [track(A)]), make(client, "Mix", [track(B)])
+    a, b = _export(client, p1["id"]), _export(client, p2["id"])
+    client.patch(f"/api/playlists/{p2['id']}", json={"name": "Renamed"})
+    assert _export(client, p2["id"]) == "Reef/Playlists/Renamed.m3u"
+    assert not (config.MUSIC_DIR / b).exists() and (config.MUSIC_DIR / a).exists()  # only its own old file went
+    # History from before the fix: both playlists recorded the same file. Neither re-export may delete it.
+    with playlists._file.lock:
+        items = playlists._file.load()
+        for p in items:
+            p["exported"] = {"path": a, "at": 1}
+        playlists._file.save(items)
+    client.patch(f"/api/playlists/{p1['id']}", json={"name": "Other"})
+    assert _export(client, p1["id"]) == "Reef/Playlists/Other.m3u" and (config.MUSIC_DIR / a).exists()
+    client.patch(f"/api/playlists/{p1['id']}", json={"name": "Mix"})
+    assert _export(client, p1["id"]) == f"Reef/Playlists/Mix [{p1['id']}].m3u"  # p2 still points at Mix.m3u
+
+
+def test_a_file_reef_didnt_write_is_left_alone(client, two_kept):
+    folder = playlists.export_dir()
+    folder.mkdir(parents=True)
+    (folder / "Solo.m3u").write_text("the user's own list")
+    p = make(client, "Solo", [track(A)])
+    assert _export(client, p["id"]) == f"Reef/Playlists/Solo [{p['id']}].m3u"
+    assert (folder / "Solo.m3u").read_text() == "the user's own list"
+
+
+@pytest.mark.parametrize("spelling", ["link", "case"])
+def test_an_alias_of_another_playlists_export_is_not_ours(client, two_kept, spelling):
+    """Another playlist records a link to (or another spelling of) this playlist's file: re-exporting must neither
+    write over it nor delete it."""
+    p1, p2 = make(client, "Mix", [track(A)]), make(client, "Other", [track(B)])
+    mix = config.MUSIC_DIR / _export(client, p1["id"])
+    if spelling == "link":
+        (mix.parent / "Alias.m3u").symlink_to(mix)
+        theirs = "Reef/Playlists/Alias.m3u"
+    else:
+        theirs = "Reef/Playlists/MIX.m3u"
+    with playlists._file.lock:
+        items = playlists._file.load()
+        next(p for p in items if p["id"] == p2["id"])["exported"] = {"path": theirs, "at": 1}
+        playlists._file.save(items)
+    before = mix.read_text()
+    assert _export(client, p1["id"]) == f"Reef/Playlists/Mix [{p1['id']}].m3u"
+    assert mix.read_text() == before  # left as it was: p2's export points at it too
+    client.patch(f"/api/playlists/{p1['id']}", json={"name": "Renamed"})
+    assert _export(client, p1["id"]) == "Reef/Playlists/Renamed.m3u" and mix.exists()
+
+def test_a_leftover_named_like_the_temp_file_is_never_written_through(client, two_kept):
+    """The old export wrote `<name>.m3u.tmp`, then renamed it: a link left under that name sent the playlist text into
+    whatever it pointed at (a kept song) and published the link itself as the .m3u."""
+    folder = playlists.export_dir()
+    folder.mkdir(parents=True)
+    song = config.DOWNLOAD_DIR / "One.opus"
+    audio = song.read_bytes()
+    (folder / "Mix.m3u.tmp").symlink_to(song)
+    p = make(client, "Mix", [track(A)])
+    assert _export(client, p["id"]) == "Reef/Playlists/Mix.m3u"
+    assert song.read_bytes() == audio and not (folder / "Mix.m3u").is_symlink()
+    assert (folder / "Mix.m3u").read_text().startswith("#EXTM3U") and (folder / "Mix.m3u.tmp").is_symlink()
+    assert sorted(x.name for x in folder.iterdir()) == ["Mix.m3u", "Mix.m3u.tmp"]  # no temp file left
+
+def test_concurrent_same_name_exports_and_a_playlist_deleted_midway(client, two_kept, monkeypatch):
+    import threading
+    import time
+    ps = [make(client, "Mix", [track(A)]) for _ in range(4)]
+    real_m3u = playlists.m3u
+
+    def slow(*a, **k):  # widen the window between picking a name and recording it
+        time.sleep(0.02)
+        return real_m3u(*a, **k)
+    monkeypatch.setattr(playlists, "m3u", slow)
+    out = []
+    threads = [threading.Thread(target=lambda pid=p["id"]: out.append(playlists.export(pid)["path"])) for p in ps]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert len(set(out)) == 4
+    p = make(client, "Gone", [track(A)])
+    monkeypatch.setattr(playlists, "set_exported", lambda pid, rel: playlists.delete(pid) and False)
+    assert client.post(f"/api/playlists/{p['id']}/export").status_code == 404
+    assert not (playlists.export_dir() / "Gone.m3u").exists()  # no orphan file for a deleted playlist
+
+
 # ---------- history: kept tracks are never dropped ----------
 
 def vid(n):

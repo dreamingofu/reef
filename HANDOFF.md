@@ -1,41 +1,86 @@
 # Reef — handoff notes (resume on another machine)
 
-Last updated: 2026-10-22 (Round 16, UI remake step 5, audit batch 1 accepted and committed, batch 2 in progress).
+Last updated: 2026-10-22 (Round 16, UI remake step 5, audit batches 1 and 2 accepted and committed locally).
 
-## CURRENT supervision (read first; 2026-10-22)
+## CURRENT supervision (read first; 2026-10-22, written for a session rotation)
 
 - **Owner's goal**: finish the current task, then the necessary whole-codebase refactors, implemented by Claude and
-  verified and accepted independently by Codex (root). Root acceptance allows a local commit only: no push, deploy or
-  U6 is authorized (not even after acceptance) unless the owner says so; no real secrets, permissions, model or
-  phone/publication changes.
-- **State**:
-  - U5 is accepted and committed locally as `bd5014d` (983 pytest passed / 1 deselected at acceptance; root WebKit
-    proofs are under `/tmp/reef-codex-u5-20261022`; real-device gaps remain). The old `term_bc7a30e2` and the U5 writer
-    are idle and have relinquished ownership.
+  verified and accepted independently by Codex (root).
+  - Root acceptance allows a local commit only. No push, deploy or U6 is authorized (not even after acceptance)
+    unless the owner says so.
+  - No real services, phone, secrets, permissions or model changes.
+- **Commits on `dreamingofu/codebase-overview-and-risk`** (local only, none pushed):
+  - U5 `bd5014d`.
+  - Batch 1 `8fc8de93c619e1e674ade79fd5e2fe8eead4a698`.
+  - Batch 2: the commit that adds this text (see `git log`).
 - **Who's working**:
-  - Root coordinator: `term_a1a35e94-ec0d-4c97-a320-2c6a2a95c78d` (replacement root after an explicit RELEASE from
-    `term_d731eb62`), owns Run `run_644fd9908c5b` generation 2.
-  - Sole writer: `term_62492f92-3dea-4cc5-ac14-f76f76a4bdb7` (Claude). Current Task `task_e630e35fb597`, Dispatch
-    `ctx_dcc35f052515`, batch 2: it owns only `downloader.py`, `playlists.py`, their tests and this file.
-  - The previous writer Task `task_a93a61d0b573` / `ctx_320829a25ceb` (batch 1) is settled; the terminal was kept
-    idle for this next batch.
-- **Audit**: `/tmp/reef-codebase-audit-20261022.md` (report + addendum).
-  - Findings F1–F11 with validated / hypothesis labels, plus planned batches.
-  - The root independently confirmed F1, F5, F6, F7 and F11 with synthetic data.
-  - The sheets / settings parts of app.js were skimmed, not line-audited. Don't claim perfect correctness.
-- **Batch 1 (persistence: F1, F5, F6 store half)**: **accepted by the root** and committed locally (not pushed).
-  - Root checks: an independent diff review; 155 focused tests passed; full pytest 1003 passed / 1 deselected
-    (16.22 s); Ruff and `git diff --check` clean.
-  - A separate root scratch probe showed that a like added concurrently after the preflight and the snapshot is kept.
-  - Details are in "Audit batch 1" below.
-- **Batch 2 (keep / .m3u collisions: F3, F9)**: in progress, stays uncommitted until the root accepts it. See
-  "Audit batch 2" below.
-- **Remaining batches, root assigns each**:
-  - the credential + API / CSRF boundary (an Origin guard must still work behind Tailscale Serve, which keeps
-    the Host header and adds https X-Forwarded-Proto);
-  - updater health checks with auth;
-  - durable JS tests in CI;
-  - bad-JSON API handling, and the byte-bounded art cache if justified.
+  - Root coordinator: `term_a1a35e94-ec0d-4c97-a320-2c6a2a95c78d`, sole supervisor of Run `run_644fd9908c5b`
+    generation 2 until an explicit replacement RELEASE.
+  - Claude writer `term_62492f92-3dea-4cc5-ac14-f76f76a4bdb7`:
+    - The batch 2 repair Task `task_dd2cff493c45` / `ctx_29078306d082` is settled, succeeded.
+    - This milestone Task `task_3035a994e8c6` / `ctx_2386ceabed08` owned only this file and the local batch 2 commit.
+    - After that commit it **relinquishes checkout writer ownership** and idles. The root rotates Claude from this
+      handoff; the old tab is kept, with no duplicate writers.
+  - Earlier settled writer Tasks: `task_a93a61d0b573` (batch 1) and `task_e630e35fb597` (batch 2's first version).
+  - No browser or server is running.
+- **Audit**: `/tmp/reef-codebase-audit-20261022.md`, report plus a superseding ADDENDUM. Don't redo the survey.
+  - Root-confirmed findings:
+    - F1 / F5 / F6 / F7 / F11 (synthetic repros);
+    - F3, generic keep collision, and F9, .m3u export collision (both fixed in batch 2);
+    - F4: `errors.payload` and `navidrome.ping` leak the raw request URL (Subsonic token / salt, query secrets).
+  - The root has now read the relevant sheets / settings parts of app.js (a bounded review). There is no claim of
+    perfect correctness.
+  - Device, Safari, performance and real-service gaps remain.
+- **Batch 1 (persistence: F1, F5, F6 store half)**: accepted, committed `8fc8de9`.
+  - Root checks: an independent diff review; 155 focused tests passed; full pytest 1003 passed / 1 deselected; Ruff
+    and diff check clean.
+  - A root scratch probe showed that a like added concurrently after the preflight and the snapshot is kept.
+- **Batch 2 (keep / .m3u / .lrc collisions: F3, F9 + root repairs)**: **accepted by the root** after the repairs,
+  committed locally. Root checks:
+  - an independent final diff review;
+  - `.venv/bin/python -m pytest -q tests/test_downloader.py tests/test_lossless.py tests/test_library.py
+    tests/test_lyrics.py` → 150 passed;
+  - full suite 1020 passed / 1 deselected; Ruff and diff check clean;
+  - `PYTHONPATH=. .venv/bin/python /tmp/reef-codex-refactor-20261022/ytdlp-intermediate.py` (real pipeline: the
+    correct 1 s audio, the 4 s original kept);
+  - `/tmp/reef-codex-refactor-20261022/file-ownership.py` (alias ownership, the export `.tmp` link target, the lyrics
+    sidecar link target).
+- **Next work for a fresh root / Claude** (none implemented yet; one bounded batch each, regressions first, no guessed
+  rewrites):
+  1. **Credentials / API / CSRF.**
+     - Redaction (F4/F11):
+       - `log.redact`: mask URL userinfo and common query secrets (`api_key`, `key`, `token`, `access_token`,
+         `password`, `auth`);
+       - `log.redact_obj`: redact dict keys too;
+       - `errors.payload` and `navidrome.ping`: sanitise messages;
+       - redact `/api/health`;
+       - give raw exception text from app.py the same safe presentation.
+       - Keep the raw internal failover keys / identity; sanitise only what is presented.
+     - F2: a global guard for unsafe methods on Origin / Sec-Fetch-Site. It must keep direct access and HTTPS
+       Tailscale Serve working as same-origin (Serve keeps the Host header and sets `X-Forwarded-Proto: https`). It
+       must not trust forwarded headers a tailnet peer could forge, and it must not change the socket-based trust or
+       requests without an Origin (CLI, scripts, update.sh).
+     - F6: `app._seconds` must treat an `OverflowError` from huge ints as an invalid / absent duration.
+     - F7: one robust JSON-object helper, keeping sendBeacon, uploads and optional bodies working.
+  2. **Updater health with auth.** Health checks must authenticate under `REEF_OPEN=1` + `REEF_PASSWORD`, both in the
+     Python child (`updater._healthy`) and in `termux/update.sh`. Prove it with a scratch fake Basic-auth server; no
+     real updates.
+  3. **JS proof in CI.** Dependency-free `node:test` checks of the sentinel cores, plus `node --check static/app.js`.
+     No bundler, modules or new dependencies.
+  4. **Frontend correctness.**
+     - U-a: `api()` must reject an invalid 2xx JSON body instead of returning `{}`.
+     - Root-confirmed (`/tmp/reef-codex-refactor-20261022/frontend-before.cjs` runs the actual functions):
+       - `pinFix` has an async target race. An old selection waiting on a pending key POSTs under the new target's
+         key after the target switches, and `applyFix` attaches the wrong key. The mutable `fix.key` is also read
+         after an API await.
+       - A successful restore refreshes settings / history / blocklist / Home but not likes / playlists. Cached
+         detail and lyrics may need scoped invalidation that keeps playback going.
+     - Add regressions first.
+  5. **U-b art byte budget (justified).** Root mocked 33 valid 512 KiB responses: 17,301,504 bytes retained; the
+     400-entry count alone allows 209,715,200 bytes. Keep the count limit, add a sensible byte budget with race-safe
+     accounting.
+  6. **Only with evidence:** F10 (finished-job cap) if shown necessary. J1–J3 / U-c / U-d performance and gesture
+     hypotheses need measurements first. No cosmetic whole-file splits.
 - **Tooling note**: `worker-start --terminal` returns `agent_unconfigured`. The proven fallback is manual
   task-create, then `dispatch --return-preamble`, then terminal-send the exact preamble.
 
@@ -1094,6 +1139,100 @@ Audit report: `/tmp/reef-codebase-audit-20261022.md` (findings F1, F5, F6). Base
   - `ruff check .` and `git diff --check`: clean;
   - the five new restore tests, the `store.seconds` tests and the updater test were also run against `bd5014d`'s
     backup.py / store.py / updater.check (a scratch pytest plugin loading the old code): all of them fail there.
+
+## Audit batch 2 (2026-10-22): keep and .m3u name collisions (accepted by root Codex after repairs; local commit)
+
+Root acceptance: an independent final diff review; focused tests (downloader, lossless, library, lyrics) 150 passed;
+full suite 1020 passed / 1 deselected; Ruff and diff check clean; root scripts `ytdlp-intermediate.py` and
+`file-ownership.py` in `/tmp/reef-codex-refactor-20261022/` pass.
+
+
+Audit findings F3 and F9 (`/tmp/reef-codebase-audit-20261022.md`). Base: batch 1 commit `8fc8de9`. Changed files:
+`downloader.py`, `playlists.py`, `lyrics.py` (sidecar write only), `tests/test_downloader.py`, `tests/test_library.py`,
+`tests/test_lyrics.py`.
+
+**Root review of the first version (blockers, now repaired):**
+- **F3 intermediates.** The first version only predicted the final file name. Repro with the real installed yt-dlp
+  and FFmpeg (only `extract_info` swapped for a local result; `/tmp/reef-codex-refactor-20261022/ytdlp-intermediate.py`):
+  - source `.wav` 1 s; an unknown `DOWNLOAD_DIR/Title.wav` 4 s already there;
+  - the keep reused that 4 s file as its download, produced a 4 s `.opus` and deleted `Title.wav`.
+- **Alias ownership.** `_keep_path` excluded other tracks' files by abspath string but matched its own file with
+  `samefile`. Repro:
+  - track `aaaaaaaaaaa` owns `p/Title.opus`;
+  - track `bbbbbbbbbbb`'s history points at `p/Alias.opus`, a symlink to that file;
+  - candidates `[p/Title.opus, p/Title [bbbbbbbbbbb].opus]` returned `p/Title.opus`, which authorised overwriting
+    the other track's file.
+- **Playlist exports.** Ownership was compared as raw relative strings, so a link or another case spelling of another
+  playlist's export was missed.
+- **Export `.tmp` link** (root repro): a kept `Track.opus`, and `Mix.m3u.tmp` as a symlink to it. Exporting "Mix"
+  wrote the playlist text through the link into the song and published the link as `Mix.m3u`.
+- **`.lrc` sidecar link** (root repro, real opus): a re-keep of the same id, with `Title.lrc` a symlink to another
+  file. `lyrics.embed` wrote the sidecar through the link and corrupted that file.
+
+**Behaviour now:**
+- **Staging.** Every keep (yt-dlp, generic, lossless) works in its own `tempfile.mkdtemp` folder under `TMP_DIR`, which
+  is removed when the keep ends.
+  - yt-dlp's `paths` home and temp both point there, so the download, intermediates, the thumbnail
+    (convert → square crop → embed) and the audio extraction all happen inside it. The postprocessor order is
+    unchanged, and there is still one `extract_info(..., download=True)` per keep.
+  - Generic keeps fetch and convert in their stage too.
+  - Nothing outside the stage is read, replaced or deleted except the final destination.
+- **Publish.** `downloader._publish` picks the destination with `_keep_path`, then moves the staged file into a
+  `.part` created exclusively by `mkstemp` (`<stem>.<random><ext>.part`, so an existing `*.part` or a symlink named
+  like one is never touched), then `os.replace` into place. A failure unlinks only that `.part`.
+- **Names.** `<title><ext>` (the yt-dlp name is the one yt-dlp itself sanitised in the stage), then
+  `<title> [<id>]<ext>`, then `(2..50)`.
+- **Ownership** (`_is_same` / `_may_be_same`):
+  - A path is taken when another kept track's file is, or could be, that file: the same existing file through a
+    link or alias, or the same resolved path compared case-insensitively. The case-insensitive comparison errs
+    towards "taken"; that only costs a suffix.
+  - Own reuse (re-keep / force) needs the exact same file, and only when no other track's file is or could be it.
+  - A free name also needs no `<stem>.lrc` next to it, so the lyrics sidecar of something else is never overwritten.
+  - Ordinary keeps keep their plain names. A file that two history entries share from before the fix is never
+    rewritten.
+- **Exports** (`playlists.export`):
+  - The same `_is_same` / `_may_be_same` checks run on the absolute paths of the recorded exports. Another
+    playlist's export as a link or another case spelling counts as taken.
+  - The playlist's own export is reused only when it isn't taken.
+  - The old export is deleted only when it is the playlist's own (not taken) and isn't the new file.
+  - `_export_lock` still covers pick, write and record (lock order `_export_lock` → store lock). A playlist deleted
+    during its export leaves no file (404).
+- **Exclusive temporary writes.** The `.m3u` (`playlists._write_new`) and the `.lrc` sidecar (`lyrics._write_new`) are
+  written to a hidden temp file created with `O_CREAT | O_EXCL` (a random name; an existing file or link of that
+  name is never opened), then `os.replace`d onto the final name. That replaces a link or hard link there instead of
+  writing through it, and the temp file is removed on failure. Contents, names and APIs are unchanged.
+
+**Checks:**
+- **Root script:** `PYTHONPATH=. .venv/bin/python /tmp/reef-codex-refactor-20261022/ytdlp-intermediate.py` now passes:
+  saved 1.0 s, the untracked 4 s `Title.wav` unchanged.
+- **New tests, `tests/test_downloader.py`:**
+  - `test_real_ytdlp_processing_never_reuses_or_deletes_files_it_didnt_make`: real yt-dlp + FFmpeg; local `file://`
+    source and cover through `YDL_EXTRA` `enable_file_urls`; skipped without ffmpeg. Checks a 1 s result with an
+    embedded cover, and that the existing `Title.wav` / `Title.jpg` / `Title.webp` in the library and the `Title.wav`
+    / `Title.temp.opus` in `TMP_DIR` keep their bytes, and that the stage is removed.
+  - `test_an_alias_of_another_tracks_file_is_not_this_tracks_own`: the root's alias case; the other file's bytes
+    are kept.
+  - `test_files_already_named_like_temp_parts_are_left_alone`: an existing `.part`, a `.part` symlink, an unrelated
+    `.lrc`.
+- **New tests, `tests/test_library.py`:** `test_an_alias_of_another_playlists_export_is_not_ours[link|case]`, and
+  `test_a_leftover_named_like_the_temp_file_is_never_written_through` (the root's `.tmp` symlink case: the song's
+  bytes are kept, `Mix.m3u` is a regular file, the leftover is untouched).
+- **New test, `tests/test_lyrics.py`:** `test_embed_sidecar_never_writes_through_a_link[symlink|hardlink]`.
+- **Unchanged batch 2 tests:** the earlier fake-yt-dlp tests now expect the single `extract_info(download=True)`
+  per keep (was `process=False`); their file and bytes assertions are unchanged.
+- **Mutation checks:**
+  - All five new cases fail against `8fc8de9`'s downloader.py / playlists.py.
+  - The alias and `.part` tests fail with the first version's `_keep_path`.
+  - The intermediate case fails on the first version (the root's script).
+  - The `.tmp` and `.lrc` link tests fail on `8fc8de9`'s playlists.py / lyrics.py.
+- **Suite:** full `python -m pytest -q` 1020 passed, 1 deselected; `ruff check .` and `git diff --check` clean.
+
+**Gaps and risks:**
+- Not run against real YouTube or on the phone (the `-m live` test only resolves).
+- Keeps now copy the finished file from `TMP_DIR` to shared storage: one extra copy of a few MB, where yt-dlp used
+  to move it there itself.
+- Playlists still leave their old export file when deleted (as before).
+- F10 (job cap) is not done.
 
 ## Ideas / next steps
 

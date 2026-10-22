@@ -10,6 +10,8 @@ Navidrome resolves them) and the server asks Navidrome to rescan.
 """
 import os
 import re
+import secrets
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -26,6 +28,8 @@ ID_LEN = 8
 PLACEHOLDER_ID = re.compile(r"^pq:[0-9a-f]{6,32}$")
 
 _file = store.JsonFile(lambda: config.PLAYLISTS_FILE, list)
+_export_lock = threading.Lock()  # an export picks its .m3u name, writes it and records it before the next one looks
+EXPORT_TRIES = 50
 
 
 def valid_id(pid):
@@ -234,13 +238,22 @@ def replace_entries(pid, changes):
 
 
 def set_exported(pid, path):
+    """Record the playlist's export; False when the playlist is gone."""
     with _file.lock:
         items = _file.load()
         for p in items:
             if p.get("id") == pid:
                 p["exported"] = {"path": path, "at": time.time()}
                 _file.save(items)
-                return
+                return True
+        return False
+
+
+def _exports_of_others(pid):
+    """The export paths (relative to the music folder) other playlists have recorded."""
+    with _file.lock:
+        return {p["exported"]["path"] for p in _file.load()
+                if p.get("id") != pid and isinstance(p.get("exported"), dict) and isinstance(p["exported"].get("path"), str)}
 
 
 # ---------- .m3u ----------
@@ -299,30 +312,72 @@ def export_name(name):
     return name or "Playlist"
 
 
+def _write_new(path, text):
+    """Write `text` to `path` through a temporary file created exclusively (an existing file or link named like it is
+    never opened, so its target is never written), then swapped in: os.replace replaces a link or hard link at `path`
+    itself, never what it points at. The temporary file is removed when anything fails."""
+    path = Path(path)
+    for _ in range(100):
+        tmp = path.with_name(f".{path.name[:150]}.{secrets.token_hex(4)}.tmp")
+        try:
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+        except FileExistsError:
+            continue
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(text)
+            os.replace(tmp, path)
+        except BaseException:
+            tmp.unlink(missing_ok=True)
+            raise
+        return
+    raise FileExistsError(f"no free temporary name next to {path.name}")
+
+
+def _music_rel(path):
+    return os.path.relpath(path, config.MUSIC_DIR).replace(os.sep, "/")
+
+
 def export(pid):
     """Write `<music>/Reef/Playlists/<name>.m3u` with the kept tracks. Returns {path (relative to the music
     folder), tracks, skipped}, None when the playlist doesn't exist; ValueError when nothing in it is kept.
-    A previous export under another name (the playlist was renamed) is removed."""
-    p = get(pid)
-    if p is None:
-        return None
-    folder = export_dir()
-    dest = folder / f"{export_name(p['name'])}.m3u"
-    text, kept, skipped = m3u(p, base=folder, kept_only=True)
-    if not kept:
-        raise ValueError("none of these tracks are kept yet; keep some first")
-    folder.mkdir(parents=True, exist_ok=True)
-    tmp = dest.with_name(dest.name + ".tmp")
-    tmp.write_text(text, encoding="utf-8")
-    os.replace(tmp, dest)
-    rel = os.path.relpath(dest, config.MUSIC_DIR).replace(os.sep, "/")
-    old = (p.get("exported") or {}).get("path")
-    if old and old != rel:
-        old_path = Path(config.MUSIC_DIR) / old
-        if old_path.parent == folder and old_path.suffix == ".m3u":  # never delete outside our folder
-            try:
-                old_path.unlink()
-            except OSError:
-                pass
-    set_exported(pid, rel)
-    return {"path": rel, "tracks": kept, "skipped": skipped}
+    A name another playlist's export uses, or a file Reef didn't write, is left alone: this one is then saved as
+    `<name> [<id>].m3u`. A previous export under another name (the playlist was renamed) is removed, unless another
+    playlist's export points at it."""
+    with _export_lock:
+        p = get(pid)
+        if p is None:
+            return None
+        folder = export_dir()
+        text, kept, skipped = m3u(p, base=folder, kept_only=True)
+        if not kept:
+            raise ValueError("none of these tracks are kept yet; keep some first")
+        from downloader import _is_same, _may_be_same  # lazy: the downloader pulls in yt-dlp
+        music = Path(config.MUSIC_DIR)
+        others = [music / rel for rel in _exports_of_others(pid)]
+
+        def taken(path):  # another playlist's export is, or could be, this file (a link, another case)
+            return any(_may_be_same(path, o) for o in others)
+
+        old = (p.get("exported") or {}).get("path")
+        old_path = music / old if isinstance(old, str) else None
+        mine = old_path is not None and not taken(old_path)
+        name = export_name(p["name"])
+        tags = ["", f" [{pid}]", *(f" [{pid}] ({n})" for n in range(2, EXPORT_TRIES + 1))]
+        dest = next((d for d in (folder / f"{name}{tag}.m3u" for tag in tags)
+                     if not taken(d) and ((mine and _is_same(d, old_path)) or not os.path.lexists(d))), None)
+        if dest is None:
+            raise ValueError(f"no free file name for this playlist in {folder.name}/")
+        folder.mkdir(parents=True, exist_ok=True)
+        _write_new(dest, text)
+        rel = _music_rel(dest)
+        if not set_exported(pid, rel):  # deleted while this ran: don't leave its file behind
+            dest.unlink(missing_ok=True)
+            return None
+        if mine and not _is_same(old_path, dest):
+            if old_path.parent == folder and old_path.suffix == ".m3u":  # never delete outside our folder
+                try:
+                    old_path.unlink()
+                except OSError:
+                    pass
+        return {"path": rel, "tracks": kept, "skipped": skipped}

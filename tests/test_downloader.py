@@ -425,3 +425,214 @@ def test_replaygain_off_skips_measuring(monkeypatch, tmp_path):
     downloader._run(job)
     assert job["status"] == "done" and history.get(VID)["gain_db"] is None
     config.HISTORY_FILE.write_text("[]", encoding="utf-8")
+
+
+# ---------- where a keep lands: same titles never overwrite another track's file (audit F3) ----------
+
+V1, V2, V3 = "aaaaaaaaaa1", "bbbbbbbbbb2", "ccccccccccc"
+_RealYDL = yt_dlp.YoutubeDL
+
+
+class FakeYDL(_RealYDL):
+    """yt-dlp minus the network: extraction returns a canned result, processing writes the file where yt-dlp's own
+    output template (as _run_ytdlp left it) says. Everything else (options, prepare_filename) is the real thing."""
+    titles, extractions = {}, []
+
+    def extract_info(self, url, download=True, process=True, **kw):
+        vid = url.rsplit("=", 1)[1]
+        FakeYDL.extractions.append((vid, download, process))
+        raw = {"id": vid, "title": self.titles[vid], "channel": "Some Artist", "duration": 200, "ext": "webm",
+               "webpage_url": url, "extractor": "youtube", "extractor_key": "Youtube"}
+        return self.process_ie_result(raw, download) if process else raw
+
+    def process_ie_result(self, ie_result, download=True, extra_info=None):
+        path = self.prepare_filename({**ie_result, "ext": "opus"})
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(f"audio of {ie_result['id']} #{len(FakeYDL.extractions)}")
+        return {**ie_result, "ext": "opus", "requested_downloads": [{"filepath": path}]}
+
+
+@pytest.fixture
+def keep_dir(monkeypatch, tmp_path):
+    music = tmp_path / "music"
+    music.mkdir()
+    monkeypatch.setattr(downloader, "DOWNLOAD_DIR", music)
+    (tmp_path / "tmp").mkdir()
+    monkeypatch.setattr(downloader, "TMP_DIR", tmp_path / "tmp")
+    monkeypatch.setattr(history, "HISTORY_FILE", tmp_path / "history.json")
+    monkeypatch.setattr(downloader, "AUDIO_FORMAT", "opus")
+    monkeypatch.setattr(downloader.navidrome, "rescan", lambda: False)
+    monkeypatch.setattr(downloader.navidrome, "find_song", lambda *a: None)
+    monkeypatch.setattr(downloader.loudness, "measure", lambda p: None)
+    monkeypatch.setattr(downloader.lyrics, "for_track", lambda *a: None)
+    monkeypatch.setattr(downloader.yt_dlp, "YoutubeDL", FakeYDL)
+    monkeypatch.setattr(FakeYDL, "titles", {})
+    monkeypatch.setattr(FakeYDL, "extractions", [])
+    return music
+
+
+def _keep_yt(vid, title):
+    FakeYDL.titles[vid] = title
+    job = downloader._new_job(vid, title, "")
+    downloader._run(job)
+    assert job["status"] == "done", job["error"]
+    return job
+
+
+def test_ytdlp_keeps_of_one_title_get_their_own_files(keep_dir):
+    a = _keep_yt(V1, "Hallelujah")
+    b = _keep_yt(V2, "Hallelujah")
+    assert a["file"] == str(keep_dir / "Hallelujah.opus")  # a name nobody uses stays plain
+    assert b["file"] == str(keep_dir / f"Hallelujah [{V2}].opus")
+    assert (keep_dir / "Hallelujah.opus").read_text().startswith(f"audio of {V1}")  # the first keep's bytes
+    assert history.get(V1)["file"] != history.get(V2)["file"]
+    assert FakeYDL.extractions == [(V1, True, True), (V2, True, True)]  # one extraction per keep
+
+
+def test_ytdlp_titles_that_sanitise_alike_and_untracked_files(keep_dir):
+    _keep_yt(V1, "AC/DC")
+    b = _keep_yt(V2, "AC⧸DC")  # yt-dlp writes "/" as "⧸": both names would be "AC⧸DC.opus"
+    assert b["file"].endswith(f"AC⧸DC [{V2}].opus") and history.get(V1)["file"].endswith("AC⧸DC.opus")
+    (keep_dir / "Intro.opus").write_text("the user's own file")
+    (keep_dir / f"Intro [{V3}].opus").write_text("another file of theirs")
+    c = _keep_yt(V3, "Intro")
+    assert c["file"] == str(keep_dir / f"Intro [{V3}] (2).opus")
+    assert (keep_dir / "Intro.opus").read_text() == "the user's own file"
+    assert (keep_dir / f"Intro [{V3}].opus").read_text() == "another file of theirs"
+
+
+def test_ytdlp_rekeep_of_the_same_track_replaces_its_own_file(keep_dir):
+    _keep_yt(V1, "Hallelujah")
+    b = _keep_yt(V2, "Hallelujah")
+    again = _keep_yt(V2, "Hallelujah")  # force / re-keep: back into its own (suffixed) file
+    assert again["file"] == b["file"] and (keep_dir / f"Hallelujah [{V2}].opus").read_text().endswith("#3")
+    first = _keep_yt(V1, "Hallelujah")
+    assert first["file"] == str(keep_dir / "Hallelujah.opus") and len(list(keep_dir.iterdir())) == 2
+    assert (keep_dir / f"Hallelujah [{V2}].opus").read_text().endswith("#3")  # untouched by V1's re-keep
+
+
+def test_a_file_two_tracks_already_share_is_not_rewritten(keep_dir):
+    """History written before the fix may point two tracks at one file: a re-keep of either gets a file of its own."""
+    shared = keep_dir / "Hallelujah.opus"
+    shared.write_text("one of them")
+    history._file.save([{"id": V1, "title": "Hallelujah", "file": str(shared)},
+                        {"id": V2, "title": "Hallelujah", "file": str(shared)}])
+    b = _keep_yt(V2, "Hallelujah")
+    assert b["file"] == str(keep_dir / f"Hallelujah [{V2}].opus") and shared.read_text() == "one of them"
+
+
+class _KeepSource:
+    key, name, can_keep, codec_label = "mc", "Monochrome", True, "FLAC"
+
+    def info(self, native, hint=None):
+        return {"title": "Hallelujah", "artist": f"Artist {native}", "album": "", "art": "", "duration": 200}
+
+    def art(self, native, size):
+        return None
+
+
+@pytest.fixture
+def generic_keep(keep_dir, monkeypatch):
+    monkeypatch.setitem(downloader.sources.SOURCES, "mc", _KeepSource())
+    monkeypatch.setattr(downloader.streamer, "resolve", lambda tid: {"url": "http://mc/" + tid, "ext": "flac"})
+    monkeypatch.setattr(downloader, "_fetch", lambda job, entry, dest, tid=None: dest.write_text(f"flac of {tid}"))
+    monkeypatch.setattr(downloader, "_convert", lambda src, ext, dest, fmt=None: shutil.copy(src, dest))
+    monkeypatch.setattr(downloader, "_tag", lambda *a, **k: None)
+    monkeypatch.setattr(downloader, "_length", lambda p: None)
+    return keep_dir
+
+
+def _keep_generic(tid):
+    job = downloader._new_job(tid, "", "")
+    downloader._run_generic(job, fmt="flac")
+    return job["file"]
+
+
+def test_generic_keeps_of_one_title_get_their_own_files(generic_keep):
+    music = generic_keep
+    (music / "Hallelujah [333].flac").write_text("untracked")
+    a, b, c = _keep_generic("mc:111"), _keep_generic("mc:222"), _keep_generic("mc:333")
+    assert [a, b, c] == [str(music / "Hallelujah.flac"), str(music / "Hallelujah [222].flac"),
+                         str(music / "Hallelujah [333] (2).flac")]
+    assert [history.get(t)["file"] for t in ("mc:111", "mc:222", "mc:333")] == [a, b, c]
+    assert (music / "Hallelujah.flac").read_text() == "flac of mc:111"  # the first keep's bytes survive
+    assert (music / "Hallelujah [333].flac").read_text() == "untracked"
+    assert _keep_generic("mc:222") == b and len(list(music.iterdir())) == 4  # re-keep: its own file again
+
+
+# ---------- staging: a keep only touches files it made (root review of audit batch 2) ----------
+
+def _wav(path, seconds):
+    import struct
+    import wave
+    with wave.open(str(path), "wb") as w:
+        w.setparams((1, 2, 8000, 0, "NONE", "not compressed"))
+        w.writeframes(struct.pack("<h", 0) * 8000 * seconds)
+
+
+@pytest.mark.skipif(not shutil.which("ffmpeg"), reason="needs ffmpeg")
+def test_real_ytdlp_processing_never_reuses_or_deletes_files_it_didnt_make(keep_dir, tmp_path, monkeypatch):
+    """Real yt-dlp + FFmpeg (download, cover convert / crop / embed, audio extract); only the extraction is local.
+    A same-named .wav, cover and temp leftovers already in the library and in TMP_DIR must not be used or touched."""
+    from mutagen import File as MutagenFile
+    src = tmp_path / "src"
+    src.mkdir()
+    _wav(src / "source.wav", 1)
+    subprocess.run(["ffmpeg", "-loglevel", "error", "-f", "lavfi", "-i", "color=c=red:s=64x48", "-frames:v", "1",
+                    str(src / "cover.jpg")], check=True)
+    untouched = {keep_dir / "Title.wav": None, keep_dir / "Title.jpg": b"not our cover",
+                 keep_dir / "Title.webp": b"nor this", downloader.TMP_DIR / "Title.wav": None,
+                 downloader.TMP_DIR / "Title.temp.opus": b"someone's temp file"}
+    for path, data in untouched.items():
+        _wav(path, 4) if data is None else path.write_bytes(data)
+    before = {p: p.read_bytes() for p in untouched}
+
+    class LocalYDL(_RealYDL):
+        def extract_info(self, url, download=True, process=True, **kw):
+            raw = {"id": V1, "title": "Title", "channel": "Artist", "duration": 1, "ext": "wav", "vcodec": "none",
+                   "acodec": "pcm_s16le", "url": (src / "source.wav").as_uri(), "extractor": "generic",
+                   "extractor_key": "Generic", "webpage_url": "https://example.invalid/" + V1,
+                   "thumbnails": [{"id": "0", "url": (src / "cover.jpg").as_uri()}]}
+            return self.process_ie_result(raw, download) if process else raw
+
+    monkeypatch.setattr(downloader.yt_dlp, "YoutubeDL", LocalYDL)
+    monkeypatch.setattr(config, "YDL_EXTRA", {"enable_file_urls": True})
+    job = downloader._new_job(V1, "Title", "Artist")
+    downloader._run(job)
+    assert job["status"] == "done", job["error"]
+    assert job["file"] == str(keep_dir / "Title.opus")
+    f = MutagenFile(job["file"])
+    assert abs(f.info.length - 1) < 0.15  # the 1 s source, not the 4 s file that was already there
+    assert f.get("metadata_block_picture")  # the cover went through convert / crop / embed in the stage
+    assert {p: p.read_bytes() for p in untouched} == before
+    assert sorted(p.name for p in downloader.TMP_DIR.iterdir()) == ["Title.temp.opus", "Title.wav"]  # stage removed
+    assert sorted(p.name for p in keep_dir.iterdir()) == ["Title.jpg", "Title.opus", "Title.wav", "Title.webp"]
+
+
+def test_an_alias_of_another_tracks_file_is_not_this_tracks_own(generic_keep):
+    """History may point a track at a link (or another spelling) of a file another track owns: that's not its own
+    file to replace."""
+    music = generic_keep
+    real, alias = music / "Hallelujah.flac", music / "Alias.flac"
+    real.write_text("mc:111's audio")
+    alias.symlink_to(real)
+    history._file.save([{"id": "mc:111", "title": "Hallelujah", "file": str(real)},
+                        {"id": "mc:222", "title": "Hallelujah", "file": str(alias)}])
+    other = music / "Hallelujah [222].flac"
+    assert downloader._keep_path("mc:222", [real, other]) == other
+    assert _keep_generic("mc:222") == str(other)
+    assert real.read_text() == "mc:111's audio" and alias.is_symlink()
+
+
+def test_files_already_named_like_temp_parts_are_left_alone(generic_keep):
+    music = generic_keep
+    (music / "Hallelujah.flac.part").write_text("someone's half copy")
+    (music / "Hallelujah.lrc").write_text("lyrics for another file")
+    target = music / "elsewhere.txt"
+    target.write_text("link target")
+    (music / "Hallelujah [111].flac.part").symlink_to(target)
+    got = _keep_generic("mc:111")
+    assert got == str(music / "Hallelujah [111].flac")  # the plain name's .lrc belongs to something else
+    assert (music / "Hallelujah.flac.part").read_text() == "someone's half copy"
+    assert (music / "Hallelujah.lrc").read_text() == "lyrics for another file" and target.read_text() == "link target"
+    assert (music / "Hallelujah [111].flac").read_text() == "flac of mc:111"

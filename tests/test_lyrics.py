@@ -278,6 +278,21 @@ def test_embed_sidecar(tmp_path, monkeypatch):
     assert path.with_suffix(".lrc").read_text() == SYNCED
 
 
+@needs_ffmpeg
+@pytest.mark.parametrize("kind", ["symlink", "hardlink"])
+def test_embed_sidecar_never_writes_through_a_link(tmp_path, monkeypatch, kind):
+    """A `.lrc` already there may be a link to another track's file: the sidecar replaces the link, not its target."""
+    monkeypatch.setattr(config, "LRC_SIDECAR", True)
+    path = _make(tmp_path, "opus")
+    other = tmp_path / "other.opus"
+    other.write_bytes(b"another track's audio")
+    lrc = path.with_suffix(".lrc")
+    lrc.symlink_to(other) if kind == "symlink" else lrc.hardlink_to(other)
+    assert lyrics.embed(path, {"synced": SYNCED, "plain": None, "instrumental": False}) is True
+    assert other.read_bytes() == b"another track's audio"
+    assert lrc.read_text() == SYNCED and not lrc.is_symlink()
+    assert not list(tmp_path.glob(".*.tmp"))
+
 def test_embed_nothing_or_unsupported(tmp_path):
     assert lyrics.embed(tmp_path / "x.opus", {"synced": None, "plain": None, "instrumental": True}) is False
     assert lyrics.embed(tmp_path / "x.opus", None) is False

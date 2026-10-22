@@ -5,9 +5,11 @@ import queue
 import re
 import shutil
 import subprocess
+import tempfile
 import threading
 import time
 import uuid
+from pathlib import Path
 
 import requests
 import yt_dlp
@@ -230,13 +232,98 @@ def _custom_pps(ydl, hints=None):
     return pps
 
 
+# ---------- where a keep is saved ----------
+# Every keep works in a staging folder of its own under TMP_DIR (downloads, intermediates, covers, conversions), so it
+# never reads, replaces or deletes a file it didn't make there. The finished file is then published into the library
+# under its title. Two different tracks can share one (two artists' "Hallelujah", titles that sanitise alike, a file
+# the user put there): the later one then gets the track's id in its name instead of replacing the other file. A
+# re-keep of the same track (force) replaces its own file. Keeps run one at a time (the single worker), so no other
+# keep claims a name between the choice and the write.
+NAME_TRIES = 50
+
+
+def _name_tags(native_id):
+    """What goes between the title and the extension, in order of preference: nothing, then the id (+ a counter)."""
+    return ["", f" [{native_id}]", *(f" [{native_id}] ({n})" for n in range(2, NAME_TRIES + 1))]
+
+
+def _is_same(a, b):
+    """`a` and `b` are the same file: one existing file (a link, an alias), or, both missing, one resolved path."""
+    a_there, b_there = os.path.exists(a), os.path.exists(b)
+    if a_there or b_there:
+        try:
+            return a_there and b_there and os.path.samefile(a, b)
+        except OSError:
+            return False
+    return os.path.normcase(os.path.realpath(a)) == os.path.normcase(os.path.realpath(b))
+
+
+def _may_be_same(a, b):
+    """`a` and `b` are, or could become, the same file: the same file, or one resolved path spelt another way on
+    case-insensitive storage (Android's shared storage, macOS). Errs towards "same": it only ever costs a suffix."""
+    return _is_same(a, b) or os.path.realpath(a).casefold() == os.path.realpath(b).casefold()
+
+
+def _keep_path(track_id, candidates):
+    """The first of `candidates` that track `track_id` may write: its own kept file (when no other kept track's file is
+    that file too), else a name no other kept track's file is or could be, where nothing (nor a `.lrc` next to it)
+    exists yet."""
+    others = [e["file"] for e in history.list_recent(None) if isinstance(e.get("file"), str) and e.get("id") != track_id]
+
+    def taken(path):
+        return any(_may_be_same(path, o) for o in others)
+
+    own = (history.get(track_id) or {}).get("file")
+    if isinstance(own, str) and not taken(own):
+        for path in candidates:
+            if _is_same(path, own):
+                return path
+    for path in candidates:
+        if not taken(path) and not os.path.lexists(path) and not os.path.lexists(Path(path).with_suffix(".lrc")):
+            return path
+    raise RuntimeError(f"no free file name for this keep ({os.path.basename(str(candidates[0]))} and "
+                       f"{NAME_TRIES} more are taken)")
+
+
+def _stage(job):
+    """A new, empty folder for this keep's own files (removed by the caller when the keep ends)."""
+    TMP_DIR.mkdir(parents=True, exist_ok=True)
+    return Path(tempfile.mkdtemp(prefix=f"keep-{job['id']}-", dir=TMP_DIR))
+
+
+def _publish(track_id, staged, name, native_id):
+    """Move the finished `staged` file into the library as `<name>[ tag]<its extension>` (see _keep_path), through a
+    `.part` file nothing else has (created exclusively), so a half copy never sits under the final name."""
+    staged = Path(staged)
+    dest = _keep_path(track_id, [DOWNLOAD_DIR / f"{name}{tag}{staged.suffix}" for tag in _name_tags(native_id)])
+    DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    fd, part = tempfile.mkstemp(prefix=f"{dest.stem[:100]}.", suffix=f"{dest.suffix}.part", dir=DOWNLOAD_DIR)
+    os.close(fd)
+    try:
+        shutil.move(str(staged), part)  # may cross filesystems (tmp -> shared storage)
+        os.replace(part, dest)
+    except BaseException:
+        _unlink(Path(part))  # half a copy on shared storage must never reach Navidrome (nor stay next to a fallback)
+        raise
+    return dest
+
+
 def _run_ytdlp(job):
-    with yt_dlp.YoutubeDL(_options(job)) as ydl:
-        for pp, when in _custom_pps(ydl, job.get("hints")):
-            ydl.add_post_processor(pp, when=when)
-        info = ydl.extract_info(f"https://www.youtube.com/watch?v={job['video_id']}", download=True)
-    requested = (info.get("requested_downloads") or [{}])[0]
-    job["file"] = requested.get("filepath")
+    stage = _stage(job)
+    try:
+        opts = _options(job)
+        opts["paths"] = {"home": str(stage), "temp": str(stage)}  # everything yt-dlp writes stays in the stage
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            for pp, when in _custom_pps(ydl, job.get("hints")):
+                ydl.add_post_processor(pp, when=when)
+            info = ydl.extract_info(f"https://www.youtube.com/watch?v={job['video_id']}", download=True)
+        staged = Path((info.get("requested_downloads") or [{}])[0].get("filepath") or "")
+        if not staged.name or not staged.is_file():
+            raise RuntimeError("yt-dlp finished without a file")
+        dest = _publish(job["video_id"], staged, staged.stem, job["video_id"])
+    finally:
+        shutil.rmtree(stage, ignore_errors=True)
+    job["file"] = str(dest)
     job["title"] = info.get("title") or job["title"]
     job["percent"] = 100
     # What the file was tagged with (_MusicTagsPP is deterministic), but with the source's artist names (not an
@@ -522,9 +609,10 @@ def _run_generic(job, track_id=None, fmt=None, expect=None, extra=None):
     job["title"] = title
 
     entry = streamer.resolve(tid)
-    raw = TMP_DIR / f"{job['id']}.{entry.get('ext') or 'bin'}"
     ext = _FORMATS.get(fmt or AUDIO_FORMAT, (fmt or AUDIO_FORMAT,))[0]
-    out = TMP_DIR / f"{job['id']}.out.{ext}"
+    stage = _stage(job)
+    raw = stage / f"source.{entry.get('ext') or 'bin'}"
+    out = stage / f"out.{ext}"
     try:
         _fetch(job, entry, raw, tid)
         if expect:
@@ -539,16 +627,9 @@ def _run_generic(job, track_id=None, fmt=None, expect=None, extra=None):
         _tag(out, title, names.name(artist), album, cover, cover_mime, info.get("isrc") or "",
              names.name(hints.get("album_artist") or ""), hints.get("track_number"), hints.get("year"))
         length = _length(out)
-        dest = DOWNLOAD_DIR / f"{_filename(title)}.{ext}"
-        part = dest.with_name(dest.name + ".part")
-        try:
-            shutil.move(str(out), str(part))  # may cross filesystems (tmp -> shared storage)
-            os.replace(part, dest)
-        except BaseException:
-            _unlink(part)  # half a copy on shared storage must never reach Navidrome (nor stay next to a fallback)
-            raise
+        dest = _publish(tid, out, _filename(title), _filename(native))
     finally:
-        _unlink(raw, out)
+        shutil.rmtree(stage, ignore_errors=True)
     # From here the file is in the library: the keep happened. What's left is bookkeeping, and a failure there is
     # reported on the job (`warning`) instead of failing it; a lossless keep must not fall back to YouTube now, or
     # Navidrome would list the song twice (.flac and .opus).
