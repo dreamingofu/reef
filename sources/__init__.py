@@ -1,16 +1,16 @@
 """Registry of search/stream sources. Track ids are "<key>:<native id>"; bare ids are YouTube."""
 import re
 
-import config
 import settings
 
 from . import invidious, monochrome, navidrome_src, piped, youtube
 
 _PREFIX = re.compile(r"^([a-z]{2}):(.+)$")
 
-# Piped / Invidious back up yt-dlp inside the `yt` source; registered only when configured, so off costs nothing.
-for _cfg, _mod in ((config.PIPED_INSTANCES, piped), (config.INVIDIOUS_INSTANCES, invidious)):
-    if _cfg:
+# Piped / Invidious back up yt-dlp inside the `yt` source; registered only when configured (reef.env or a
+# Settings override), so off costs nothing. Turning one on later takes a restart.
+for _key, _mod in (("piped_instances", piped), ("invidious_instances", invidious)):
+    if settings.get(_key):
         youtube.search_fallbacks.append(_mod.search)
         youtube.resolve_fallbacks.append(_mod.resolve)
 

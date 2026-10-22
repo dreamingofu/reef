@@ -5,7 +5,7 @@ Streams use `latest_version ... local=true`, so the instance proxies the media (
 """
 from urllib.parse import quote
 
-import config
+import settings
 
 from . import failover
 
@@ -14,9 +14,10 @@ BUDGET = 12         # seconds for one call across all its instances
 
 
 def _instances():
-    if not config.INVIDIOUS_INSTANCES:
+    instances = settings.get("invidious_instances")  # REEF_INVIDIOUS_INSTANCES unless set in Settings
+    if not instances:
         raise RuntimeError("no Invidious instances configured")
-    return config.INVIDIOUS_INSTANCES[:MAX_INSTANCES]
+    return instances[:MAX_INSTANCES]
 
 
 def search(q, limit):

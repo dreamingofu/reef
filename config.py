@@ -78,6 +78,17 @@ SETTINGS_FILE = Path(os.environ.get("REEF_SETTINGS_FILE") or HISTORY_FILE.with_n
 # (/api/home, refreshed in the background). Both default next to history.json.
 DISLIKES_FILE = Path(os.environ.get("REEF_DISLIKES_FILE") or HISTORY_FILE.with_name("dislikes.json"))
 HOME_FILE = Path(os.environ.get("REEF_HOME_FILE") or HISTORY_FILE.with_name("home.json"))
+# ListenBrainz scrobble queue (pending listens, last result, the token's user name), the cached update check
+# (+ the state of an in-app update, which outlives the restart it causes) and the backups folder (daily
+# snapshots, pre-restore copies). All default next to history.json.
+SCROBBLES_FILE = Path(os.environ.get("REEF_SCROBBLES_FILE") or HISTORY_FILE.with_name("scrobbles.json"))
+UPDATE_FILE = Path(os.environ.get("REEF_UPDATE_FILE") or HISTORY_FILE.with_name("update.json"))
+BACKUP_DIR = Path(os.environ.get("REEF_BACKUP_DIR") or HISTORY_FILE.with_name("backups"))
+# 1 = allow "Update" in the status sheet on a host that isn't Termux (the in-app update git-pulls this checkout
+# and restarts through termux/reef-boot.sh; a dev worktree must never be pulled by surprise).
+ALLOW_SELF_UPDATE = os.environ.get("REEF_ALLOW_SELF_UPDATE", "0").strip() == "1"
+# GitHub repo checked for new Reef commits (owner/name).
+UPDATE_REPO = os.environ.get("REEF_UPDATE_REPO", "dreamingofu/reef").strip() or "dreamingofu/reef"
 # Search, suggestions, radio and link metadata via YouTube Music (ytmusicapi, anonymous).
 # 0 = yt-dlp search only (no suggestions or radio).
 YTMUSIC = os.environ.get("REEF_YTMUSIC", "1").strip() != "0"

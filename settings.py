@@ -4,7 +4,11 @@ resetting it (PATCH with null) goes back to the env value. Code that honours a s
 moment it needs it, so a change applies without a restart.
 
 Secrets (`secret: True`) are write-only: `public()` reports only whether they're set.
+Instance lists (`urls`) are sent as one comma-separated string (or a list); blank goes back to the reef.env list.
 """
+import re
+from urllib.parse import urlsplit
+
 import config
 import store
 
@@ -30,8 +34,35 @@ SCHEMA = {
                          "label": "Lyrics sources", "help": "Where lyrics come from, in order. (Not used yet.)"},
     "listenbrainz_token": {"type": "secret", "default": lambda: "", "label": "ListenBrainz token",
                            "help": "User token from listenbrainz.org/settings, for scrobbling. Never shown again once saved."},
+    "scrobble_enabled": {"type": "bool", "default": lambda: True, "label": "Scrobble to ListenBrainz",
+                         "help": "Send every counted listen to ListenBrainz (needs the token above)."},
+    "skipped_version": {"type": "text", "pattern": r"[0-9a-f]{7,40}", "default": lambda: "",
+                        "label": "Skipped Reef update", "help": "The Reef commit \"Skip this version\" hid."},
+    # Effective at once for Monochrome and an already-enabled Piped/Invidious; turning a source on or off
+    # (an empty env list and a list set here, or the reverse) takes a restart, since sources register at start.
+    "tracks_api": {"type": "urls", "default": lambda: list(config.TRACKS_API), "label": "Monochrome instances",
+                   "help": "Comma-separated API URLs; blank = the reef.env list."},
+    "piped_instances": {"type": "urls", "default": lambda: list(config.PIPED_INSTANCES), "label": "Piped instances",
+                        "help": "Comma-separated API URLs, YouTube fallbacks; blank = the reef.env list."},
+    "invidious_instances": {"type": "urls", "default": lambda: list(config.INVIDIOUS_INSTANCES),
+                            "label": "Invidious instances",
+                            "help": "Comma-separated API URLs, YouTube fallbacks; blank = the reef.env list."},
 }
 SECRET_MAX = 200
+URLS_MAX = 10
+URL_MAX = 300
+
+
+def _url(raw):
+    u = raw.strip().rstrip("/")
+    try:
+        parts = urlsplit(u)
+        _ = parts.port  # raises ValueError for a bad port
+    except ValueError:
+        raise ValueError(f"not a URL: {u[:60]}") from None
+    if parts.scheme not in ("http", "https") or not parts.hostname or len(u) > URL_MAX or re.search(r"\s", u):
+        raise ValueError(f"not an http(s) URL: {u[:60]}")
+    return u
 
 
 def _valid(key, value):
@@ -54,6 +85,22 @@ def _valid(key, value):
         if not isinstance(value, str) or len(value) > SECRET_MAX or any(c.isspace() for c in value.strip()):
             raise ValueError(f"{key} must be a token without spaces")
         return value.strip()
+    if kind == "text":
+        if not isinstance(value, str) or not re.fullmatch(spec["pattern"], value.strip()):
+            raise ValueError(f"{key} has the wrong format")
+        return value.strip()
+    if kind == "urls":
+        items = value.split(",") if isinstance(value, str) else value
+        if not isinstance(items, list) or not all(isinstance(v, str) for v in items):
+            raise ValueError(f"{key} must be comma-separated URLs")
+        out = []
+        for v in (v for v in items if v.strip()):
+            u = _url(v)
+            if u not in out:
+                out.append(u)
+        if not out or len(out) > URLS_MAX:
+            raise ValueError(f"{key} takes 1 to {URLS_MAX} URLs")
+        return out
     raise ValueError(f"{key} can't be set")
 
 
@@ -98,14 +145,15 @@ def schema():
 
 def update(changes):
     """PATCH: validate every key first (nothing is written on an error), then store. None resets a key to its
-    env default ("" too, for a secret: it clears the token)."""
+    env default ("" too, for a secret, text or URL list: it clears the token / goes back to the env list)."""
     if not isinstance(changes, dict) or not changes:
         raise ValueError("send a JSON object of settings")
     clean = {}
     for key, value in changes.items():
         if key not in SCHEMA:
             raise ValueError(f"unknown setting: {key}")
-        if value is None or (SCHEMA[key]["type"] == "secret" and value == ""):
+        blank = isinstance(value, str) and not value.strip() or value == []
+        if value is None or (SCHEMA[key]["type"] in ("secret", "text", "urls") and blank):
             clean[key] = None
         else:
             clean[key] = _valid(key, value)

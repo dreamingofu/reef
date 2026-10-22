@@ -34,7 +34,7 @@ def test_get_shape(client):
     assert set(body["values"]) == set(keys) == set(settings.SCHEMA)
     for row in body["schema"]:
         assert {"key", "type", "default", "label", "help", "overridden"} <= set(row)
-        assert row["type"] in ("bool", "choice", "list", "secret")
+        assert row["type"] in ("bool", "choice", "list", "secret", "text", "urls")
     by_key = {r["key"]: r for r in body["schema"]}
     assert by_key["default_source"]["choices"] == ["yt", "mc", "nd"]
     assert body["values"]["prefer_library"] is True and body["values"]["listenbrainz_token"] == {"set": False}

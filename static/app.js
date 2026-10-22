@@ -2596,6 +2596,10 @@
     ];
     const n = state.blocked?.length;
     $("#status-list").innerHTML = rows.map(([k, v, c]) => `<li><span class="k">${esc(k)}</span><span class="v ${c}">${esc(v)}</span></li>`).join("")
+      + stLink("sources", "Sources", sourcesSummary())
+      + stLink("updates", "Updates", updatesSummary(), updateAvailable())
+      + stLink("scrobble", "Scrobbling", scrobbleSummary())
+      + stLink("backup", "Backup", backupSummary())
       + `<li class="st-link"><button data-open-hidden><span class="k">Hidden artists</span><span class="v">${n == null ? "" : n}${icon("chev-right")}</span></button></li>`
       + `<li class="st-link"><button data-yt-reset${ytResetting ? " disabled" : ""}><span class="k">Reset YouTube session</span><span class="v">${ytResetting ? "Resetting…" : icon("repeat")}</span></button></li>`
       + `<li class="st-link"><button data-copy-diag><span class="k">Copy diagnostics</span><span class="v">${icon("copy")}</span></button></li>`
@@ -2664,9 +2668,319 @@
     openSheet("#status-sheet");
     loadBlocklist();
     loadDiagnostics();
+    loadVersion();
+    loadScrobble();
+    loadBackupStatus();
     await loadHealth();
     renderStatus();
   }
+
+  // ---------- status sub-sheets: Sources, Updates, Scrobbling, Backup ----------
+  // Each opens from a Server row (the Server sheet closes, like Hidden artists) and has a back arrow to it.
+  const st = {
+    sources: null, sourcesBusy: false, version: null, versionBusy: false, upd: null, updTimer: 0, updDown: false,
+    scrob: null, tokenBusy: false, backup: null, restoreMode: "merge", restoreFile: null, restoreBusy: false, restored: null,
+  };
+  const SUBS = { sources: renderSourcesSheet, updates: renderUpdatesSheet, scrobble: renderScrobbleSheet, backup: renderBackupSheet };
+  const subOpen = (k) => !$(`#${k}-sheet`).hidden;
+  const rerender = (k) => { if (subOpen(k)) SUBS[k](); if (!$("#status-sheet").hidden) renderStatus(); };
+  const ON = (b) => (b ? " disabled" : "");
+  function stLink(key, label, value, badge) {
+    return `<li class="st-link"><button data-st="${key}"><span class="k">${esc(label)}</span><span class="v">${badge ? '<i class="st-badge"></i>' : ""}${esc(value || "")}${icon("chev-right")}</span></button></li>`;
+  }
+  function openSub(k) {
+    closeSheet("#status-sheet");
+    SUBS[k]();
+    openSheet(`#${k}-sheet`);
+    if (k === "sources") loadSourcesHealth(false);
+    if (k === "updates") { loadVersion(); loadUpdateStatus(); }
+    if (k === "scrobble") loadScrobble();
+    if (k === "backup") loadBackupStatus();
+  }
+  function backToStatus(w) {
+    closeSheet(w);
+    openStatus();
+  }
+  const shortDate = (ts) => (ts ? new Date(typeof ts === "number" ? ts * 1000 : ts).toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" }) : "");
+  const plural = (n, one, many = one + "s") => `${n} ${n === 1 ? one : many}`;
+  const skel = (n) => '<div class="sk-row"><div class="sk l"></div></div>'.repeat(n);
+
+  // Sources: /api/health/sources (6 s at most, cached 60 s on the server; Refresh asks again).
+  const HL = { ONLINE: "Online", REACHABLE: "Reachable, not working", OFFLINE: "Offline", DISABLED: "Off" };
+  function sourcesSummary() {
+    const r = st.sources;
+    if (!r) return "";
+    const on = r.filter((x) => x.status === "ONLINE").length, bad = r.filter((x) => x.status === "OFFLINE" || x.status === "REACHABLE").length;
+    return bad ? `${on} online · ${bad} down` : `${on} online`;
+  }
+  async function loadSourcesHealth(force) {
+    if (st.sourcesBusy) return;
+    st.sourcesBusy = true;
+    rerender("sources");
+    try { st.sources = await api(`/api/health/sources${force ? "?refresh=1" : ""}`); } catch (e) { toast(`Couldn't check sources: ${e.message}`); }
+    st.sourcesBusy = false;
+    rerender("sources");
+  }
+  function renderSourcesSheet() {
+    const r = st.sources, busy = st.sourcesBusy;
+    const when = r?.[0]?.checked_at ? `Checked ${timeAgo(r[0].checked_at)}` : busy ? "Checking every source…" : "";
+    $("#sources-body").innerHTML = `<div class="st-head"><span>${esc(when)}</span>
+        <button class="chip sm" data-st="refresh-sources"${ON(busy)}>${icon("repeat")}${busy ? "Checking…" : "Refresh"}</button></div>`
+      + (!r ? skel(6) : `<ul class="hl-list">${r.map((x) => `<li class="hl-row">
+          <i class="hl-dot ${esc(x.status.toLowerCase())}" title="${esc(HL[x.status] || x.status)}"></i>
+          <span class="row-text"><span class="row-t">${esc(x.name)}</span>
+            <span class="row-s">${esc(HL[x.status] || x.status)}${x.detail ? ` · ${esc(x.detail)}` : ""}</span></span>
+          <span class="hl-ms">${x.latency_ms != null && x.status !== "DISABLED" ? `${x.latency_ms} ms` : ""}</span></li>`).join("")}</ul>`);
+  }
+
+  // Updates: /api/version (cached 6 h on the server; "Check now" asks GitHub/PyPI again), POST /api/update.
+  const updateAvailable = () => !!(st.version && ((st.version.behind && !st.version.skipped) || st.version.ytdlp_outdated));
+  function updatesSummary() {
+    const v = st.version;
+    if (st.upd?.running) return "Updating…";
+    if (!v) return "";
+    if (v.behind && !v.skipped) return v.behind_count ? `${plural(v.behind_count, "commit")} behind` : "Update available";
+    if (v.ytdlp_outdated) return "yt-dlp update";
+    return v.behind === false ? "Up to date" : (v.reef?.short || "");
+  }
+  async function loadVersion(force) {
+    if (force) { st.versionBusy = true; rerender("updates"); }
+    try { st.version = await api(`/api/version${force ? "?refresh=1" : ""}`); } catch (e) { if (force) toast(`Couldn't check: ${e.message}`); }
+    st.versionBusy = false;
+    rerender("updates");
+  }
+  async function loadUpdateStatus() {
+    try { st.upd = await api("/api/update/status"); } catch { return; }
+    rerender("updates");
+    if (st.upd.running && !st.updTimer) watchUpdate();
+  }
+  function renderUpdatesSheet() {
+    const v = st.version, u = st.upd, running = !!u?.running || st.updDown;
+    if (!v) { $("#updates-body").innerHTML = skel(4); return; }
+    const L = v.latest_reef;
+    const reefState = v.behind === true ? (v.behind_count ? `${plural(v.behind_count, "commit")} behind` : "Behind")
+      : v.behind === false ? "Up to date" : "Unknown (this commit isn't on GitHub)";
+    const rows = [
+      ["Reef", `${v.reef?.short || "?"}${v.reef?.date ? ` · ${shortDate(v.reef.date)}` : ""}`, ""],
+      ["Newest", L ? `${L.short} · ${shortDate(L.date)}` : "—", ""],
+      ["Status", reefState + (v.behind && v.skipped ? " (skipped)" : ""), v.behind && !v.skipped ? "bad" : v.behind === false ? "ok" : ""],
+      ["yt-dlp", v.ytdlp || "—", ""],
+      ["Newest yt-dlp", v.latest_ytdlp || "—", v.ytdlp_outdated ? "bad" : v.latest_ytdlp ? "ok" : ""],
+    ];
+    const allowed = v.self_update?.allowed;
+    const label = { reef: "Reef", ytdlp: "yt-dlp", both: "Reef and yt-dlp" }[u?.what] || "";
+    const progress = u && (running || u.finished_at) ? `<div class="upd-run">
+        <div class="upd-state ${running ? "" : u.result === "ok" ? "ok" : "bad"}">${running ? '<span class="spin"></span>' : ""}${esc(
+          st.updDown ? `Restarting Reef…` : running ? `Updating ${label}…` : u.result === "ok" ? `${label} updated ${timeAgo(u.finished_at)}` : `${label} update failed ${timeAgo(u.finished_at)}`)}</div>
+        ${u.log_tail?.length ? `<pre class="upd-log">${esc(u.log_tail.slice(-8).join("\n"))}</pre>` : ""}</div>` : "";
+    $("#updates-body").innerHTML = `<ul class="status-list">${rows.map(([k, val, c]) => `<li><span class="k">${esc(k)}</span><span class="v ${c}">${esc(val)}</span></li>`).join("")}</ul>`
+      + (L?.message ? `<p class="st-note">Newest: “${esc(L.message)}”</p>` : "")
+      + progress
+      + (allowed ? `<div class="st-btns">
+          ${v.behind ? `<button class="btn-wide" data-st="update-reef"${ON(running)}>Update Reef</button>` : ""}
+          ${v.ytdlp_outdated ? `<button class="btn-wide alt" data-st="update-ytdlp"${ON(running)}>Update yt-dlp to ${esc(v.latest_ytdlp)}</button>` : ""}
+        </div>` : `<p class="st-note">${esc(v.self_update?.reason || "Updates can't run here.")}</p>`)
+      + `<div class="st-actions">
+          <button class="chip sm" data-st="check-updates"${ON(st.versionBusy)}>${icon("repeat")}${st.versionBusy ? "Checking…" : "Check now"}</button>
+          ${v.behind && !v.skipped && L ? `<button class="chip sm" data-st="skip-version">Skip this version</button>` : ""}
+          ${v.skipped ? `<button class="chip sm" data-st="unskip-version">Stop skipping</button>` : ""}
+        </div>`
+      + `<p class="st-note">${v.checked_at ? `Checked ${esc(timeAgo(v.checked_at))}` : "Not checked yet"}${v.errors?.length ? ` · ${esc(v.errors.join("; "))}` : ""}</p>`;
+    const lg = $("#updates-body .upd-log");
+    if (lg) lg.scrollTop = lg.scrollHeight; // the newest lines
+  }
+  async function startUpdate(what) {
+    const label = what === "reef" ? "Reef" : "yt-dlp";
+    if (!confirm(`Update ${label} now? Reef restarts, so playback stops for a few seconds.`)) return;
+    try {
+      st.upd = await api("/api/update", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ what, confirm: true }) });
+    } catch (e) {
+      toast(`Can't update: ${e.message}`);
+      return;
+    }
+    rerender("updates");
+    watchUpdate();
+  }
+  // Poll /api/update/status every 2 s. While Reef restarts nothing answers: poll /api/health until it's back,
+  // then read the result. A finished Reef update reloads the page so the new app.js runs.
+  async function watchUpdate() {
+    clearTimeout(st.updTimer);
+    st.updTimer = 0;
+    let u = null;
+    if (st.updDown) {
+      try { await api("/api/health"); st.updDown = false; } catch { /* still restarting */ }
+    }
+    if (!st.updDown) {
+      try { u = await api("/api/update/status"); } catch { st.updDown = true; }
+    }
+    if (u) st.upd = u;
+    rerender("updates");
+    if (st.updDown || u?.running) { st.updTimer = setTimeout(watchUpdate, 2000); return; }
+    if (!u) return;
+    if (u.result === "ok") {
+      toast(`${u.what === "ytdlp" ? "yt-dlp" : "Reef"} updated`);
+      if (u.what !== "ytdlp") { setTimeout(() => location.reload(), 1500); return; }
+      loadVersion();
+      loadHealth();
+    } else {
+      toast("Update failed. The log is in Server → Updates.");
+    }
+  }
+
+  // Scrobbling: ListenBrainz token (write-only; the field never shows the saved one), on/off, queue.
+  function scrobbleSummary() {
+    const s = st.scrob;
+    if (!s) return "";
+    if (!s.token_set) return "Off";
+    if (s.token_valid === false) return "Token not valid";
+    if (!s.scrobble_enabled) return "Paused";
+    return (s.user_name || "On") + (s.pending ? ` · ${s.pending} waiting` : "");
+  }
+  async function loadScrobble() {
+    try { st.scrob = await api("/api/scrobble/status"); } catch { /* keep the last */ }
+    rerender("scrobble");
+  }
+  function renderScrobbleSheet() {
+    const s = st.scrob;
+    if (!s) { $("#scrobble-body").innerHTML = skel(3); return; }
+    const who = !s.token_set ? ["No token", ""] : s.user_name ? [s.user_name, "ok"] : s.token_valid === false ? ["Token not valid", "bad"] : ["Not checked yet", ""];
+    $("#scrobble-body").innerHTML = `<p class="st-note st-lead">Counted listens (30 s or half the song) go to ListenBrainz. Get your user token at
+        <a href="https://listenbrainz.org/settings/" target="_blank" rel="noopener">listenbrainz.org/settings</a>.</p>
+      <form class="st-form" id="lb-form" autocomplete="off">
+        <input class="st-input" id="lb-token" type="password" autocomplete="off" autocapitalize="off" spellcheck="false"
+          placeholder="${s.token_set ? "Saved · paste to replace" : "Paste your ListenBrainz token"}" aria-label="ListenBrainz token">
+        <button class="chip" type="submit"${ON(st.tokenBusy)}>${st.tokenBusy ? "Checking…" : "Save"}</button>
+      </form>
+      <ul class="status-list">
+        <li><span class="k">Account</span><span class="v ${who[1]}">${esc(who[0])}</span></li>
+        <li class="st-toggle"><label for="lb-on"><span class="k">Scrobble listens</span>
+          <input type="checkbox" class="sw" id="lb-on"${s.scrobble_enabled ? " checked" : ""}${s.token_set ? "" : " disabled"}></label></li>
+        <li><span class="k">Waiting to send</span><span class="v">${s.pending}</span></li>
+        <li><span class="k">Sent</span><span class="v">${s.submitted}${s.last_ok_at ? ` · last ${esc(timeAgo(s.last_ok_at))}` : ""}</span></li>
+      </ul>
+      ${s.last_error ? `<p class="st-note bad">${esc(s.last_error)}${s.retry_at ? ` · retrying ${esc(untilText(s.retry_at))}` : ""}</p>` : ""}
+      ${s.token_set ? `<div class="st-actions"><button class="chip sm" data-st="validate-token"${ON(st.tokenBusy)}>${icon("repeat")}Check token</button>
+        <button class="chip sm" data-st="clear-token"${ON(st.tokenBusy)}>${icon("x")}Remove token</button></div>` : ""}`;
+  }
+  function untilText(ts) {
+    const d = Math.max(0, Math.round(ts - Date.now() / 1000));
+    return d < 60 ? "in a moment" : d < 3600 ? `in ${Math.round(d / 60)} min` : `in ${Math.round(d / 3600)} h`;
+  }
+  async function saveToken(value) {
+    st.tokenBusy = true;
+    rerender("scrobble");
+    try {
+      await api("/api/settings", { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ listenbrainz_token: value }) });
+      await loadScrobble();
+      const s = st.scrob;
+      toast(!value ? "Token removed" : s?.user_name ? `Scrobbling as ${s.user_name}` : s?.token_valid === false ? "ListenBrainz says that token isn't valid" : (s?.last_error || "Token saved"));
+    } catch (e) {
+      toast(`Couldn't save: ${e.message}`);
+    }
+    st.tokenBusy = false;
+    rerender("scrobble");
+  }
+  async function setScrobbling(on) {
+    try {
+      await api("/api/settings", { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ scrobble_enabled: on }) });
+    } catch (e) { toast(`Couldn't change it: ${e.message}`); }
+    loadScrobble();
+  }
+  async function validateToken() {
+    st.tokenBusy = true;
+    rerender("scrobble");
+    try { st.scrob = await api("/api/scrobble/validate", { method: "POST" }); } catch (e) { toast(`Couldn't check: ${e.message}`); }
+    st.tokenBusy = false;
+    rerender("scrobble");
+  }
+
+  // Backup: download (GET /api/backup), restore (POST /api/restore, merge or replace), daily snapshots.
+  function backupSummary() {
+    const b = st.backup;
+    return b?.last_auto_at ? `Saved ${timeAgo(b.last_auto_at)}` : b ? "No backup yet" : "";
+  }
+  async function loadBackupStatus() {
+    try { st.backup = await api("/api/backup/status"); } catch { /* keep the last */ }
+    rerender("backup");
+  }
+  function renderBackupSheet() {
+    const b = st.backup, r = st.restored, f = st.restoreFile;
+    const autos = (b?.snapshots || []).filter((x) => x.kind === "auto").length;
+    $("#backup-body").innerHTML = `<p class="st-note st-lead">Your kept-song list, listens, likes, playlists, hidden artists, lyrics and
+        preferences in one file. Never your ListenBrainz token or passwords.</p>
+      <a class="btn-wide alt" href="/api/backup" download>${icon("download")}Download backup</a>
+      <h4 class="st-sub">Restore</h4>
+      <label class="st-file">${icon("note")}<span>${esc(f ? f.name : "Choose a backup file")}</span>
+        <input type="file" id="restore-file" accept=".json,application/json"></label>
+      <div class="seg st-seg">
+        <button data-st="mode-merge" class="${st.restoreMode === "merge" ? "on" : ""}">Merge</button>
+        <button data-st="mode-replace" class="${st.restoreMode === "replace" ? "on" : ""}">Replace</button>
+      </div>
+      <p class="st-note">${st.restoreMode === "merge" ? "Merge adds what's missing; where both have an item, the newer copy wins." : "Replace swaps each section for the backup's copy."}
+        Reef saves a copy of the current data first.</p>
+      <button class="btn-wide" data-st="restore"${ON(!f || st.restoreBusy)}>${st.restoreBusy ? "Restoring…" : "Restore"}</button>
+      ${r ? `<p class="st-note ok">Restored (${esc(r.mode)}): ${esc(Object.entries(r.sections).map(([k, c]) => `${k} ${c.after}`).join(", "))}</p>` : ""}
+      <ul class="status-list">
+        <li><span class="k">Last automatic backup</span><span class="v">${b?.last_auto_at ? esc(timeAgo(b.last_auto_at)) : b ? "Not yet" : ""}</span></li>
+        <li><span class="k">Daily copies kept</span><span class="v">${b ? `${autos} of 7` : ""}</span></li>
+      </ul>`;
+  }
+  async function restoreBackup() {
+    const f = st.restoreFile, mode = st.restoreMode;
+    if (!f || st.restoreBusy) return;
+    if (!confirm(`${mode === "replace" ? "Replace" : "Merge"} Reef's data with “${f.name}”? A copy of the current data is saved first.`)) return;
+    st.restoreBusy = true;
+    rerender("backup");
+    const fd = new FormData();
+    fd.append("file", f);
+    fd.append("mode", mode);
+    try {
+      st.restored = await api("/api/restore", { method: "POST", body: fd });
+      st.restoreFile = null;
+      toast("Backup restored");
+      loadSettings();
+      loadHistory();
+      loadBlocklist();
+      loadHome();
+    } catch (e) {
+      toast(`Couldn't restore: ${e.message}`);
+    }
+    st.restoreBusy = false;
+    loadBackupStatus();
+  }
+
+  function statusAction(a, el) {
+    if (SUBS[a]) { openSub(a); return; }
+    if (a === "back") { backToStatus(el.closest(".sheet-wrap")); return; }
+    if (a === "refresh-sources") { loadSourcesHealth(true); return; }
+    if (a === "check-updates") { loadVersion(true); return; }
+    if (a === "update-reef") { startUpdate("reef"); return; }
+    if (a === "update-ytdlp") { startUpdate("ytdlp"); return; }
+    if (a === "skip-version" || a === "unskip-version") {
+      const sha = a === "skip-version" ? st.version?.latest_reef?.sha : null;
+      api("/api/settings", { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ skipped_version: sha }) })
+        .then(() => { toast(sha ? "Skipped this version" : "Showing updates again"); loadVersion(); })
+        .catch((e) => toast(`Couldn't save: ${e.message}`));
+      return;
+    }
+    if (a === "validate-token") { validateToken(); return; }
+    if (a === "clear-token") { if (confirm("Remove the ListenBrainz token? Listens stop being sent.")) saveToken(""); return; }
+    if (a === "mode-merge" || a === "mode-replace") { st.restoreMode = a.slice(5); rerender("backup"); return; }
+    if (a === "restore") restoreBackup();
+  }
+  $("#scrobble-body").addEventListener("submit", (e) => {
+    e.preventDefault();
+    const v = $("#lb-token").value.trim();
+    if (!v) { toast("Paste the token first"); return; }
+    saveToken(v);
+  });
+  $("#scrobble-body").addEventListener("change", (e) => { if (e.target.id === "lb-on") setScrobbling(e.target.checked); });
+  $("#backup-body").addEventListener("change", (e) => {
+    if (e.target.id !== "restore-file") return;
+    st.restoreFile = e.target.files?.[0] || null;
+    st.restored = null;
+    renderBackupSheet();
+  });
 
   // ---------- sheets ----------
   function openSheet(sel) {
@@ -2801,7 +3115,7 @@
 
   // ---------- events ----------
   document.addEventListener("click", (e) => {
-    const t = e.target.closest("[data-keep],[data-play],[data-search],[data-source],[data-home-tab],[data-filter],[data-dismiss],[data-play-all],[data-shuffle-all],[data-close],[data-clear-finished],[data-clear-searches],[data-more],[data-act],[data-q-jump],[data-q-remove],[data-q-clear],[data-q-mode],[data-sleep],[data-fill],[data-keep-all],[data-retry],[data-page-radio],[data-artist-hide],[data-unhide],[data-unhide-page],[data-open-hidden],[data-yt-reset],[data-copy-diag],[data-about],[data-mix]");
+    const t = e.target.closest("[data-keep],[data-play],[data-search],[data-source],[data-home-tab],[data-filter],[data-dismiss],[data-play-all],[data-shuffle-all],[data-close],[data-clear-finished],[data-clear-searches],[data-more],[data-act],[data-q-jump],[data-q-remove],[data-q-clear],[data-q-mode],[data-sleep],[data-fill],[data-keep-all],[data-retry],[data-page-radio],[data-artist-hide],[data-unhide],[data-unhide-page],[data-open-hidden],[data-yt-reset],[data-copy-diag],[data-about],[data-mix],[data-st]");
     if (!t) return;
     const d = t.dataset;
     if ("keep" in d) { e.preventDefault(); if (d.keep) keep(d.keep, d.list); return; }
@@ -2821,6 +3135,7 @@
     if ("openHidden" in d) { openHidden(); return; }
     if ("ytReset" in d) { resetYouTube(); return; }
     if ("copyDiag" in d) { copyDiagnostics(); return; }
+    if ("st" in d) { if (!t.disabled) statusAction(d.st, t); return; }
     if ("about" in d) {
       detail.about = !detail.about;
       $("#about")?.classList.toggle("clamp", !detail.about);

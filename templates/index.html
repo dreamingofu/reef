@@ -158,9 +158,45 @@
 
 <div class="sheet-wrap" id="status-sheet" hidden>
   <div class="scrim" data-close></div>
-  <div class="sheet" role="dialog" aria-label="Server status">
+  <div class="sheet tall" role="dialog" aria-label="Server status">
     <div class="sheet-top"><div class="grabber"></div><h3>Server</h3></div>
-    <ul class="status-list" id="status-list"></ul>
+    <div class="sheet-body"><ul class="status-list" id="status-list"></ul></div>
+    <button class="btn-wide" data-close>Done</button>
+  </div>
+</div>
+
+<div class="sheet-wrap" id="sources-sheet" hidden>
+  <div class="scrim" data-close></div>
+  <div class="sheet tall" role="dialog" aria-label="Sources">
+    <div class="sheet-top"><div class="grabber"></div><div class="head-row st-top"><button class="icon-btn st-back" data-st="back" aria-label="Back to Server"><svg class="i"><use href="#i-chev-left"/></svg></button><h3>Sources</h3></div></div>
+    <div class="sheet-body" id="sources-body"></div>
+    <button class="btn-wide" data-close>Done</button>
+  </div>
+</div>
+
+<div class="sheet-wrap" id="updates-sheet" hidden>
+  <div class="scrim" data-close></div>
+  <div class="sheet tall" role="dialog" aria-label="Updates">
+    <div class="sheet-top"><div class="grabber"></div><div class="head-row st-top"><button class="icon-btn st-back" data-st="back" aria-label="Back to Server"><svg class="i"><use href="#i-chev-left"/></svg></button><h3>Updates</h3></div></div>
+    <div class="sheet-body" id="updates-body"></div>
+    <button class="btn-wide" data-close>Done</button>
+  </div>
+</div>
+
+<div class="sheet-wrap" id="scrobble-sheet" hidden>
+  <div class="scrim" data-close></div>
+  <div class="sheet tall" role="dialog" aria-label="Scrobbling">
+    <div class="sheet-top"><div class="grabber"></div><div class="head-row st-top"><button class="icon-btn st-back" data-st="back" aria-label="Back to Server"><svg class="i"><use href="#i-chev-left"/></svg></button><h3>Scrobbling</h3></div></div>
+    <div class="sheet-body" id="scrobble-body"></div>
+    <button class="btn-wide" data-close>Done</button>
+  </div>
+</div>
+
+<div class="sheet-wrap" id="backup-sheet" hidden>
+  <div class="scrim" data-close></div>
+  <div class="sheet tall" role="dialog" aria-label="Backup">
+    <div class="sheet-top"><div class="grabber"></div><div class="head-row st-top"><button class="icon-btn st-back" data-st="back" aria-label="Back to Server"><svg class="i"><use href="#i-chev-left"/></svg></button><h3>Backup</h3></div></div>
+    <div class="sheet-body" id="backup-body"></div>
     <button class="btn-wide" data-close>Done</button>
   </div>
 </div>

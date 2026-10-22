@@ -22,3 +22,27 @@ os.environ["REEF_PIPED_INSTANCES"] = ""
 os.environ["REEF_INVIDIOUS_INSTANCES"] = ""
 
 sys.path.insert(0, str(ROOT))
+
+
+import pytest  # noqa: E402  (after the environment above is set)
+import requests  # noqa: E402
+
+
+class NoNetwork:
+    """Stands in for the requests sessions of scrobble / updater / health: nothing in the suite reaches
+    ListenBrainz, GitHub, PyPI or a source by accident (a settings PATCH with a token validates it, for one)."""
+    headers = {}
+
+    def request(self, *a, **k):
+        raise requests.ConnectionError("network is off in tests")
+
+    get = post = head = request
+
+
+@pytest.fixture(autouse=True)
+def _offline_sessions(monkeypatch):
+    import health
+    import scrobble
+    import updater
+    for mod in (scrobble, updater, health):
+        monkeypatch.setattr(mod, "_session", NoNetwork())

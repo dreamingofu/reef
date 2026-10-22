@@ -91,6 +91,8 @@ Pass the Navidrome password through the environment. Don't put it in a committed
   for read-modify-write) and `clean_track` (the only place client track dicts are trimmed before storing).
   `listens.py` (play log + pure stats/recap aggregates), `likes.py`, `playlists.py` (+ `.m3u`), `settings.py`
   (runtime overrides of env defaults) sit on it; their files default next to history.json (Round 10).
+- `scrobble.py` (ListenBrainz queue + worker), `updater.py` (version check, in-app update child), `backup.py`
+  (backup / restore / daily snapshots), `health.py` (`/api/health/sources`): Round 12.
 - `log.py`: logging setup (stderr + `logs/reef.log` rotated 1 MB × 5 + a 300-line in-memory tail), `redact()` for
   signed-URL params / Subsonic tokens / cookies. Modules log through `logging.getLogger(__name__)`, no print().
 - `termux/reef-run.sh`: restart loop with backoff; `termux/reef-boot.sh` (Termux:Boot) (re)starts it.
@@ -319,6 +321,92 @@ New files `dislikes.json`, `home.json` (git-ignored; `REEF_DISLIKES_FILE` / `REE
 - `POST /api/dislikes/<id>` → 201/200 `{entry: track + {at, until, artist_key, artist_id, blocked?}, created,
   blocked: blocklist entry|null}`; 400 body id mismatch, 404 bad id. `DELETE` → 204/404. `GET /api/dislikes` → marks
   of the last 30 days, newest first.
+
+## Round 12 (2026-10-22): scrobbling, updates, backup, source health (production plan P1.4, P1.11-P1.13)
+
+New files `scrobbles.json`, `update.json`, `backups/` (git-ignored; `REEF_SCROBBLES_FILE` / `REEF_UPDATE_FILE` /
+`REEF_BACKUP_DIR`, next to history.json). Status sheet → four new rows that open sub-sheets (back arrow returns):
+**Sources**, **Updates**, **Scrobbling**, **Backup**. The Server sheet now scrolls (`.sheet.tall`).
+
+- **Scrobbling** (`scrobble.py`, ListenBrainz only; Last.fm and `playing_now` skipped: the player reports plays
+  only when they end). A counted listen (`POST /api/listens`) with a token set and `scrobble_enabled` on is queued
+  (`scrobbles.json` `pending`, cap 2000) and a worker thread (`reef-scrobble`) submits it as `listen_type: single`
+  with `track_metadata {artist_name (artists joined, else tagging.guess on the YouTube title/channel), track_name,
+  release_name?, additional_info {submission_client, media_player: "Reef", duration_ms?, origin_url + music_service
+  for YouTube ids}}`. Offline / 429 / 5xx → queue-wide backoff 30 s doubling to 1 h (Retry-After /
+  X-RateLimit-Reset-In honoured); other 4xx → that listen is dropped and logged; **401 keeps the listens** and pauses
+  1 h (until a new token validates) instead of dropping them (deviation from "drop on 4xx": a typo shouldn't lose a
+  week of scrobbles); anything queued > 14 days is dropped. Submitted keys `<id>@<started_at>` are remembered (last
+  1000) and the listen entry gets `scrobbled: true` (kept when a later report of the same play replaces the entry).
+  Saving the token (`PATCH /api/settings`) runs `GET /1/validate-token` (≤ 10 s) and stores the user name. The token
+  is never logged, returned, in diagnostics or backups (only a sha256 prefix, to tie the user name to it).
+- **Update check + in-app update** (`updater.py`). `/api/version` compares `git log -1` with GitHub
+  `commits/main` (If-None-Match → free 304s) and, once per new pair, `compare/<local>...<latest>` for the count;
+  yt-dlp vs PyPI `info.version` compared numerically (PyPI drops leading zeros: 2026.8.19 = 2026.08.19). Cached in
+  `update.json` 6 h (30 min after a failure); a `reef-chores` thread (every 60 s, first after 60 s) refreshes it when
+  due and takes the daily backup. `POST /api/update {what, confirm: true}` → 202, the child runs in its own session
+  with output in `logs/update.log`: `reef` = `bash termux/update.sh` (unchanged; `REEF_UPDATE_PIP="<python> -m
+  pip"`), `ytdlp` = `python updater.py ytdlp` (pip -U, restart via `~/.termux/boot/reef.sh` or termux/reef-boot.sh,
+  wait ≤ 30 s for /api/diagnostics to report the new yt-dlp, else reinstall the old one and restart), `both` = the
+  yt-dlp step then update.sh. Guards: loopback/Tailscale socket address only (a REEF_PASSWORD client on the LAN gets
+  403), `confirm: true`, one run at a time (409), and Termux only (`PREFIX`/`TERMUX_VERSION`/the Termux files dir)
+  unless `REEF_ALLOW_SELF_UPDATE=1` — for **both** targets, not just reef (the restart needs the Termux supervisor).
+  The run (pid, start) is in `update.json`, so the restarted process still reports it; result = the log's last
+  `UPDATE_OK` / `UPDATE_FAILED` line. The client polls `/api/update/status` every 2 s, polls `/api/health` while the
+  server is down, toasts the result and reloads the page after a Reef update. "Skip this version" =
+  `PATCH /api/settings {skipped_version: <latest sha>}`.
+- **Backup / restore** (`backup.py`). `GET /api/backup` builds `{"format": "reef-backup", "schemaVersion": 1,
+  createdAt, app: {reef}, sections: {history, lyrics (hits only), listens, likes, playlists, dislikes, blocklist,
+  settings}}`, writes it to a temp file, reads it back, validates and serves it as `reef-backup-<date>.json`.
+  Settings are an allow-list of preferences (`backup.SETTINGS_KEYS`): never the token, instance URLs or
+  `skipped_version`. `POST /api/restore` (multipart `file` + `mode`, or a JSON body + `?mode=`; ≤ 20 MB via
+  Flask 3.1's per-request `max_content_length`, the rest of the app keeps 4 MB) refuses another format / newer schema
+  / a section of the wrong type, skips + counts bad items, snapshots to `backups/pre-restore-<UTC ts>[-n].json`
+  (keep 10), then rewrites each store under its own lock with its atomic write. `replace` swaps each section present
+  in the file; `merge` unions by id, strictly newer wins (kept_at / liked_at / at / updated_at; listens by
+  (id, started_at), longer play wins; settings: what's set here stays), so a second merge is a no-op. Sections absent
+  from the file are untouched. History `file` paths are kept only when the file exists on this device. Daily
+  `backups/auto-<ts>.json`, keep 7. Measured on the Mac: a 6.5 MB backup (19 000 listens) restores in ~0.15 s.
+- **Source health** (`health.py`). `GET /api/health/sources` runs every check in parallel (6 s each, a check that
+  doesn't answer is OFFLINE), cached 60 s (`?refresh=1` re-runs). YouTube = a stream that played in the last 10 min,
+  else `streamer.resolve(dQw4w9WgXcQ)` (shares the stream cache); YouTube Music = an uncached suggestions call;
+  each Monochrome / Piped / Invidious instance (search JSON); Navidrome ping; LRCLIB `/api/get`; ListenBrainz
+  validate-token (with a token); GitHub / PyPI HEAD. Its own requests session, so checks never cool failover hosts.
+  On the Mac: YouTube 1.3 s cold, the whole panel ~1.3 s, cached 11 ms.
+- **Instance lists in Settings**: `tracks_api`, `piped_instances`, `invidious_instances` (type `urls`:
+  comma-separated string or list, http(s) only, ≤ 10; blank = the reef.env list). Monochrome and an enabled
+  Piped/Invidious follow a change at once; turning Piped/Invidious on from an empty env list takes a restart
+  (fallbacks register at start). New settings types `text` (skipped_version) and `urls`; new bool `scrobble_enabled`.
+
+### API shapes
+
+- `GET /api/scrobble/status` → `{enabled, token_set, scrobble_enabled, pending, submitted, last_ok_at, last_error,
+  last_error_at, retry_at, user_name, token_valid (true|false|null = not checked / unreachable), validated_at}`.
+  `POST /api/scrobble/validate` → the same after asking ListenBrainz.
+- `GET /api/version[?refresh=1]` → `{reef: {sha, short, date (epoch)}, latest_reef: {sha, short, date (ISO),
+  message}|null, behind: bool|null (null = GitHub doesn't know this commit), behind_count, ytdlp, latest_ytdlp,
+  ytdlp_outdated, checked_at, skipped_version, skipped, errors: [str], self_update: {allowed, reason}}`.
+- `POST /api/update {what: reef|ytdlp|both, confirm: true}` → 202 status | 400 / 403 / 409 `{error}`.
+  `GET /api/update/status` → `{running, what, started_at, finished_at, result: ok|failed|null, log_tail: [≤ 20
+  redacted lines]}`.
+- `GET /api/backup` → the file. `GET /api/backup/status` → `{last_auto_at, snapshots: [{name, kind: auto|pre-restore,
+  at, size}], max_bytes, sections}`. `POST /api/restore` → `{mode, snapshot, sections: {name: {before, in_backup,
+  skipped, after}}}` | 400 / 413 `{error}`.
+- `GET /api/health/sources[?refresh=1]` → `[{name, kind: youtube|ytmusic|monochrome|piped|invidious|navidrome|
+  lyrics|scrobble|updates, status: ONLINE|REACHABLE|OFFLINE|DISABLED, latency_ms, detail, checked_at}]`.
+
+### To check on the phone
+
+1. Deploy as usual (`bash ~/reef/termux/update.sh`); no new packages.
+2. Status → Updates should show this commit; after the next push, "Update Reef" end to end: confirm, the log tail
+   moves, the page goes quiet during the restart, then "Reef updated" and the page reloads on the new commit
+   (`logs/update.log` has the run). Also "Update yt-dlp" (restart + /api/diagnostics shows the new version).
+   Check that `is_termux()` is true under Termux:Boot (`PREFIX` set) — else the buttons say "only on Termux".
+3. Scrobbling: paste the real token → "Scrobbling as <user>"; play a song > 30 s, it shows on listenbrainz.org
+   within a minute; airplane mode → "Waiting to send" grows, then drains when back online.
+4. Backup: Download on iPhone Safari (saves to Files), then Restore from that file with Merge; check
+   `~/reef/backups/` gets `auto-*.json` daily.
+5. Sources: the panel on cellular vs Wi-Fi, and how long the YouTube row takes on the phone.
 
 ## Production plan (2026-10-21)
 

@@ -71,6 +71,8 @@ def record(body, now=None):
             e = items[i]
             if e.get("id") == entry["id"] and e.get("started_at") == entry["started_at"]:
                 if entry["played_s"] >= e.get("played_s", 0):
+                    if e.get("scrobbled"):
+                        entry["scrobbled"] = True  # ListenBrainz has it: a later report mustn't submit it again
                     items[i] = entry  # the later, longer report knows more (counted, skipped, end)
                     _file.save(items)
                 return dict(items[i]), False
@@ -79,6 +81,23 @@ def record(body, now=None):
             del items[:len(items) - MAX]
         _file.save(items)
         return dict(entry), True
+
+
+def mark_scrobbled(keys):
+    """Flag the entries ListenBrainz accepted, by (id, started_at) (scrobble.py); returns how many."""
+    want = {(tid, int(ts)) for tid, ts in keys}
+    n = 0
+    with _file.lock:
+        items = _file.load()
+        for e in reversed(items):
+            if (e.get("id"), e.get("started_at")) in want and not e.get("scrobbled"):
+                e["scrobbled"] = True
+                n += 1
+                if n == len(want):
+                    break
+        if n:
+            _file.save(items)
+    return n
 
 
 def entries():

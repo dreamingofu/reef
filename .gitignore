@@ -28,3 +28,8 @@ dislikes.json
 dislikes.json.tmp
 home.json
 home.json.tmp
+scrobbles.json
+scrobbles.json.tmp
+update.json
+update.json.tmp
+backups/

@@ -5,7 +5,7 @@ Enabled by REEF_PIPED_INSTANCES (registered in sources/__init__.py); instances m
 import re
 from urllib.parse import quote
 
-import config
+import settings
 
 from . import failover
 
@@ -16,9 +16,10 @@ _VIDEO_ID = re.compile(r"[?&]v=([A-Za-z0-9_-]{11})(?:&|$)")
 
 
 def _instances():
-    if not config.PIPED_INSTANCES:
+    instances = settings.get("piped_instances")  # REEF_PIPED_INSTANCES unless set in Settings
+    if not instances:
         raise RuntimeError("no Piped instances configured")
-    return config.PIPED_INSTANCES[:MAX_INSTANCES]
+    return instances[:MAX_INSTANCES]
 
 
 def search(q, limit):

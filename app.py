@@ -1,5 +1,6 @@
 import hmac
 import ipaddress
+import json
 import logging
 import os
 import platform
@@ -14,11 +15,14 @@ from zoneinfo import ZoneInfo
 
 import yt_dlp
 from flask import Flask, Response, abort, jsonify, redirect, render_template, request
+from werkzeug.exceptions import BadRequest, RequestEntityTooLarge
 
+import backup
 import blocklist
 import config
 import downloader
 import errors
+import health as source_health
 import history
 import home
 import likes
@@ -28,12 +32,14 @@ import lyrics
 import navidrome
 import playlists
 import recommend
+import scrobble
 import settings
 import sources
 import store
 import streamer
 import tagging
 import tiles
+import updater
 import ytmusic
 
 logger = logging.getLogger(__name__)
@@ -161,9 +167,9 @@ def _config_summary():
         "open": config.OPEN, "password_set": bool(config.PASSWORD),
         "download_dir": str(config.DOWNLOAD_DIR), "default_source": settings.get("default_source"),
         "yt_client": config.YT_CLIENT, "ytmusic": settings.get("ytmusic"),
-        "tracks_api": [_safe_url(u) for u in config.TRACKS_API],
-        "piped": [_safe_url(u) for u in config.PIPED_INSTANCES],
-        "invidious": [_safe_url(u) for u in config.INVIDIOUS_INSTANCES],
+        "tracks_api": [_safe_url(u) for u in settings.get("tracks_api")],
+        "piped": [_safe_url(u) for u in settings.get("piped_instances")],
+        "invidious": [_safe_url(u) for u in settings.get("invidious_instances")],
         "navidrome": {"url": _safe_url(config.NAVIDROME_URL), "configured": navidrome.configured()},
         "sponsorblock": settings.get("sponsorblock_keep"), "replaygain": settings.get("replaygain"),
         "lrc_sidecar": settings.get("lrc_sidecar"), "prefer_library": settings.get("prefer_library"),
@@ -187,6 +193,10 @@ def api_diagnostics():
         "yt_gates": sources.youtube.gates.snapshot(),
         "failover_cooling": sources.failover.cooling(),
         "home": home.status(),
+        "scrobble": {k: v for k, v in scrobble.status().items()
+                     if k in ("enabled", "token_set", "pending", "submitted", "last_ok_at", "last_error", "retry_at")},
+        "update": {k: v for k, v in updater.status().items() if k != "log_tail"},
+        "backup": {"last_auto_at": backup.status()["last_auto_at"]},
         "jobs": [{k: j.get(k) for k in ("id", "status", "error")} for j in downloader.list_jobs()][:20],
         "log": log.recent(),
     }))
@@ -675,6 +685,10 @@ def api_listens_add():
             home.listened()  # enough new listens: rebuild Home in the background
         except Exception as e:
             logger.warning(f"home: tick after listen failed: {str(e)[:200]}")
+        try:
+            scrobble.listened(entry)  # queued for ListenBrainz when a token is set (no-op when it's in already)
+        except Exception as e:
+            logger.warning(f"scrobble: queueing failed: {str(e)[:200]}")
     return jsonify({"entry": entry, "created": created}), 201 if created else 200
 
 
@@ -919,11 +933,112 @@ def api_settings():
 
 @app.patch("/api/settings")
 def api_settings_patch():
+    body = request.get_json(silent=True)
     try:
-        settings.update(request.get_json(silent=True))
+        settings.update(body)
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
+    if "listenbrainz_token" in body:
+        scrobble.token_changed()  # checks the new token with ListenBrainz (a few seconds at most)
     return _settings_body()
+
+
+# ---------- scrobbling (ListenBrainz) ----------
+
+@app.get("/api/scrobble/status")
+def api_scrobble_status():
+    return jsonify(scrobble.status())
+
+
+@app.post("/api/scrobble/validate")
+def api_scrobble_validate():
+    return jsonify(scrobble.validate())
+
+
+# ---------- update check, in-app update ----------
+
+@app.get("/api/version")
+def api_version():
+    """This checkout and yt-dlp vs the newest on GitHub / PyPI (cached 6 h; ?refresh=1 asks again)."""
+    return jsonify(updater.check(force=request.args.get("refresh") == "1"))
+
+
+@app.post("/api/update")
+def api_update():
+    """{what: reef|ytdlp|both, confirm: true}: starts the update in a detached child and answers at once.
+    Only from loopback / Tailscale, even when REEF_PASSWORD lets other networks in."""
+    if not trusted(request.remote_addr):
+        return jsonify({"error": "updates can only be started over Tailscale or on the phone itself"}), 403
+    body = request.get_json(silent=True) or {}
+    if not isinstance(body, dict):
+        return jsonify({"error": "send a JSON object"}), 400
+    try:
+        return jsonify(updater.start(body.get("what"), body.get("confirm"))), 202
+    except updater.UpdateError as e:
+        return jsonify({"error": str(e)}), e.status
+
+
+@app.get("/api/update/status")
+def api_update_status():
+    resp = jsonify(updater.status())
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+# ---------- backup and restore ----------
+
+@app.get("/api/backup")
+def api_backup():
+    try:
+        name, raw = backup.download()
+    except Exception as e:
+        logger.warning(f"backup: download failed: {str(e)[:200]}")
+        return jsonify({"error": f"couldn't build the backup: {str(e)[:200]}"}), 500
+    return Response(raw, content_type="application/json; charset=utf-8",
+                    headers={"Content-Disposition": f'attachment; filename="{name}"', "Cache-Control": "no-store"})
+
+
+@app.get("/api/backup/status")
+def api_backup_status():
+    return jsonify(backup.status())
+
+
+@app.post("/api/restore")
+def api_restore():
+    """A backup as a multipart `file` (+ `mode` field) or as the JSON body (?mode=); mode replace|merge."""
+    try:
+        request.max_content_length = backup.MAX_BYTES  # Flask >= 3.1; older: the app-wide 4 MB applies
+    except AttributeError:
+        pass
+    if (request.content_length or 0) > backup.MAX_BYTES:
+        return jsonify({"error": "the backup is larger than 20 MB"}), 413
+    mode = request.args.get("mode") or "merge"
+    try:
+        if request.files.get("file"):
+            mode = request.form.get("mode") or mode
+            raw = request.files["file"].read(backup.MAX_BYTES + 1)
+            if len(raw) > backup.MAX_BYTES:
+                return jsonify({"error": "the backup is larger than 20 MB"}), 413
+            doc = json.loads(raw)
+        else:
+            doc = request.get_json(force=True, silent=False)
+    except RequestEntityTooLarge:
+        return jsonify({"error": "the backup is larger than 20 MB"}), 413
+    except (ValueError, UnicodeDecodeError, BadRequest):
+        return jsonify({"error": "that file isn't JSON"}), 400
+    try:
+        return jsonify(backup.restore(doc, mode))
+    except backup.BackupError as e:
+        return jsonify({"error": str(e)}), 400
+
+
+# ---------- source health ----------
+
+@app.get("/api/health/sources")
+def api_health_sources():
+    resp = jsonify(source_health.sources_health(force=request.args.get("refresh") == "1"))
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
 
 
 @app.get("/api/library/recent")
@@ -1060,11 +1175,25 @@ def api_tiles():
     return jsonify(tiles.load())
 
 
+def _chores():
+    """Every minute: the update check and the daily backup, each when it's due (they decide)."""
+    time.sleep(60)  # let start-up (and the first requests) go first
+    while True:
+        for name, fn in (("update check", updater.tick), ("backup", backup.tick)):
+            try:
+                fn()
+            except Exception as e:
+                logger.warning(f"chores: {name} failed: {str(e)[:200]}")
+        time.sleep(60)
+
+
 def main():
     log.setup()
     downloader.start_worker()
     tiles.start_refresher()
     home.start_refresher()
+    scrobble.start_worker()
+    threading.Thread(target=_chores, daemon=True, name="reef-chores").start()
     server = "flask-dev" if config.DEV else "waitress"
     logger.info(f"reef start host={config.HOST} port={config.PORT} server={server} version={_version()} "
                 f"open={int(config.OPEN)} password={int(bool(config.PASSWORD))} downloads={config.DOWNLOAD_DIR}")

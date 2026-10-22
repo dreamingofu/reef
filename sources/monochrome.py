@@ -5,6 +5,7 @@ from urllib.parse import quote, urlencode
 
 import config
 import history
+import settings
 
 from . import failover
 from .base import BROWSER_UA, Source
@@ -19,12 +20,17 @@ class Monochrome(Source):
     can_keep = True
     codec_label = "FLAC"
 
-    def __init__(self, instances):
-        self.instances = list(instances)
+    def __init__(self, instances, setting=None):
+        self._instances = list(instances)
+        self._setting = setting  # settings key whose override (Settings / status sheet) replaces the list
         self._tracks = {}  # native id -> {title, artists, artwork, releaseId, duration}
         self._albums = {}  # releaseId -> album title ("" when the lookup failed)
         self._healthy = (None, 0.0)  # (instance base, expires)
         self._lock = threading.Lock()
+
+    @property
+    def instances(self):
+        return settings.get(self._setting) if self._setting else self._instances
 
     def enabled(self):
         return bool(self.instances)
@@ -60,7 +66,7 @@ class Monochrome(Source):
 
     def _base_for(self, path):
         base, expires = self._healthy
-        if base and expires > time.time():
+        if base and expires > time.time() and base in self.instances:
             return base
         r = failover.request(self.instances, path, headers={"Range": "bytes=0-0"}, stream=True)
         r.close()
@@ -112,4 +118,4 @@ class Monochrome(Source):
                 "art": self._artwork(native_id), "duration": t.get("duration"), "isrc": t.get("isrc")}
 
 
-SOURCE = Monochrome(config.TRACKS_API)
+SOURCE = Monochrome(config.TRACKS_API, setting="tracks_api")
