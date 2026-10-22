@@ -14,6 +14,7 @@ from urllib3.exceptions import ProtocolError, ReadTimeoutError
 import config
 import errors
 import sources
+import testaudio
 from sources.youtube import client_of
 from sources.youtube import ydl_options  # noqa: F401  (re-exported for scripts/bench_resolve.py)
 
@@ -308,6 +309,7 @@ def _warm(track_id):
 
 def prefetch(ids):
     """Warm the resolve cache in the background. Returns how many ids were queued."""
+    ids = [tid for tid in ids if not testaudio.covers(sources.parse(tid)[0])]  # test audio: YouTube is never resolved
     todo = []
     with _lock:
         for tid in ids:

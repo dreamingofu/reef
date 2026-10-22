@@ -781,6 +781,22 @@ order. Headlines: cover-coloured mini player with progress ring and swipe-to-ski
 stretchy transport, joined action row and pull-up queue, depth lyrics, a Library hub replacing Kept/Downloads, new
 Settings / Stats / Recap screens. Prerequisite: serve Reef over HTTPS with `tailscale serve`.
 
+### UI remake step 1: Foundation (2026-10-22, uncommitted on `dreamingofu/codebase-overview-and-risk`)
+
+- `static/style.css` starts with the design system: surface ramp, text levels, hairline, type scale, radii,
+  `.joined` groups, motion tokens + `.press` / tab-in / `.list-in` / `.xfade` / `.sk` (250 ms delay, .25↔.5 pulse),
+  the `.empty` / `.empty.err` state, `prefers-reduced-motion` (fades kept, movement dropped).
+- Cover palette: `palette-core` in `static/app.js` (node check `scratchpad/u1/palette_core_check.js`), applied to
+  `.cover-tint` (mini player, Now Playing) via `--c-base` / `--c-accent` / `--c-on-accent` (`@property`, 800 ms).
+  Pref `reef.theme` = cover | accent | black, picked in the server sheet. `/api/art?size<=128` is now sent as bytes
+  from Reef's origin (small LRU in `app.py`) so the canvas can read it.
+- Tabs: Home · Library + Search FAB; `#kept` / `#downloads` redirect to `#library` (Downloads, Playlists + Import,
+  New in Navidrome, Kept songs). Header: avatar (opens the server sheet) carrying the status dot.
+- Errors from search / browse / home / library show typed hints (`errors.payload` on upstream 502s).
+- **Test audio mode** (`testaudio.py`): `REEF_TEST_AUDIO=<file|dir>` serves local audio for YouTube streams (per-id
+  hash pick, Range/206) and drops YouTube prefetches. Only when `REEF_HOST` is loopback (or `REEF_TEST_AUDIO_I_KNOW=1`);
+  startup logs "TEST AUDIO MODE"; Now Playing's pill says "Test audio". Use it for all UI checks on the Mac.
+
 ## Ideas / next steps
 
 - Check round 2 on the iPhone: Now Playing on the small screen, tile artwork, source chips, FLAC playback over cellular.

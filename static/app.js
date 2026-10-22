@@ -4,7 +4,9 @@
   const $ = (s, r = document) => r.querySelector(s);
   const $$ = (s, r = document) => [...r.querySelectorAll(s)];
   const audio = $("#audio");
-  const VIEWS = ["home", "search", "kept", "downloads"];
+  const VIEWS = ["home", "search", "library"];
+  // Old tabs folded into Library (UI remake step 1): their hashes still work and land there.
+  const OLD_VIEWS = { kept: "library", downloads: "library" };
   const ACTIVE = ["queued", "downloading", "converting"];
   const FROM = { results: "From search", history: "Kept", recent: "Recently played", quick: "Quick picks", on_repeat: "On repeat",
     jump_back: "Jump back in", liked: "Liked songs" };
@@ -23,16 +25,18 @@
   const state = {
     view: "home",
     parent: "home", // the main view a detail page (album, artist, ...) was opened from: its tab and bottom bar stay
-    homeTab: "foryou",
     home: store.get("home", null), // the last /api/home body: Home paints from it at once, then refreshes
     query: "",
     results: [],
     searching: false,
-    searchError: "",
+    searchError: null, // the failed search's error (status, body {block, hint})
     link: null, // the current search is a pasted link: { kind: "track" | "playlist", title }
     filter: "top",
     history: [],
-    library: null,
+    historyLoaded: false, // /api/history answered at least once (the Library shows a skeleton until then)
+    historyErr: null,
+    homeErr: null, // the last /api/home failure while there's nothing to show
+    library: null, // Navidrome's newest albums (Library page), null until loaded
     jobs: [],
     queue: [],
     index: -1,
@@ -44,6 +48,7 @@
     settings: {}, // server-side settings (/api/settings `values`); missing keys mean the defaults
     blocked: null, // hidden artists from /api/blocklist (null until loaded)
     playlists: null, // Reef playlists (/api/playlists summaries), null until loaded
+    playlistsErr: null,
     // Search sources from /api/sources; `source` is the chip picked for searching.
     sources: [{ key: "yt", name: "YouTube", can_keep: true, codec_label: "AAC" }],
     source: store.get("source", null),
@@ -74,7 +79,8 @@
   // >= 600 -> maxres). Sizes are [not kept, kept]: the client can't tell whether the square art is
   // known (the server forgets it on restart), so non-kept art stays <= 200 in square crops so
   // hqdefault's black bars never show; square art at 200 is still sharp enough for rows and cards.
-  const ART = { small: [200, 480], big: [720, 720], fallback: [200, 480], tile: [320, 320], mini: [160, 320], bg: [160, 160] };
+  // `bg` (Now Playing's blurred backdrop) is the same 64 px copy the cover palette samples: one fetch for both.
+  const ART = { small: [200, 480], big: [720, 720], fallback: [200, 480], tile: [320, 320], mini: [160, 320], bg: [64, 64] };
   // encodeURIComponent turns "mc:123" into "mc%3A123", which Flask decodes back before routing.
   // A placeholder (an import row not matched yet, "pq:…") has no art: the app icon.
   const artUrl = (id, size) => (/^pq:/.test(id || "") ? "/static/icon.svg" : `/api/art/${encodeURIComponent(id)}?size=${size}`);
@@ -513,6 +519,134 @@
   })();
   // ==== lyrics-core:end ====
 
+  // ---------- palette core ----------
+  // Cover colours (UI_REMAKE_PLAN §1.1) from an image's RGBA pixels (a 64 px canvas of /api/art): pure
+  // functions, no DOM. Pixels go into coarse RGB buckets ranked by population, vivid ones (HSV saturation > .3,
+  // brightness .2-.9) counting ×1.3; a mean saturation under .22 (near-black pixels left out) makes the image grey. Roles: `base` the darkest
+  // muted colour (lightness ≤ 26%), `accent` the most vibrant one at ~80% lightness with ≥ 4.5:1 contrast on base,
+  // `onAccent` ~20% for text on the accent. Unit-checked from node by slicing between these sentinels.
+  // ==== palette-core:start ====
+  const P = (() => {
+    const DEFAULT = Object.freeze({ base: "#121212", accent: "#fb2c5a", onAccent: "#ffffff", grey: false });
+    const BLACK = Object.freeze({ base: "#000000", accent: "#fb2c5a", onAccent: "#ffffff", grey: false });
+    const VIVID_BOOST = 1.3;
+    const GREY_SAT = 0.22;
+    const BASE_MAX_L = 0.26, BASE_MIN_L = 0.08, BASE_MAX_S = 0.55;
+    const ACCENT_L = 0.8, ON_ACCENT_L = 0.2, MIN_CONTRAST = 4.5;
+    const clamp = (x, a, b) => Math.min(b, Math.max(a, x));
+
+    // h in [0, 360), s and l in [0, 1]
+    function rgbToHsl(r, g, b) {
+      r /= 255; g /= 255; b /= 255;
+      const mx = Math.max(r, g, b), mn = Math.min(r, g, b), l = (mx + mn) / 2, d = mx - mn;
+      if (!d) return [0, 0, l];
+      const s = d / (1 - Math.abs(2 * l - 1));
+      const h = mx === r ? ((g - b) / d) % 6 : mx === g ? (b - r) / d + 2 : (r - g) / d + 4;
+      return [(h * 60 + 360) % 360, clamp(s, 0, 1), l];
+    }
+    function hslToRgb(h, s, l) {
+      const c = (1 - Math.abs(2 * l - 1)) * s, x = c * (1 - Math.abs(((h / 60) % 2) - 1)), m = l - c / 2;
+      const [r, g, b] = h < 60 ? [c, x, 0] : h < 120 ? [x, c, 0] : h < 180 ? [0, c, x] : h < 240 ? [0, x, c] : h < 300 ? [x, 0, c] : [c, 0, x];
+      return [r, g, b].map((v) => Math.round(clamp(v + m, 0, 1) * 255));
+    }
+    const hex = (rgb) => "#" + rgb.map((v) => Math.round(v).toString(16).padStart(2, "0")).join("");
+    function fromHex(h) {
+      const m = /^#?([0-9a-f]{6})$/i.exec(String(h || ""));
+      if (!m) return null;
+      const n = parseInt(m[1], 16);
+      return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+    }
+    // WCAG relative luminance and contrast ratio
+    function luminance(rgb) {
+      const [r, g, b] = rgb.map((v) => { v /= 255; return v <= 0.03928 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4; });
+      return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+    }
+    function contrast(a, b) {
+      const x = luminance(a), y = luminance(b);
+      return (Math.max(x, y) + 0.05) / (Math.min(x, y) + 0.05);
+    }
+
+    // RGBA bytes -> buckets (3 bits per channel), each {rgb (mean), h, s, l, sv, v, n, share, vivid, score}, best first
+    function buckets(data, { minAlpha = 125 } = {}) {
+      const map = new Map();
+      let total = 0, satSum = 0, satN = 0;
+      for (let i = 0; i + 3 < (data?.length || 0); i += 4) {
+        if (data[i + 3] < minAlpha) continue;
+        const r = data[i], g = data[i + 1], b = data[i + 2];
+        const key = ((r >> 5) << 6) | ((g >> 5) << 3) | (b >> 5);
+        let e = map.get(key);
+        if (!e) map.set(key, (e = { n: 0, r: 0, g: 0, b: 0 }));
+        e.n++; e.r += r; e.g += g; e.b += b;
+        const mx = Math.max(r, g, b), mn = Math.min(r, g, b);
+        // near-black pixels have no meaningful saturation: they don't vote on "grey"
+        if (mx >= 31) { satSum += (mx - mn) / mx; satN++; }
+        total++;
+      }
+      const list = [...map.values()].map((e) => {
+        const rgb = [e.r / e.n, e.g / e.n, e.b / e.n].map(Math.round);
+        const [h, s, l] = rgbToHsl(...rgb);
+        const mx = Math.max(...rgb), mn = Math.min(...rgb);
+        const v = mx / 255, sv = mx ? (mx - mn) / mx : 0;
+        const vivid = sv > 0.3 && v >= 0.2 && v <= 0.9;
+        return { rgb, h, s, l, sv, v, n: e.n, share: e.n / total, vivid, score: e.n * (vivid ? VIVID_BOOST : 1) };
+      }).sort((a, b) => b.score - a.score || b.n - a.n);
+      return { list, total, meanSat: satN ? satSum / satN : 0 };
+    }
+
+    // The best bucket for a target lightness / saturation, weighing population like a palette swatch search.
+    function best(list, { l, s, minL = 0, maxL = 1, filter = () => true }) {
+      const top = list[0]?.score || 1;
+      let pick = null, score = -Infinity;
+      for (const c of list) {
+        if (c.l < minL || c.l > maxL || !filter(c)) continue;
+        const v = 0.24 * (1 - Math.abs(c.s - s)) + 0.52 * (1 - Math.abs(c.l - l)) + 0.24 * (c.score / top);
+        if (v > score) { score = v; pick = c; }
+      }
+      return pick;
+    }
+
+    function derive(data) {
+      const { list, total, meanSat } = buckets(data);
+      if (!total) return null;
+      const grey = meanSat < GREY_SAT;
+      const kept = list.filter((c) => c.share >= 0.01);
+      const cands = kept.length ? kept : list;
+      // base: the darkest muted colour, clamped dark; near-black / near-white buckets carry no hue
+      const b = best(cands, { l: 0.26, s: 0.3, minL: 0.04, maxL: 0.6 }) || cands[0];
+      const baseHsl = [b.h, grey ? 0 : Math.min(b.s, BASE_MAX_S), clamp(b.l, BASE_MIN_L, BASE_MAX_L)];
+      const base = hslToRgb(...baseHsl);
+      // accent: the most vibrant colour, lifted to ~80% lightness until it reads on the base
+      const a = grey ? null : best(cands, { l: 0.5, s: 1, minL: 0.15, maxL: 0.92, filter: (c) => c.sv > 0.3 && c.v >= 0.2 })
+        || cands.filter((c) => c.l > 0.1 && c.l < 0.95).sort((x, y) => y.s - x.s)[0] || b;
+      const aH = a ? a.h : b.h, aS = grey ? 0 : clamp(a.s, 0.35, 0.9);
+      let aL = ACCENT_L, accent = hslToRgb(aH, aS, aL);
+      while (contrast(accent, base) < MIN_CONTRAST && aL < 0.97) { aL += 0.02; accent = hslToRgb(aH, aS, aL); }
+      // on-accent: the same hue, dark enough to read on the accent
+      let oL = ON_ACCENT_L, onAccent = hslToRgb(aH, Math.min(aS, 0.6), oL);
+      while (contrast(onAccent, accent) < MIN_CONTRAST && oL > 0.02) { oL -= 0.03; onAccent = hslToRgb(aH, Math.min(aS, 0.6), oL); }
+      return { base: hex(base), accent: hex(accent), onAccent: hex(onAccent), grey };
+    }
+
+    // The CSS custom properties for a palette (DEFAULT when it's missing or malformed).
+    function vars(p) {
+      const ok = p && fromHex(p.base) && fromHex(p.accent) && fromHex(p.onAccent);
+      const q = ok ? p : DEFAULT;
+      return { "--c-base": q.base, "--c-accent": q.accent, "--c-on-accent": q.onAccent };
+    }
+
+    // A bounded {id: palette} cache: `id` moves to the end (newest); the oldest go past `max`. Returns a new object.
+    function remember(cache, id, p, max = 150) {
+      const out = {};
+      const keys = Object.keys(cache && typeof cache === "object" ? cache : {}).filter((k) => k !== id);
+      for (const k of keys.slice(Math.max(0, keys.length - (max - 1)))) out[k] = cache[k];
+      out[id] = p;
+      return out;
+    }
+
+    return { DEFAULT, BLACK, MIN_CONTRAST, rgbToHsl, hslToRgb, hex, fromHex, luminance, contrast, buckets, derive, vars, remember };
+  })();
+  // ==== palette-core:end ====
+
   const navidromeUrl = (path) => `${location.protocol}//${location.hostname}:4533${path}`;
   const cur = () => state.queue[state.index];
   // What a queued / remembered track keeps (queue, session, "plays"). `auto` (an autoplay item) is dropped
@@ -667,14 +801,54 @@
     </li>`;
   }
 
+  // ---------- empty and error states (§1.5) ----------
+  // One component: a 40 px icon, a short title, a line of text, one action. Errors read the server's typed
+  // failure ({block, hint} from errors.py) so the text says what to do ("YouTube wants a bot check: try mobile data").
   function emptyState(ic, title, text, action) {
-    return `<div class="empty">${icon(ic)}<h3>${esc(title)}</h3><p>${esc(text)}</p>${action || ""}</div>`;
+    return `<div class="empty" role="status">${icon(ic)}${title ? `<h3>${esc(title)}</h3>` : ""}${text ? `<p>${esc(text)}</p>` : ""}${action || ""}</div>`;
+  }
+  const BLOCK_TITLE = {
+    BOT_WALL: "YouTube wants a bot check", NETWORK: "Network problem", RATE_LIMITED: "YouTube is rate-limiting",
+    REGION: "Not available in your region", LOGIN_REQUIRED: "Sign-in required", MEMBERS_OR_PAID: "Members-only",
+    GONE: "Not available",
+  };
+  // {ic, title, text} for a failed api() call: offline, server unreachable, a typed block, or the message itself.
+  function errorInfo(e, title = "Something went wrong", fallback = "Try again in a moment.") {
+    if (navigator.onLine === false) return { ic: "wifi-off", title: "You're offline", text: "This loads again once you're back online." };
+    if (!e || !e.status) return { ic: "wifi-off", title: "Can't reach Reef", text: "The server didn't answer. Is it running, and is Tailscale on?" };
+    const block = e.body?.block;
+    if (block && block !== "UNKNOWN" && BLOCK_TITLE[block]) return { ic: "alert", title: BLOCK_TITLE[block], text: e.body.hint || fallback };
+    const msg = e.message && e.message.length <= 90 ? e.message : fallback;
+    return { ic: "alert", title, text: msg };
+  }
+  // `retry` is the attribute the Retry button carries (handled in the click listener); `notFound` the 404 text.
+  function errorState(e, { title, fallback, retry = "", notFound = "" } = {}) {
+    const x = e?.status === 404 && notFound ? { ic: "alert", title: "Not found", text: notFound } : errorInfo(e, title, fallback);
+    return `<div class="empty err" role="alert">${icon(x.ic)}<h3>${esc(x.title)}</h3><p>${esc(x.text)}</p>${retry
+      ? `<button class="pill-btn" ${retry}>${icon("repeat")}Retry</button>` : ""}</div>`;
+  }
+
+  // ---------- skeletons + list-in (§1.4) ----------
+  // Skeletons stay invisible for 250 ms, then pulse (CSS); a container that held one animates its real content in.
+  const SK_LABEL = `role="status" aria-label="Loading…"`;
+  const skRows = (n, { art = true } = {}) => `<div class="skel" ${SK_LABEL}>${`<div class="sk-row">${art ? '<div class="sk a"></div>' : ""}<div class="l2"><i class="sk"></i><i class="sk"></i></div></div>`.repeat(n)}</div>`;
+  const skCards = (n = 4) => `<div class="scroller skel short" ${SK_LABEL}>${'<div class="card"><div class="card-art sk"></div><div class="sk sk-line"></div></div>'.repeat(n)}</div>`;
+  const LIST_SEL = ".rows, .scroller, .tiles, .grid2, .qp, .joined, .chips.wrap";
+  function animateIn(root) {
+    for (const el of $$(LIST_SEL, root)) if (!el.classList.contains("skel")) el.classList.add("list-in");
+  }
+  // Set innerHTML; lists fade in when the view was just opened (route) or this element was showing a skeleton.
+  function paint(el, html) {
+    if (!el) return;
+    const fresh = el.closest(".view")?.dataset.anim === "1" || !!el.querySelector(".skel");
+    el.innerHTML = html;
+    if (fresh) animateIn(el);
   }
 
   // ---------- Home shelves (/api/home) ----------
   const homeShelf = (id) => (state.home?.shelves || []).find((s) => s.id === id && Array.isArray(s.items) && s.items.length);
   const homeItems = (id) => homeShelf(id)?.items || [];
-  const skeletonCards = () => `<div class="scroller">${'<div class="card"><div class="card-art sk"></div></div>'.repeat(4)}</div>`;
+  const skeletonCards = () => skCards(4);
 
   // Quick picks: columns of 4 rows, scrolled sideways one column at a time; the next column peeks in.
   const quickRows = (items) => `<ul class="qp" data-shelf="quick">${items.map((t, i) => row(t, i, "quick")).join("")}</ul>`;
@@ -714,15 +888,14 @@
     const view = $("#view-home");
     // Re-rendering (a dislike, a refresh) keeps each shelf's sideways scroll.
     const scrolled = new Map($$("[data-shelf]", view).map((el) => [el.dataset.shelf, el.scrollLeft]));
-    let html = `<h1 class="page-title">${greeting()}</h1>
-      <div class="seg" role="tablist">
-        <button role="tab" class="${state.homeTab === "foryou" ? "on" : ""}" data-home-tab="foryou">For you</button>
-        <button role="tab" class="${state.homeTab === "library" ? "on" : ""}" data-home-tab="library">Library</button>
-      </div>`;
-
-    if (state.homeTab === "foryou") {
+    let html = `<h1 class="page-title">${greeting()}</h1>`;
+    {
       let s;
-      if (!state.home) html += shelf({ title: "Quick picks", ic: "sparkle", body: skeletonCards() });
+      if (!state.home) {
+        html += state.homeErr
+          ? errorState(state.homeErr, { title: "Couldn't load Home", retry: "data-retry-home" })
+          : shelf({ title: "Quick picks", ic: "sparkle", body: skeletonCards() });
+      }
       if ((s = homeShelf("quick"))) {
         html += shelf({ title: s.title, ic: "sparkle", sub: "Based on what you've been playing", body: quickRows(s.items),
           action: `<button class="link-btn shelf-act" data-play-all="quick">Play all</button>` });
@@ -736,7 +909,7 @@
       if ((s = homeShelf("liked"))) html += shelf({ title: s.title, ic: "heart", body: trackCards(s.items, "liked") });
       if ((s = homeShelf("top_artists"))) html += shelf({ title: s.title, ic: "person", body: topArtistCards(s.items) });
       if (state.history.length) {
-        html += shelf({ title: "Recently kept", ic: "sparkle", sub: "Saved to Navidrome by Reef", more: "#kept", body: squares(state.history.slice(0, 15), "history") });
+        html += shelf({ title: "Recently kept", ic: "sparkle", sub: "Saved to Navidrome by Reef", more: "#library", body: squares(state.history.slice(0, 15), "history") });
       }
       const searches = store.get("searches", []);
       if (searches.length) {
@@ -745,18 +918,8 @@
       html += moodsOn()
         ? shelf({ title: "Browse moods & genres", ic: "trend", sub: "Playlists from YouTube Music", more: "#moods", body: tiles() })
         : shelf({ title: "Browse moods & genres", ic: "trend", sub: "Tap one to search YouTube", body: tiles() });
-    } else if (state.library === null) {
-      html += `<div class="shelf"><div class="scroller">${'<div class="card"><div class="card-art sk"></div></div>'.repeat(4)}</div></div>`;
-    } else if (!state.library.length) {
-      const ok = state.health?.navidrome?.ok;
-      html += emptyState("disc", ok ? "Your library is empty" : "Can't reach Navidrome",
-        ok ? "Songs you keep will show up here." : "Open the server sheet (pink button) to see what's wrong.");
-    } else {
-      html += shelf({ title: "New in your library", ic: "disc", sub: "Latest albums in Navidrome", body: albumCards(state.library.slice(0, 10)) });
-      if (state.library.length > 10) html += shelf({ title: "More albums", ic: "note", body: albumCards(state.library.slice(10)) });
-      if (state.history.length) html += shelf({ title: "Kept with Reef", ic: "sparkle", more: "#kept", body: squares(state.history.slice(0, 15), "history") });
     }
-    view.innerHTML = html;
+    paint(view, html);
     for (const [k, x] of scrolled) { const el = $(`[data-shelf="${k}"]`, view); if (el) el.scrollLeft = x; }
   }
 
@@ -807,7 +970,7 @@
           <h2 class="pl-t">${esc(state.link.title || (album ? res[0].album : "") || "Playlist")}</h2>${artist}
           <span class="pl-s">${res.length} song${res.length === 1 ? "" : "s"}${len}</span></div>
       </div>
-      ${res.length ? `<div class="actions">
+      ${res.length ? `<div class="actions joined h">
         <button class="pill-btn" data-play-all="results">${icon("play", "fill")}Play</button>
         <button class="pill-btn" data-shuffle-all="results">${icon("shuffle")}Shuffle</button>
       </div>
@@ -826,10 +989,10 @@
     }
     if (!state.query) {
       const searches = store.get("searches", []);
-      el.innerHTML = sourceChips() + (searches.length ? `
+      paint(el, sourceChips() + (searches.length ? `
         <div class="head-row"><h2 class="section-title">Recent</h2><button class="link-btn" data-clear-searches>Clear</button></div>
         <ul class="rows">${searches.map((q) => `<li class="row"><button class="row-main" data-search="${esc(q)}"><span class="row-art" style="display:grid;place-items:center;color:var(--faint)">${icon("clock")}</span><span class="row-text"><span class="row-t">${esc(q)}</span></span></button></li>`).join("")}</ul>` : "")
-        + `<div class="head-row sec"><h2 class="section-title">Browse Categories</h2>${moodsOn() ? `<a class="link-btn" href="#moods">See all</a>` : ""}</div>${tiles()}`;
+        + `<div class="head-row sec"><h2 class="section-title">Browse Categories</h2>${moodsOn() ? `<a class="link-btn" href="#moods">See all</a>` : ""}</div>${tiles()}`);
       return;
     }
 
@@ -839,18 +1002,18 @@
       `<button class="chip${state.filter === k ? " on" : ""}" data-filter="${k}">${l}</button>`).join("")}</div>`;
 
     if (state.searching) {
-      el.innerHTML = chips + `<h2 class="section-title">${link ? "Opening link…" : "Top result"}</h2><div class="sk sk-top"></div>${link ? "" : `<h2 class="section-title">Songs</h2>`}`
-        + `<div class="sk-row"><div class="sk a"></div><div class="sk l"></div></div>`.repeat(link ? 3 : 5);
+      el.innerHTML = chips + `<h2 class="section-title">${link ? "Opening link…" : "Top result"}</h2><div class="skel short" ${SK_LABEL}><div class="sk sk-top"></div></div>${link ? "" : `<h2 class="section-title">Songs</h2>`}`
+        + skRows(link ? 3 : 5);
       return;
     }
     if (state.searchError) {
-      el.innerHTML = chips + emptyState("alert", link ? "Couldn't open link" : "Search failed", state.searchError);
+      paint(el, chips + errorState(state.searchError, { title: link ? "Couldn't open link" : "Search failed", retry: "data-retry-search" }));
       return;
     }
     const res = state.results;
-    if (link?.kind === "playlist") { el.innerHTML = playlistView(res); return; }
+    if (link?.kind === "playlist") { paint(el, playlistView(res)); return; }
     if (!res.length) {
-      el.innerHTML = chips + emptyState("search", "No results", `Nothing found for “${state.query}”.`);
+      paint(el, chips + emptyState("search", "No results", `Nothing found for “${state.query}”.`));
       return;
     }
 
@@ -866,43 +1029,86 @@
         ? `<ul class="rows" style="margin-top:14px">${items.map(([r, i]) => row(r, i, "results")).join("")}</ul>`
         : emptyState("disc", "None kept yet", "Tap + on a song to keep it in your library.");
     }
-    el.innerHTML = html;
+    paint(el, html);
   }
 
-  // Reef's own playlists (/api/playlists), listed on Kept until the Library hub; Import opens the import sheet.
+  // ---------- Library (UI remake step 1) ----------
+  // One page for what used to be the Kept and Downloads tabs: active keeps (Downloads), Reef's own playlists
+  // (+ Import), Navidrome's newest albums and the Kept songs. The Library hub (§6) replaces it in step 6.
+  // Each part paints into its own box, so the 1.5 s jobs poll repaints Downloads only.
   async function loadPlaylists() {
     try {
       const list = await api("/api/playlists");
-      if (Array.isArray(list)) state.playlists = list;
-    } catch { /* keep the last list */ }
-    if (state.view === "kept") renderKept();
+      if (Array.isArray(list)) { state.playlists = list; state.playlistsErr = null; }
+    } catch (e) {
+      if (!state.playlists) state.playlistsErr = e; // keep the last list
+    }
+    if (state.view === "library") { renderLibPlaylists(); renderLibSub(); }
   }
-  function playlistRows() {
-    const list = state.playlists || [];
-    return `<div class="shelf-head pl-head"><h2>Playlists</h2><button class="chip sm shelf-act" data-st="import">${icon("plus")}Import</button></div>
-      ${list.length ? `<ul class="rows">${list.map((p) => `<li class="row pl-row"><a class="pl-link" href="#local/${encodeURIComponent(p.id)}">
+  const libHead = (title, count, action = "") => `<div class="lib-head"><h2>${esc(title)}</h2>${count ? `<span class="lib-count">${count}</span>` : ""}${action}</div>`;
+  function renderLibPlaylists() {
+    const el = $("#lib-pl");
+    if (!el) return;
+    const list = state.playlists;
+    const body = list === null
+      ? (state.playlistsErr ? errorState(state.playlistsErr, { title: "Couldn't load playlists", retry: "data-retry-playlists" }) : skRows(2))
+      : list.length ? `<ul class="joined">${list.map((p) => `<li class="row pl-row"><a class="pl-link" href="#local/${encodeURIComponent(p.id)}">
           <span class="row-art">${p.cover_id ? art(p.cover_id) : `<span class="pl-ic">${icon("note")}</span>`}</span>
           <span class="row-text"><span class="row-t">${esc(p.name)}</span><span class="row-s">${esc([songs(p.count), p.unmatched ? `${p.unmatched} to match` : "", p.not_found ? `${p.not_found} not found` : ""].filter(Boolean).join(" · "))}</span></span>
           ${icon("chev-right")}</a></li>`).join("")}</ul>`
-        : `<p class="st-note">Import a CSV from Exportify, TuneMyMusic or Google Takeout to make one.</p>`}`;
+        : `<p class="st-note">Import a CSV from Exportify, TuneMyMusic or Google Takeout to make one.</p>`;
+    paint(el, `<section class="lib-sec">${libHead("Playlists", list?.length || "", `<button class="chip sm shelf-act" data-st="import">${icon("plus")}Import</button>`)}${body}</section>`);
   }
-
+  function renderLibNavidrome() {
+    const el = $("#lib-nd");
+    if (!el) return;
+    const albums = state.library;
+    if (albums === null) { paint(el, `<section class="lib-sec">${libHead("New in Navidrome")}${skCards(3)}</section>`); return; }
+    if (!albums.length) {
+      // Nothing to show: say so only when Navidrome itself is the problem.
+      const nd = state.health?.navidrome;
+      paint(el, nd && !nd.ok && nd.configured !== false ? `<section class="lib-sec">${libHead("New in Navidrome")}${errorState(
+        { status: 502, message: state.health.navidrome?.error || "" }, { title: "Can't reach Navidrome", fallback: "Open the server sheet (your avatar) to see what's wrong.", retry: "data-retry-library" })}</section>` : "");
+      return;
+    }
+    paint(el, `<section class="lib-sec">${libHead("New in Navidrome")}${albumCards(albums.slice(0, 20))}</section>`);
+  }
+  function renderLibSub() {
+    const el = $("#lib-sub");
+    if (!el) return;
+    const n = state.history.length, p = state.playlists?.length || 0;
+    el.textContent = state.historyLoaded ? [`${songs(n)} kept`, p ? `${p} playlist${p === 1 ? "" : "s"}` : ""].filter(Boolean).join(" · ") : " ";
+  }
   function renderKept() {
+    const el = $("#lib-songs");
+    if (!el) return;
     const n = state.history.length;
-    let html = `<h1 class="page-title">Kept</h1><p class="page-sub">${n} song${n === 1 ? "" : "s"} saved to Navidrome</p>`;
-    if (state.playlists) html += playlistRows();
-    if (state.playlists && n) html += `<h2 class="section-title">Songs</h2>`;
-    if (!n) {
-      html += emptyState("disc", "Nothing kept yet", "Search for a song and tap + to save it to your library.",
+    let body;
+    if (!state.historyLoaded) {
+      body = state.historyErr ? errorState(state.historyErr, { title: "Couldn't load your keeps", retry: "data-retry-history" }) : skRows(6);
+    } else if (!n) {
+      body = emptyState("disc", "Nothing kept yet", "Search for a song and tap + to keep it in your library.",
         `<a class="pill-btn" href="#search">${icon("search")}Search</a>`);
     } else {
-      html += `<div class="actions">
+      body = `<div class="actions joined h">
           <button class="pill-btn" data-play-all="history">${icon("play", "fill")}Play</button>
           <button class="pill-btn" data-shuffle-all="history">${icon("shuffle")}Shuffle</button>
         </div>
-        <ul class="rows" style="margin-top:12px">${state.history.map((t, i) => row(t, i, "history", `${esc(t.channel)} · ${timeAgo(t.kept_at)}`)).join("")}</ul>`;
+        <ul class="rows">${state.history.map((t, i) => row(t, i, "history", `${esc(t.channel)} · ${timeAgo(t.kept_at)}`)).join("")}</ul>`;
     }
-    $("#view-kept").innerHTML = html;
+    paint(el, `<section class="lib-sec">${libHead("Kept songs", n || "")}${body}</section>`);
+    renderLibSub();
+  }
+  function renderLibrary() {
+    const el = $("#view-library");
+    if (!$("#lib-songs", el)) {
+      el.innerHTML = `<h1 class="page-title">Library</h1><p class="page-sub" id="lib-sub"> </p>
+        <div id="lib-dl"></div><div id="lib-pl"></div><div id="lib-nd"></div><div id="lib-songs"></div>`;
+    }
+    renderDownloads();
+    renderLibPlaylists();
+    renderLibNavidrome();
+    renderKept();
   }
 
   function jobLabel(j) {
@@ -916,21 +1122,27 @@
     }
   }
 
+  // Downloads: on top of the Library while something is being kept, at the bottom once it's all finished.
   function renderDownloads() {
+    const el = $("#lib-dl");
+    if (!el) return;
     const jobs = state.jobs;
+    const active = jobs.some((j) => ACTIVE.includes(j.status));
     const finished = jobs.some((j) => !ACTIVE.includes(j.status));
-    let html = `<div class="head-row"><h1 class="page-title">Downloads</h1>${finished ? `<button class="link-btn" data-clear-finished>Clear</button>` : ""}</div>
-      <p class="page-sub">Songs being saved to your Navidrome library</p>`;
+    el.classList.toggle("active", active);
+    const head = libHead("Downloads", active ? jobs.filter((j) => ACTIVE.includes(j.status)).length : "",
+      finished ? `<button class="link-btn shelf-act" data-clear-finished>Clear</button>` : "");
     if (!jobs.length) {
-      html += emptyState("download", "No downloads", "Tap + on any song to keep it.", `<a class="pill-btn" href="#search">${icon("search")}Search</a>`);
-    } else {
-      html += `<ul class="rows" style="margin-top:14px">${jobs.map((j) => `
+      paint(el, `<section class="lib-sec">${head}<p class="st-note">Nothing downloading. Tap + on any song to keep it in your library.</p></section>`);
+      return;
+    }
+    paint(el, `<section class="lib-sec">${head}<ul class="joined">${jobs.map((j) => `
         <li class="row job ${j.status}">
           <span class="row-main" style="cursor:default">
             <span class="row-art">${art(j.video_id)}</span>
             <span class="row-text">
               <span class="row-t">${esc(j.title || j.video_id)}${j.lossless ? ` <span class="lbadge">Lossless</span>` : ""}</span>
-              <span class="row-s"${j.status === "error" && j.error ? ` title="${esc(j.error)}"` : ""}>${esc(jobLabel(j))}</span>
+              <span class="row-s num"${j.status === "error" && j.error ? ` title="${esc(j.error)}"` : ""}>${esc(jobLabel(j))}</span>
               ${j.status === "error" && j.hint && j.error && j.error !== j.hint ? `<span class="row-e">${esc(j.error)}</span>` : ""}
               ${j.status === "done" && j.warning ? `<span class="row-e">${esc(j.warning)}</span>` : ""}
               ${j.status === "downloading" ? `<span class="bar"><i style="width:${j.percent}%"></i></span>` : ""}
@@ -939,9 +1151,7 @@
           ${ACTIVE.includes(j.status)
             ? `<span class="keep pending" aria-label="Working">${icon("plus")}</span>`
             : `<button class="icon-btn sm" data-dismiss="${esc(j.id)}" aria-label="Dismiss">${icon("x")}</button>`}
-        </li>`).join("")}</ul>`;
-    }
-    $("#view-downloads").innerHTML = html;
+        </li>`).join("")}</ul></section>`);
   }
 
   // ---------- browse pages: album, artist, playlist, mood, all moods ----------
@@ -1020,20 +1230,19 @@
     if (kind === "moods" || kind === "mood") {
       const grid = kind === "mood" ? `<div class="grid2">${'<div><div class="sk sk-sq"></div><div class="sk sk-line"></div></div>'.repeat(4)}</div>`
         : `<div class="tiles">${'<div class="sk sk-tile"></div>'.repeat(8)}</div>`;
-      return `<div role="status" aria-label="Loading…"><div class="sk sk-title"></div>${grid}</div>`;
+      return `<div class="skel" ${SK_LABEL}><div class="sk sk-title"></div>${grid}</div>`;
     }
-    return `<div role="status" aria-label="Loading…"><div class="hero"><div class="hero-art${kind === "artist" ? " circle" : ""} sk"></div>
+    return `<div class="skel" ${SK_LABEL}><div class="hero"><div class="hero-art${kind === "artist" ? " circle" : ""} sk"></div>
         <div class="sk sk-line" style="width:56%"></div><div class="sk sk-line sm" style="width:34%"></div></div>
-      <div class="actions"><div class="sk sk-btn"></div><div class="sk sk-btn"></div></div>
-      ${'<div class="sk-row"><div class="sk a"></div><div class="sk l"></div></div>'.repeat(5)}</div>`;
+      <div class="actions joined h"><div class="sk sk-btn"></div><div class="sk sk-btn"></div></div>
+      ${'<div class="sk-row"><div class="sk a"></div><div class="l2"><i class="sk"></i><i class="sk"></i></div></div>'.repeat(5)}</div>`;
   }
 
-  // Upstream failures can carry a parser dump; a short message (e.g. "YouTube Music is off") is shown as is.
+  // Upstream failures can carry a parser dump; a short message (e.g. "YouTube Music is off") is shown as is,
+  // a typed one (bot wall, rate limit, network) as its hint.
   function pageError(e) {
-    const msg = e.status === 404 ? "YouTube Music doesn't have this page."
-      : e.message && e.message.length <= 90 ? e.message : "YouTube Music didn't answer. Try again in a moment.";
-    return emptyState("alert", e.status === 404 ? "Not found" : "Couldn't load this page", msg,
-      `<button class="pill-btn" data-retry>${icon("repeat")}Retry</button>`);
+    return errorState(e, { title: "Couldn't load this page", fallback: "YouTube Music didn't answer. Try again in a moment.",
+      retry: "data-retry", notFound: "YouTube Music doesn't have this page." });
   }
 
   // The glyph sits under the cover, so it shows while the cover loads or if it fails.
@@ -1041,7 +1250,7 @@
     const img = src ? `<img src="${esc(src)}" alt="" data-drop>` : tracks?.length ? art(tracks[0].id, true) : "";
     return `<span class="hero-art${round ? " circle" : ""}">${icon(round ? "person" : "note")}${img}</span>`;
   }
-  const pageActions = () => `<div class="actions">
+  const pageActions = () => `<div class="actions joined h">
       <button class="pill-btn" data-play-all="page">${icon("play", "fill")}Play</button>
       <button class="pill-btn" data-shuffle-all="page">${icon("shuffle")}Shuffle</button>
     </div>`;
@@ -1087,7 +1296,7 @@
     if (!d || !["album", "playlist", "local"].includes(detail.kind)) return;
     const s = keepAllState();
     if (s === "kept") { toast("Already in your library"); return; }
-    if (s === "pending") { location.hash = "#downloads"; return; }
+    if (s === "pending") { libFocus = "lib-dl"; location.hash = "#library"; return; }
     const album = detail.kind === "album";
     const tracks = pageTracks();
     const already = tracks.filter((t) => keepState(t.id) === "kept").length;
@@ -1170,7 +1379,7 @@
     const top = a.songs_playlist_id ? list.slice(0, 5) : list;
     let html = `<div class="hero artist">${heroArt(a.thumb, null, true)}
         <h1 class="hero-t" data-anchor>${esc(a.name)}</h1>
-        <div class="actions">
+        <div class="actions joined h">
           ${list.length ? `<button class="pill-btn" data-play-all="page">${icon("play", "fill")}Play</button>
           <button class="pill-btn" data-page-radio>${icon("radio")}Radio</button>` : ""}
           <button class="pill-btn${a.blocked ? " on" : ""}" data-artist-hide aria-pressed="${a.blocked ? "true" : "false"}">${icon("hide")}${a.blocked ? "Unhide" : "Hide"}</button>
@@ -1273,10 +1482,10 @@
     const err = detail.errors.get(detail.key);
     $("#top-title").textContent = pageTitle();
     if (entry) {
-      el.innerHTML = PAGES[detail.kind](entry.data);
+      paint(el, PAGES[detail.kind](entry.data));
       if (detail.restore != null) { window.scrollTo(0, detail.restore); detail.restore = null; }
     } else {
-      el.innerHTML = err ? pageError(err) : pageSkeleton(detail.kind);
+      paint(el, err ? pageError(err) : pageSkeleton(detail.kind));
       if (err) detail.restore = null;
     }
     syncTopTitle();
@@ -1400,7 +1609,7 @@
   function renderHidden() {
     const list = state.blocked;
     $("#hidden-list").innerHTML = list == null
-      ? '<div class="sk-row"><div class="sk a"></div><div class="sk l"></div></div>'.repeat(2)
+      ? skRows(2)
       : !list.length
         ? emptyState("hide", "No hidden artists", "Hide an artist from a song's ⋯ menu to keep them out of search, radio and playlists.")
         : `<ul class="rows">${list.map((e) => `<li class="row hid-row">
@@ -1419,18 +1628,18 @@
     loadBlocklist();
   }
 
-  const RENDER = { home: renderHome, search: renderSearch, kept: renderKept, downloads: renderDownloads, detail: renderDetail };
+  const RENDER = { home: renderHome, search: renderSearch, library: renderLibrary, detail: renderDetail };
 
   function renderBadges() {
     const n = state.jobs.filter((j) => ACTIVE.includes(j.status)).length;
-    for (const el of [$("#tab-badge"), $("#hdr-badge")]) {
+    for (const el of [$("#tab-badge")]) {
       el.hidden = !n;
       el.textContent = n;
     }
   }
 
   // ---------- routing ----------
-  // Main views #home #search #kept #downloads; browse pages (#album/<id>, #artist/<id>, #playlist/<id>,
+  // Main views #home #search #library (#kept / #downloads redirect there); browse pages (#album/<id>, #artist/<id>, #playlist/<id>,
   // #mood/<params>, #moods) show in #view-detail on top of the main view they were opened from, whose tab
   // and bottom bar stay. Every history entry carries {reef: depth, parent}: depth > 0 means Back has an
   // in-app page to return to, and each depth's scroll position comes back on back / forward (iOS edge swipe).
@@ -1462,7 +1671,15 @@
     return false;
   }
 
+  let libFocus = ""; // "#downloads" landed on the Library: scroll to its Downloads once painted
   function route() {
+    const old = OLD_VIEWS[location.hash.slice(1)];
+    if (old) {
+      libFocus = location.hash === "#downloads" ? "lib-dl" : "";
+      navReplace = true;
+      location.replace(`#${old}`);
+      return;
+    }
     const r = parseHash();
     const hs = history.state;
     const visited = trackNav();
@@ -1484,14 +1701,25 @@
     if (r.view === "detail") {
       if (changed) Object.assign(detail, { kind: r.kind, id: r.id, key: r.key, about: false });
       detail.restore = changed ? y : null; // applied once the page has content
+      const box = $("#view-detail");
+      if (changed) box.dataset.anim = "1";
       renderDetail();
+      box.dataset.anim = "";
       loadPage(r.key);
     } else {
-      if (r.view === "home" && state.homeTab === "library" && state.library === null) loadLibrary();
       if (r.view === "home" && homeDue()) loadHome();
-      if (r.view === "kept") loadPlaylists();
+      if (r.view === "library") {
+        if (state.library === null) loadLibrary();
+        loadPlaylists();
+      }
+      const box = $(`#view-${r.view}`);
+      if (changed) box.dataset.anim = "1"; // the first paint after opening a view animates its lists in
       RENDER[r.view]();
+      box.dataset.anim = "";
       if (changed) window.scrollTo(0, y);
+      const focus = r.view === "library" && libFocus && $(`#${libFocus}`);
+      libFocus = "";
+      if (focus && focus.offsetHeight) window.scrollTo(0, focus.getBoundingClientRect().top + window.scrollY - $("#top").offsetHeight - 8);
     }
     syncTopTitle();
     if (changed) {
@@ -1514,7 +1742,13 @@
 
   // ---------- data ----------
   async function loadHistory() {
-    try { state.history = await api("/api/history"); } catch { /* keep previous */ }
+    try {
+      state.history = await api("/api/history");
+      state.historyLoaded = true;
+      state.historyErr = null;
+    } catch (e) {
+      if (!state.historyLoaded) state.historyErr = e; // else keep the previous list
+    }
     for (const h of state.history) if (h && h.id && h.nd_id) ndIds.set(h.id, h.nd_id);
     // Search and browse pages only need their + buttons updated (a re-render would reset their scrollers).
     if (state.view !== "search" && state.view !== "detail") RENDER[state.view]();
@@ -1524,7 +1758,8 @@
 
   async function loadLibrary() {
     try { state.library = await api("/api/library/recent"); } catch { state.library = []; }
-    if (state.view === "home") renderHome();
+    if (!Array.isArray(state.library)) state.library = [];
+    if (state.view === "library") renderLibNavidrome();
   }
 
   let homeAt = 0, homeTries = 0, homeTimer;
@@ -1533,7 +1768,14 @@
     if (!again) homeTries = 0;
     homeAt = Date.now();
     let body;
-    try { body = await api("/api/home"); } catch { homeAt = 0; return; }
+    try {
+      body = await api("/api/home");
+    } catch (e) {
+      homeAt = 0;
+      if (!state.home) { state.homeErr = e; if (state.view === "home") renderHome(); }
+      return;
+    }
+    state.homeErr = null;
     if (!body || !Array.isArray(body.shelves)) return;
     for (const s of body.shelves) if (s.kind === "tracks") noteKept(s.items);
     const moods = body.shelves.find((s) => s.kind === "moods");
@@ -1607,7 +1849,11 @@
   async function loadHealth() {
     try { state.health = await api("/api/health"); } catch { state.health = null; }
     const dot = $("#status-dot");
-    dot.className = "dot " + (state.health?.navidrome?.ok ? "ok" : "bad");
+    const ok = !!state.health?.navidrome?.ok;
+    dot.className = "dot " + (ok ? "ok" : "bad");
+    $("#status-btn").setAttribute("aria-label", `Server and settings: ${state.health ? (ok ? "all good" : "Navidrome unreachable") : "Reef unreachable"}`);
+    if (cur()) updatePlayer();
+    if (state.view === "library" && state.library && !state.library.length) renderLibNavidrome();
   }
 
   let pollTimer;
@@ -1622,12 +1868,12 @@
       if (done.length) {
         toast(done.length === 1 ? `Saved “${done[0].title}”` : `Saved ${done.length} songs`);
         await loadHistory();
-        if (state.homeTab === "library") loadLibrary();
+        if (state.library !== null) loadLibrary(); // the Library's "New in Navidrome" picks up the keep
       }
       if (failed.length) toast(`Couldn't keep “${failed[0].title}”`);
       refreshKeepButtons();
       renderBadges();
-      if (state.view === "downloads") renderDownloads();
+      if (state.view === "library") renderDownloads();
       if (jobs.some((j) => ACTIVE.includes(j.status))) pollTimer = setTimeout(pollJobs, 1500);
     } catch {
       pollTimer = setTimeout(pollJobs, 5000);
@@ -1650,7 +1896,7 @@
     state.query = q;
     state.link = asLink ? { kind: "", title: "" } : null;
     state.searching = true;
-    state.searchError = "";
+    state.searchError = null;
     state.filter = "top";
     clearTimeout(sug.timer);
     sug.seq++;
@@ -1686,7 +1932,7 @@
     } catch (e) {
       if (seq !== searchSeq) return;
       state.results = [];
-      state.searchError = e.message;
+      state.searchError = e;
     }
     state.searching = false;
     if (state.view === "search") renderSearch();
@@ -2150,12 +2396,88 @@
     queueChanged();
   }
 
+  // ---------- cover palette (§1.1) ----------
+  // The mini player and Now Playing (.cover-tint) take their colours from the artwork: a 64 px copy of /api/art
+  // (same origin, so the canvas can be read) through palette-core, cached per track id in memory and (bounded)
+  // in localStorage. The three roles live on :root, registered with @property, so they glide over 800 ms.
+  // UI pref (localStorage "reef.theme"): "cover" (Cover colours), "accent" (Accent only), "black" (Pure black).
+  const THEMES = { cover: "Cover colours", accent: "Accent only", black: "Pure black" };
+  const PALETTE_SIZE = 64, PALETTE_KEEP = 150;
+  const pal = { theme: THEMES[store.get("theme")] ? store.get("theme") : "cover", mem: new Map(), loading: new Map(), seq: 0 };
+  function paletteFor(id) {
+    if (pal.mem.has(id)) return Promise.resolve(pal.mem.get(id));
+    const saved = store.get("palettes", {})?.[id];
+    if (saved && P.vars(saved)["--c-base"] === saved.base) { pal.mem.set(id, saved); return Promise.resolve(saved); }
+    if (pal.loading.has(id)) return pal.loading.get(id);
+    const p = new Promise((resolve) => {
+      const img = new Image();
+      img.decoding = "async";
+      img.onload = () => {
+        let out = null;
+        try {
+          const c = document.createElement("canvas");
+          c.width = c.height = PALETTE_SIZE;
+          const ctx = c.getContext("2d", { willReadFrequently: true });
+          ctx.drawImage(img, 0, 0, PALETTE_SIZE, PALETTE_SIZE);
+          out = P.derive(ctx.getImageData(0, 0, PALETTE_SIZE, PALETTE_SIZE).data);
+        } catch { out = null; } // a tainted canvas (a cross-origin redirect) or no 2D context
+        resolve(out);
+      };
+      img.onerror = () => resolve(null);
+      img.src = artUrl(id, PALETTE_SIZE);
+    }).then((out) => {
+      pal.loading.delete(id);
+      if (out) {
+        pal.mem.set(id, out);
+        store.set("palettes", P.remember(store.get("palettes", {}), id, out, PALETTE_KEEP));
+      }
+      return out;
+    });
+    pal.loading.set(id, p);
+    return p;
+  }
+  function setPaletteVars(p) {
+    const root = document.documentElement.style;
+    for (const [k, v] of Object.entries(P.vars(p))) root.setProperty(k, v);
+  }
+  function applyPalette(t = cur()) {
+    document.body.dataset.theme = pal.theme;
+    const seq = ++pal.seq;
+    if (pal.theme !== "cover" || !t || M.isPlaceholder(t)) { setPaletteVars(pal.theme === "black" ? P.BLACK : P.DEFAULT); return; }
+    // Until the new cover is read, the previous colours stay (then glide over); unreadable art -> the defaults.
+    paletteFor(t.id).then((p) => { if (seq === pal.seq) setPaletteVars(p || P.DEFAULT); });
+  }
+  function setTheme(theme) {
+    if (!THEMES[theme] || theme === pal.theme) return;
+    pal.theme = theme;
+    store.set("theme", theme);
+    applyPalette();
+    if (!$("#status-sheet").hidden) renderStatus();
+  }
+  const themePicker = () => `<li class="st-theme"><span class="k">Player colours</span>
+      <div class="seg" role="radiogroup" aria-label="Player colours">${Object.entries(THEMES).map(([k, label]) =>
+        `<button role="radio" aria-checked="${k === pal.theme}" class="${k === pal.theme ? "on" : ""}" data-set-theme="${k}">${label}</button>`).join("")}</div>
+      <span class="hint">Colours the mini player and Now Playing. Saved on this device.</span></li>`;
+
+  // Re-run an element's cross-fade (titles and art on track change, §1.4 "cross").
+  function crossFade(...els) {
+    for (const el of els) {
+      if (!el) continue;
+      el.classList.remove("xfade");
+      void el.offsetWidth;
+      el.classList.add("xfade");
+    }
+  }
+
+  let shownId = null; // the track the player last painted (cross-fade + palette only when it changes)
   function updatePlayer() {
     const t = cur();
     const mini = $("#mini");
-    if (!t) { mini.hidden = true; document.body.classList.remove("has-mini"); return; }
+    if (!t) { mini.hidden = true; document.body.classList.remove("has-mini"); shownId = null; applyPalette(null); return; }
     mini.hidden = false;
     document.body.classList.add("has-mini");
+    const changed = shownId !== t.id;
+    shownId = t.id;
     $("#mini-art").src = artUrl(t.id, artSize(t.id, "mini"));
     $("#mini-t").textContent = t.title;
     $("#mini-s").textContent = t.channel;
@@ -2167,6 +2489,10 @@
       artImg.src = artUrl(t.id, artSize(t.id, "big"));
       $("#np-bg").src = artUrl(t.id, artSize(t.id, "bg"));
     }
+    if (changed) {
+      crossFade($("#mini-art"), $(".mini-text"), artImg, $(".np-titles"));
+      applyPalette(t);
+    }
     $("#np-t").textContent = t.title;
     $("#np-s").textContent = t.channel;
     $("#np-s").disabled = !linkable(t).length; // tapping the artist opens their page
@@ -2175,7 +2501,9 @@
     $("#np-yt").style.visibility = yt ? "" : "hidden"; // keeps the header centered
     if (yt) $("#np-yt").href = `https://www.youtube.com/watch?v=${encodeURIComponent(t.id)}`;
     const codec = codecLabel(t);
-    $("#np-src").textContent = srcInfo(srcKey(t.id)).name + (codec ? ` · ${codec}` : "");
+    const testAudio = !!state.health?.test_audio && srcKey(t.id) === "yt"; // REEF_TEST_AUDIO: a local file, not YouTube
+    $("#np-src").textContent = testAudio ? "Test audio" : srcInfo(srcKey(t.id)).name + (codec ? ` · ${codec}` : "");
+    $("#np-src").classList.toggle("test", testAudio);
     $("#np-keep").dataset.keep = t.id;
     $("#np-keep2").dataset.keep = t.id;
     const keepable = canKeep(t.id) || keepState(t.id) === "kept";
@@ -3037,7 +3365,7 @@
   async function keep(id, listName) {
     const s = keepState(id);
     if (s === "kept") { toast("Already in your library"); return; }
-    if (s === "pending") { location.hash = "#downloads"; return; }
+    if (s === "pending") { libFocus = "lib-dl"; location.hash = "#library"; return; }
     const t = (lists[listName]?.() || []).find((x) => x.id === id) || state.queue.find((x) => x.id === id) || { id, title: "" };
     // From an album page, the keep carries the album's tags (as Keep album does).
     const hints = listName === "page" && detail.kind === "album" ? albumHints(t, pageData()) : {};
@@ -3100,7 +3428,7 @@
       ["Web player", navidromeUrl("/app"), ""],
     ];
     const n = state.blocked?.length;
-    $("#status-list").innerHTML = rows.map(([k, v, c]) => `<li><span class="k">${esc(k)}</span><span class="v ${c}">${esc(v)}</span></li>`).join("")
+    $("#status-list").innerHTML = themePicker() + rows.map(([k, v, c]) => `<li><span class="k">${esc(k)}</span><span class="v ${c}">${esc(v)}</span></li>`).join("")
       + stLink("sources", "Sources", sourcesSummary())
       + stLink("updates", "Updates", updatesSummary(), updateAvailable())
       + stLink("scrobble", "Scrobbling", scrobbleSummary())
@@ -3209,7 +3537,7 @@
   }
   const shortDate = (ts) => (ts ? new Date(typeof ts === "number" ? ts * 1000 : ts).toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" }) : "");
   const plural = (n, one, many = one + "s") => `${n} ${n === 1 ? one : many}`;
-  const skel = (n) => '<div class="sk-row"><div class="sk l"></div></div>'.repeat(n);
+  const skel = (n) => skRows(n, { art: false });
 
   // Sources: /api/health/sources (6 s at most, cached 60 s on the server; Refresh asks again).
   const HL = { ONLINE: "Online", REACHABLE: "Reachable, not working", OFFLINE: "Offline", DISABLED: "Off" };
@@ -3666,7 +3994,7 @@
 
   // ---------- events ----------
   document.addEventListener("click", (e) => {
-    const t = e.target.closest("[data-keep],[data-play],[data-search],[data-source],[data-home-tab],[data-filter],[data-dismiss],[data-play-all],[data-shuffle-all],[data-close],[data-clear-finished],[data-clear-searches],[data-more],[data-act],[data-q-jump],[data-q-remove],[data-q-clear],[data-q-mode],[data-sleep],[data-fill],[data-keep-all],[data-retry],[data-page-radio],[data-artist-hide],[data-unhide],[data-unhide-page],[data-open-hidden],[data-yt-reset],[data-copy-diag],[data-about],[data-mix],[data-st],[data-import-resolve]");
+    const t = e.target.closest("[data-keep],[data-play],[data-search],[data-source],[data-retry-search],[data-retry-home],[data-retry-history],[data-retry-playlists],[data-retry-library],[data-set-theme],[data-filter],[data-dismiss],[data-play-all],[data-shuffle-all],[data-close],[data-clear-finished],[data-clear-searches],[data-more],[data-act],[data-q-jump],[data-q-remove],[data-q-clear],[data-q-mode],[data-sleep],[data-fill],[data-keep-all],[data-retry],[data-page-radio],[data-artist-hide],[data-unhide],[data-unhide-page],[data-open-hidden],[data-yt-reset],[data-copy-diag],[data-about],[data-mix],[data-st],[data-import-resolve]");
     if (!t) return;
     const d = t.dataset;
     if ("keep" in d) { e.preventDefault(); if (d.keep) keep(d.keep, d.list); return; }
@@ -3674,6 +4002,12 @@
     if ("act" in d) { if (!t.disabled) runAction(d.act, d.arg); return; }
     if ("keepAll" in d) { keepAll(); return; }
     if ("retry" in d) { detail.errors.delete(detail.key); renderDetail(); loadPage(detail.key, { force: true }); return; }
+    if ("retrySearch" in d) { if (state.query) runSearch(state.query, state.link ? { link: true } : {}); return; }
+    if ("retryHome" in d) { state.homeErr = null; renderHome(); loadHome(); return; }
+    if ("retryHistory" in d) { state.historyErr = null; renderKept(); loadHistory(); return; }
+    if ("retryPlaylists" in d) { state.playlistsErr = null; renderLibPlaylists(); loadPlaylists(); return; }
+    if ("retryLibrary" in d) { state.library = null; renderLibNavidrome(); loadHealth().then(loadLibrary); return; }
+    if ("setTheme" in d) { setTheme(d.setTheme); return; }
     if ("mix" in d) { const m = homeItems("mixed")[Number(d.mix)]; if (m?.seed) startRadio(m.seed); return; }
     if ("pageRadio" in d) { const s = pageTracks()[0]; if (s) startRadio(s); return; }
     if ("artistHide" in d) { toggleArtistHidden(); return; }
@@ -3717,12 +4051,6 @@
       state.source = d.source;
       store.set("source", d.source);
       if (state.query) runSearch(state.query); else renderSearch();
-      return;
-    }
-    if ("homeTab" in d) {
-      state.homeTab = d.homeTab;
-      if (state.homeTab === "library" && state.library === null) loadLibrary();
-      renderHome();
       return;
     }
     if ("filter" in d) { state.filter = d.filter; renderSearch(); return; }
@@ -3802,8 +4130,12 @@
   }, { passive: true });
   window.addEventListener("hashchange", route);
 
+  // iOS Safari only applies :active (the press feedback) when a touch listener exists somewhere on the page.
+  document.addEventListener("touchstart", () => {}, { passive: true });
+
   // ---------- boot ----------
   state.view = "";
+  applyPalette(null);
   restoreSession();
   // Share target / deep links: /?link=<url>#search or /?q=<text>#search. Drop the query string first.
   const bootArgs = new URLSearchParams(location.search);

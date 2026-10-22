@@ -61,6 +61,8 @@
   <symbol id="i-heart" viewBox="0 0 24 24"><path d="M12 20s-7.5-4.6-7.5-10.2A4.3 4.3 0 0 1 12 7.4a4.3 4.3 0 0 1 7.5 2.4C19.5 15.4 12 20 12 20z"/></symbol>
   <symbol id="i-thumb-down" viewBox="0 0 24 24"><path d="M16.5 13.5V4h3a1 1 0 0 1 1 1v7.5a1 1 0 0 1-1 1zm0 0-4.2 6.1a1.6 1.6 0 0 1-2.9-1.2l.9-3.9H5.4a1.9 1.9 0 0 1-1.8-2.4l1.8-6.6A2 2 0 0 1 7.3 4h9.2"/></symbol>
   <symbol id="i-fill" viewBox="0 0 24 24"><path d="M17.5 17.5 7 7m0 8V7h8"/></symbol>
+  <symbol id="i-library" viewBox="0 0 24 24"><path d="M5 4.5v15M9.5 4.5v15M14 5.2l4.6 14.1"/></symbol>
+  <symbol id="i-wifi-off" viewBox="0 0 24 24"><path d="M4.5 4.5l15 15M8.6 13.4a5 5 0 0 1 4.6-1.2M5.3 10.1a9.6 9.6 0 0 1 3.4-2M12 6.2c2.9 0 5.6 1.1 7.6 3.1M12 18.5h.01"/></symbol>
   <symbol id="i-logo" viewBox="0 0 32 32"><circle cx="16" cy="16" r="15" fill="url(#g-logo)" stroke="none"/><path d="M10.5 12v8M16 8.5v15M21.5 13v6" stroke="#fff" stroke-width="2.6" stroke-linecap="round" fill="none"/></symbol>
 </svg>
 
@@ -72,12 +74,8 @@
     <span>Reef</span>
   </a>
   <div class="top-actions">
-    <a class="hbtn" href="#downloads" aria-label="Downloads">
-      <svg class="i"><use href="#i-download"/></svg>
-      <span class="badge" id="hdr-badge" hidden></span>
-    </a>
-    <button class="hbtn hbtn-accent" id="status-btn" aria-label="Server status">
-      <svg class="i"><use href="#i-server"/></svg>
+    <button class="avatar" id="status-btn" aria-label="Server and settings">
+      <span class="avatar-face" id="avatar-face" aria-hidden="true"><svg class="i"><use href="#i-person"/></svg></span>
       <span class="dot" id="status-dot"></span>
     </button>
   </div>
@@ -86,12 +84,11 @@
 <main class="app">
   <section class="view" id="view-home"></section>
   <section class="view" id="view-search" hidden></section>
-  <section class="view" id="view-kept" hidden></section>
-  <section class="view" id="view-downloads" hidden></section>
+  <section class="view" id="view-library" hidden></section>
   <section class="view" id="view-detail" hidden></section>
 </main>
 
-<div class="mini glass" id="mini" hidden>
+<div class="mini cover-tint" id="mini" hidden>
   <button class="mini-open" id="mini-open" aria-label="Open player">
     <span class="mini-art"><img id="mini-art" alt=""></span>
     <span class="mini-text"><span class="mini-t" id="mini-t"></span><span class="mini-s" id="mini-s"></span></span>
@@ -104,8 +101,7 @@
 <div class="dock" id="dock">
   <nav class="tabs glass" aria-label="Main">
     <a class="tab" data-view="home" href="#home"><svg class="i"><use href="#i-home"/></svg><span>Home</span></a>
-    <a class="tab" data-view="kept" href="#kept"><svg class="i"><use href="#i-disc"/></svg><span>Kept</span></a>
-    <a class="tab" data-view="downloads" href="#downloads"><svg class="i"><use href="#i-download"/></svg><span>Downloads</span><span class="badge" id="tab-badge" hidden></span></a>
+    <a class="tab" data-view="library" href="#library"><svg class="i"><use href="#i-library"/></svg><span>Library</span><span class="badge" id="tab-badge" hidden></span></a>
   </nav>
   <a class="fab glass" href="#search" aria-label="Search"><svg class="i"><use href="#i-search"/></svg></a>
 </div>
@@ -119,7 +115,7 @@
   </label>
 </form>
 
-<section class="np" id="np" aria-hidden="true" aria-label="Now playing">
+<section class="np cover-tint" id="np" aria-hidden="true" aria-label="Now playing">
   <div class="np-bg"><img id="np-bg" alt=""></div>
   <div class="np-inner">
     <header class="np-top" id="np-grab">
@@ -155,7 +151,7 @@
       <button class="round glass" id="np-keep2" data-keep="" aria-label="Keep in library"><svg class="i"><use href="#i-plus"/></svg></button>
       <button class="round glass" id="np-queue" aria-label="Up next"><svg class="i"><use href="#i-queue"/></svg></button>
       <button class="round glass" id="np-sleep" aria-label="Sleep timer"><svg class="i"><use href="#i-moon"/></svg><span class="badge" id="np-sleep-badge" hidden></span></button>
-      <a class="round glass" href="#downloads" id="np-dl" aria-label="Downloads"><svg class="i"><use href="#i-download"/></svg></a>
+      <a class="round glass" href="#library" id="np-dl" aria-label="Downloads in Library"><svg class="i"><use href="#i-download"/></svg></a>
     </div>
   </div>
 </section>

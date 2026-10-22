@@ -8,13 +8,15 @@ import re
 import subprocess
 import threading
 import time
+from collections import OrderedDict
 from datetime import timedelta
 from datetime import timezone as dt_timezone
 from urllib.parse import parse_qs, parse_qsl, quote, urlsplit, urlunsplit
 from zoneinfo import ZoneInfo
 
+import requests
 import yt_dlp
-from flask import Flask, Response, abort, jsonify, redirect, render_template, request
+from flask import Flask, Response, abort, jsonify, redirect, render_template, request, send_file
 from werkzeug.exceptions import BadRequest, RequestEntityTooLarge
 
 import aliases
@@ -45,6 +47,7 @@ import sources
 import store
 import streamer
 import tagging
+import testaudio
 import tiles
 import updater
 import ytmusic
@@ -124,7 +127,7 @@ def index():
 def health():
     return jsonify({
         "reef": "ok",
-        "navidrome": navidrome.ping(),
+        "navidrome": {**navidrome.ping(), "configured": navidrome.configured()},
         "download_dir": str(config.DOWNLOAD_DIR),
         "ytdlp": yt_dlp.version.__version__,
         "yt_client": config.YT_CLIENT,
@@ -136,6 +139,7 @@ def health():
         "failover_cooling": sources.failover.cooling(),
         "sources": list(sources.SOURCES),
         "ytmusic": {"enabled": ytmusic.enabled(), "version": ytmusic.VERSION},
+        "test_audio": testaudio.enabled(),
     })
 
 
@@ -184,7 +188,7 @@ def _config_summary():
         "replace_dead_tracks": settings.get("replace_dead_tracks"),
         "yt_personalize": settings.get("yt_personalize"), "charts_country": settings.get("charts_country"),
         "settings_overridden": sorted(r["key"] for r in settings.schema() if r["overridden"]),
-        "ydl_extra_keys": sorted(config.YDL_EXTRA), "fake_wall": config.FAKE_WALL,
+        "ydl_extra_keys": sorted(config.YDL_EXTRA), "fake_wall": config.FAKE_WALL, "test_audio": testaudio.status(),
         "log_dir": str(config.LOG_DIR) if config.LOG_DIR else None,
     }
 
@@ -226,7 +230,7 @@ def api_search():
         # Ask for extra rows while artists are blocked, so a query they dominate still fills the page.
         results = src.search(q, config.SEARCH_LIMIT * 2 if blocked else config.SEARCH_LIMIT)
     except Exception as e:
-        return jsonify({"error": str(e)[:300]}), 502
+        return jsonify(errors.payload(e)), 502
     results = blocked.tracks(results)[:config.SEARCH_LIMIT]
     streamer.prefetch([r["id"] for r in results[:3] if _track(r["id"])])
     for r in results:
@@ -300,7 +304,7 @@ def api_radio(track_id):
     try:
         tracks = blocklist.filter_tracks(ytmusic.radio(t[2]))
     except Exception as e:
-        return jsonify({"error": str(e)[:300]}), 502
+        return jsonify(errors.payload(e)), 502
     streamer.prefetch([r["id"] for r in tracks if r["id"] != t[1]][:2])
     return jsonify(_mark_kept(tracks))
 
@@ -391,7 +395,7 @@ def api_link():
             title, tracks = _link_playlist(parsed[1])
             body = {"kind": "playlist", "tracks": tracks, "title": title}
     except Exception as e:
-        return jsonify({"error": str(e)[:300]}), 502
+        return jsonify(errors.payload(e)), 502
     body["tracks"] = [t for t in body["tracks"] or [] if t]
     if kind != "track":  # a pasted single track is explicit, like opening a blocked artist's page
         body["tracks"] = blocklist.filter_tracks(body["tracks"])
@@ -467,7 +471,7 @@ def api_match():
     try:
         found = _find_song(query, loose=True)
     except Exception as e:
-        return jsonify({"error": str(e)[:300]}), 502
+        return jsonify(errors.payload(e)), 502
     if not found:
         return jsonify({"error": "No match found", "key": key}), 404
     track, score = found
@@ -590,7 +594,7 @@ def api_moods():
     except Exception as e:
         items, stale = ytmusic.cached_moods(), True
         if not items:
-            return jsonify({"error": str(e)[:300]}), 502
+            return jsonify(errors.payload(e)), 502
     sections = {}
     for m in items:
         sections.setdefault(m["section"], []).append(
@@ -611,7 +615,7 @@ def api_mood():
     try:
         playlists = ytmusic.mood_playlists(params)
     except Exception as e:
-        return jsonify({"error": str(e)[:300]}), 502
+        return jsonify(errors.payload(e)), 502
     return jsonify({"title": ytmusic.mood_title(params), "playlists": playlists})
 
 
@@ -626,7 +630,7 @@ def api_album(browse_id):
     try:
         page = ytmusic.album(browse_id)
     except Exception as e:
-        return jsonify({"error": str(e)[:300]}), 502
+        return jsonify(errors.payload(e)), 502
     blocked = blocklist.matcher()
     page["blocked"] = blocked.any_artist(page["artists"])
     if not page["blocked"]:
@@ -648,7 +652,7 @@ def api_artist(channel_id):
     try:
         page = ytmusic.artist(channel_id)
     except Exception as e:
-        return jsonify({"error": str(e)[:300]}), 502
+        return jsonify(errors.payload(e)), 502
     blocked = blocklist.matcher()
     page["blocked"] = blocked.artist(page["id"], page["name"]) or blocked.artist(page["channel_id"])
     if not page["blocked"]:
@@ -671,7 +675,7 @@ def api_playlist(list_id):
     try:
         page = ytmusic.playlist(list_id)
     except Exception as e:
-        return jsonify({"error": str(e)[:300]}), 502
+        return jsonify(errors.payload(e)), 502
     page["tracks"] = blocklist.filter_tracks(page["tracks"])
     return _page(page)
 
@@ -742,6 +746,10 @@ def api_stream(track_id):
     t = _track(track_id)
     if not t:
         abort(404)
+    if testaudio.covers(t[0].key):
+        # REEF_TEST_AUDIO (loopback only): a local file per id, Range/206 from send_file; YouTube is never asked.
+        path = testaudio.pick(t[2])
+        return send_file(path, mimetype=testaudio.mimetype(path), conditional=True, max_age=0)
     # ?fresh=<token>: evict the cached URL and resolve again (the player's recovery). The first request
     # carrying a given token evicts; the reloaded element's later Range requests repeat it harmlessly.
     fresh = request.args.get("fresh", "").strip()[:64]
@@ -1293,7 +1301,7 @@ def api_charts():
     try:
         doc = charts.get(code)
     except Exception as e:
-        return jsonify({"error": str(e)[:300]}), 502
+        return jsonify(errors.payload(e)), 502
     blocked, names = blocklist.matcher(), aliases.resolver()
     for s in doc["sections"]:
         if s["kind"] == "artists":
@@ -1465,8 +1473,47 @@ def api_library_recent():
         return jsonify([])
 
 
+ART_MIN, ART_MAX = 64, 1000
+# Art up to this size is sent as bytes from Reef's own origin instead of a redirect, so the client can read its
+# pixels from a canvas (the cover palette samples /api/art/<id>?size=64|96); a cross-origin redirect taints it.
+ART_TINY = 128
+ART_TINY_BYTES = 512 * 1024  # bigger upstream images aren't proxied (the redirect is kept)
+ART_TINY_KEEP = 400  # tiny images kept in memory (a 64 px YT Music cover is ~2-4 KB, a mqdefault ~15 KB)
+_tiny_art = OrderedDict()  # upstream url -> (bytes, mime)
+_tiny_lock = threading.Lock()
+_art_session = requests.Session()
+
+
 def _art_size():
-    return min(max(request.args.get("size", 300, type=int), 64), 1000)
+    return min(max(request.args.get("size", 300, type=int), ART_MIN), ART_MAX)
+
+
+def _tiny_bytes(url):
+    """(data, mime) of a small upstream image, from memory or fetched once; None when it can't be had."""
+    with _tiny_lock:
+        hit = _tiny_art.get(url)
+        if hit is not None:
+            _tiny_art.move_to_end(url)
+            return hit
+    try:
+        with _art_session.get(url, timeout=(3, 6), stream=True) as r:
+            mime = (r.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+            if r.status_code != 200 or not mime.startswith("image/"):
+                return None
+            buf = bytearray()
+            for chunk in r.iter_content(16 * 1024):
+                buf += chunk
+                if len(buf) > ART_TINY_BYTES:
+                    return None
+    except Exception as e:
+        logger.info(f"art tiny fetch failed: {log.redact(str(e))[:160]}")
+        return None
+    hit = (bytes(buf), mime)
+    with _tiny_lock:
+        _tiny_art[url] = hit
+        while len(_tiny_art) > ART_TINY_KEEP:
+            _tiny_art.popitem(last=False)
+    return hit
 
 
 def _navidrome_cover(cover_id, size):
@@ -1535,6 +1582,10 @@ def api_art(track_id):
         abort(404)
     if found[0] == "bytes":
         return Response(found[1], content_type=found[2], headers={"Cache-Control": ART_CACHE})
+    if size <= ART_TINY:
+        tiny = _tiny_bytes(found[1])
+        if tiny:
+            return Response(tiny[0], content_type=tiny[1], headers={"Cache-Control": ART_CACHE})
     resp = redirect(found[1], 302)
     resp.headers["Cache-Control"] = "public, max-age=3600"
     return resp
@@ -1676,6 +1727,7 @@ def main():
     server = "flask-dev" if config.DEV else "waitress"
     logger.info(f"reef start host={config.HOST} port={config.PORT} server={server} version={_version()} "
                 f"open={int(config.OPEN)} password={int(bool(config.PASSWORD))} downloads={config.DOWNLOAD_DIR}")
+    testaudio.announce()
     if config.DEV:
         app.run(host=config.HOST, port=config.PORT, threaded=True)
         return
