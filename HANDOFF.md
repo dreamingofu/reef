@@ -58,9 +58,13 @@ Pass the Navidrome password through the environment. Don't put it in a committed
 ## Code map
 
 - `app.py`: routes (`/api/search?q=&src=`, `/api/sources`, `/api/stream/<id>` with Range passthrough, `/api/prefetch`,
-  `/api/download`, `/api/jobs`, `/api/history`, `/api/library/recent`, `/api/cover/<id>`, `/api/art/<id>`, `/api/tiles`, `/api/health`).
+  `/api/download`, `/api/jobs`, `/api/history`, `/api/library/recent`, `/api/cover/<id>`, `/api/art/<id>`, `/api/tiles`, `/api/health`,
+  `/api/suggest?q=`, `/api/radio/<id>`, `/api/link?url=` (pasted YouTube / YT Music links, parsed never fetched), `/share` (Web Share Target → `/?link=…#search`)).
   Track ids: bare 11-char = YouTube, `mc:<id>` = Monochrome, `nd:<id>` = Navidrome library (`sources.parse`).
-- `sources/`: one adapter per source (`youtube.py` wraps yt-dlp + the Piped/Invidious fallback hooks, `monochrome.py`,
+- `ytmusic.py`: anonymous YouTube Music via `ytmusicapi` (one locked client, 5/10 s timeouts): songs search with artists/album/square
+  art, suggestions (10 min cache), radio (30 min cache), song/playlist/album lookups for links, and a 5000-entry videoId → square art
+  map that `/api/art` uses. `REEF_YTMUSIC=0` turns it off; a missing package also just disables it.
+- `sources/`: one adapter per source (`youtube.py`: search = YT Music → yt-dlp → Piped/Invidious; stream = yt-dlp + fallbacks, `monochrome.py`,
   `navidrome_src.py`, `piped.py`, `invidious.py`), `failover.py` rotates across instance lists, `__init__.py` is the registry.
 - `search.py`: yt-dlp flat search (one shared `YoutubeDL`, video ids only). `streamer.py`: source-agnostic resolve cache
   (1 h TTL, concurrent calls for one id share one extraction, 2-thread prefetch pool that yields to the player), keep-alive
@@ -123,7 +127,15 @@ result card, Songs rows with **+**, and filter chips. Design tokens are at the t
 - Sleep timer (15/30/45/60 min, end of track) runs off a deadline checked every 5 s + on timeupdate/visibilitychange.
 - `reef.session` in localStorage restores the queue paused at the saved position after a reload.
 - Not yet confirmed on a real iPhone: sleep timer firing while locked, sheet drag-to-close.
-- Next per the plan: Phase 4, YouTube Music via `ytmusicapi` (search with artist/album, suggestions, radio/autoplay).
+
+## Round 6 (2026-10-21): YouTube Music discovery (Phase 4)
+
+- Search uses YouTube Music (`ytmusic.py`, `REEF_YTMUSIC=1`) with yt-dlp as the fallback; rows show artist · album,
+  an E badge and square art. Suggestions while typing (`/api/suggest`).
+- Paste a YouTube / YT Music link (track, playlist, album) into search (`/api/link`); Android share sheet → `/share`.
+- ⋯ → Start radio; Autoplay (Up next toggle, default on) appends ~20 similar tracks when ≤2 remain (`/api/radio`).
+- **Phone update now needs pip**: `cd ~/reef && git pull --ff-only && pip install -r requirements.txt && ~/.termux/boot/reef.sh`.
+- Next (Phase 4b): YT Music moods/genres home, album/artist pages + keep whole album, blocked artists.
 
 ## Production plan (2026-10-21)
 

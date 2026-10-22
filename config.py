@@ -54,6 +54,9 @@ SPONSORBLOCK = os.environ.get("REEF_SPONSORBLOCK", "0").strip() == "1"
 LYRICS_FILE = Path(os.environ.get("REEF_LYRICS_FILE") or HISTORY_FILE.with_name("lyrics.json"))
 # Also write synced lyrics as a `<file>.lrc` sidecar next to each kept track (the tag alone is enough for Navidrome).
 LRC_SIDECAR = os.environ.get("REEF_LRC_SIDECAR", "0").strip() == "1"
+# Search, suggestions, radio and link metadata via YouTube Music (ytmusicapi, anonymous).
+# 0 = yt-dlp search only (no suggestions or radio).
+YTMUSIC = os.environ.get("REEF_YTMUSIC", "1").strip() != "0"
 # Measure loudness (ffmpeg ebur128) of each kept track and write ReplayGain / R128 gain tags.
 REPLAYGAIN = os.environ.get("REEF_REPLAYGAIN", "1").strip() == "1"
 

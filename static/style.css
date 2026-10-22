@@ -194,6 +194,33 @@ ul { list-style: none; margin: 0; padding: 0; }
 .row.playing .row-t { color: var(--accent-soft); }
 .row.job.error .row-s { color: #ff8a8a; white-space: normal; }
 .row.job.done .row-s { color: var(--ok); }
+/* explicit badge, before a row's subtitle */
+.xbadge {
+  display: inline-grid; place-items: center; width: 14px; height: 14px; margin-right: 5px; vertical-align: -2px;
+  border-radius: 3px; background: rgba(255, 255, 255, .5); color: #000; font-size: 10px; font-weight: 800; line-height: 1; letter-spacing: 0;
+}
+.top-s .xbadge { vertical-align: -1px; }
+
+/* search suggestions */
+.sug { margin-top: 0; }
+.sug-row { padding-top: 2px; padding-bottom: 2px; }
+.sug-row .row-main { min-height: 46px; gap: 14px; }
+.sug-ic { flex: none; width: 24px; display: grid; place-items: center; color: var(--faint); }
+.sug-ic .i { width: 19px; height: 19px; }
+.sug-t { min-width: 0; flex: 1; font-size: 17px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.sug-t b { color: var(--text); font-weight: 600; }
+.sug-fill { color: var(--faint); }
+
+/* pasted playlist / album */
+.pl-head { display: flex; align-items: center; gap: 16px; margin-top: 4px; }
+.pl-art { flex: none; width: 128px; height: 128px; border-radius: 10px; overflow: hidden; background: var(--surface); display: grid; place-items: center; color: var(--faint); box-shadow: 0 10px 30px rgba(0, 0, 0, .5); }
+.pl-art img { width: 100%; height: 100%; object-fit: cover; }
+.pl-art .i { width: 44px; height: 44px; }
+.pl-meta { min-width: 0; flex: 1; display: flex; flex-direction: column; gap: 3px; }
+.pl-t { font-size: 22px; font-weight: 700; letter-spacing: -.02em; line-height: 1.15; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; overflow-wrap: anywhere; }
+.pl-a { font-size: 15px; color: var(--accent-soft); font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.pl-s { font-size: 14px; color: var(--muted); }
+
 .bar { display: block; height: 3px; margin-top: 6px; border-radius: 2px; background: rgba(255, 255, 255, .12); overflow: hidden; }
 .bar i { display: block; height: 100%; background: var(--accent); border-radius: 2px; transition: width .4s ease; }
 
@@ -279,13 +306,19 @@ body:not(.is-playing) .eq i { animation-play-state: paused; }
 .searchbar { display: none; }
 body[data-view="search"] .dock { display: none; }
 body[data-view="search"] .searchbar { display: flex; }
-.search-pill { flex: 1; height: 56px; border-radius: 28px; display: flex; align-items: center; gap: 10px; padding: 0 8px 0 18px; color: var(--muted); }
+/* min-width: 0 lets the pill shrink below the input's intrinsic (~20ch) width, or it overflows once ✕ shows */
+.search-pill { flex: 1; min-width: 0; height: 56px; border-radius: 28px; display: flex; align-items: center; gap: 10px; padding: 0 8px 0 18px; color: var(--muted); }
 .search-pill input {
   flex: 1; min-width: 0; height: 100%; border: 0; outline: 0; background: transparent; color: var(--text);
   font: inherit; font-size: 17px; -webkit-appearance: none; appearance: none;
 }
 .search-pill input::placeholder { color: var(--faint); }
 .search-pill input::-webkit-search-cancel-button { display: none; }
+
+/* typing on a phone: the keyboard leaves little room, so the mini player steps aside */
+@media (hover: none) and (pointer: coarse) {
+  body.typing .mini { display: none; }
+}
 
 /* mini player */
 .mini {
@@ -454,8 +487,8 @@ body:not(.is-playing) .np-art { transform: scale(.86); }
 
 /* queue sheet */
 .q-head h3 { margin-bottom: 0; }
-.q-head { padding-bottom: 6px; }
-.q-modes { display: flex; gap: 6px; flex: none; }
+.q-head { padding-bottom: 6px; flex-wrap: wrap; row-gap: 8px; }
+.q-modes { display: flex; flex-wrap: wrap; gap: 6px; }
 .chip.sm { display: inline-flex; align-items: center; gap: 5px; padding: 6px 11px; font-size: 13px; }
 .chip.sm .i { width: 15px; height: 15px; }
 .q-body { flex: 1; min-height: 0; overflow-y: auto; overscroll-behavior: contain; margin: 0 -22px; padding: 0 22px 4px; scrollbar-width: none; }
@@ -466,6 +499,8 @@ body:not(.is-playing) .np-art { transform: scale(.86); }
 .q-row .row-art { width: 44px; height: 44px; }
 .q-row .icon-btn { color: var(--muted); }
 .q-empty { color: var(--muted); font-size: 15px; padding: 12px 0 8px; }
+.q-auto { display: flex; align-items: center; gap: 6px; margin: 18px 0 4px; font-size: 14px; font-weight: 600; color: var(--faint); }
+.q-auto .i { width: 17px; height: 17px; }
 .q-body .empty { padding: 28px 12px 12px; }
 
 .btn-wide { width: 100%; height: 50px; margin-top: 16px; border-radius: 14px; background: var(--accent); color: #fff; font-size: 16px; font-weight: 600; }

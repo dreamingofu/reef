@@ -2,3 +2,4 @@ flask>=3.0
 yt-dlp
 requests
 mutagen
+ytmusicapi>=1.12,<2

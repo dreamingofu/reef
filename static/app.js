@@ -7,6 +7,7 @@
   const VIEWS = ["home", "search", "kept", "downloads"];
   const ACTIVE = ["queued", "downloading", "converting"];
   const FROM = { results: "From search", history: "Kept", recent: "Recently played" };
+  const AUTO_LIMIT = 20; // autoplay tracks appended per radio fetch
 
   const store = {
     get(k, d) { try { const v = localStorage.getItem("reef." + k); return v ? JSON.parse(v) : d; } catch { return d; } },
@@ -20,6 +21,7 @@
     results: [],
     searching: false,
     searchError: "",
+    link: null, // the current search is a pasted link: { kind: "track" | "playlist", title }
     filter: "top",
     history: [],
     library: null,
@@ -50,10 +52,12 @@
   // Direct YouTube URLs, used only for mediaSession artwork (iOS wants absolute, fetchable URLs).
   const thumb = (id) => `https://i.ytimg.com/vi/${id}/mqdefault.jpg`;
   const bigThumb = (id) => `https://i.ytimg.com/vi/${id}/maxresdefault.jpg`;
-  // Everything else goes through /api/art: the Navidrome cover for kept tracks, else a redirect to
-  // YouTube (size <= 200 -> mqdefault 16:9, < 600 -> hqdefault 4:3 letterboxed, >= 600 -> maxres).
-  // Sizes are [not kept, kept]: YouTube art stays <= 200 in square crops so hqdefault's black bars
-  // never show; kept tracks are served from Navidrome (no bars), so they get sharper sizes.
+  // Everything else goes through /api/art: the Navidrome cover for kept tracks; else, for a YouTube id
+  // the server has seen in a YT Music response (search, radio, link), square art at exactly `size`;
+  // else a redirect to YouTube (size <= 200 -> mqdefault 16:9, < 600 -> hqdefault 4:3 letterboxed,
+  // >= 600 -> maxres). Sizes are [not kept, kept]: the client can't tell whether the square art is
+  // known (the server forgets it on restart), so non-kept art stays <= 200 in square crops so
+  // hqdefault's black bars never show; square art at 200 is still sharp enough for rows and cards.
   const ART = { small: [200, 480], big: [720, 720], fallback: [200, 480], tile: [320, 320], mini: [160, 320], bg: [160, 160] };
   // encodeURIComponent turns "mc:123" into "mc%3A123", which Flask decodes back before routing.
   const artUrl = (id, size) => `/api/art/${encodeURIComponent(id)}?size=${size}`;
@@ -80,6 +84,10 @@
   // " · Monochrome" after a non-YouTube track's subtitle; YouTube is the default, so it stays unlabeled.
   const srcBadge = (t) => (srcKey(t.id) === "yt" ? "" : ` · ${esc(srcInfo(srcKey(t.id)).name)}`);
   const codecLabel = (t) => (t.codec ? String(t.codec).toUpperCase() : srcInfo(srcKey(t.id)).codec_label);
+  const xBadge = (t) => (t.explicit ? `<span class="xbadge" role="img" aria-label="Explicit">E</span>` : "");
+  // "[E] Artist · Album · 3:45 · Source": the subtitle of search / link / queue rows.
+  const trackSub = (t) => xBadge(t) + [esc(t.channel), t.album ? esc(t.album) : "", t.duration ? fmt(t.duration) : ""]
+    .filter(Boolean).join(" · ") + srcBadge(t);
 
   function fmt(sec) {
     if (!isFinite(sec) || sec < 0) sec = 0;
@@ -137,9 +145,10 @@
       return a;
     }
     // Shuffle only what comes after the current track; `original` is the snapshot unshuffle() restores.
+    // Autoplay items (t.auto) aren't shuffled: they stay a block at the end, in their order.
     function shuffleUpcoming(queue, index, rand) {
-      const head = queue.slice(0, index + 1);
-      return { queue: head.concat(shuffled(queue.slice(index + 1), rand)), original: queue.slice() };
+      const head = queue.slice(0, index + 1), up = queue.slice(index + 1);
+      return { queue: head.concat(shuffled(up.filter((t) => !t.auto), rand), up.filter((t) => t.auto)), original: queue.slice() };
     }
     // Start a fresh shuffled queue at list[index]: it plays first, everything else follows in random order.
     function shuffleFrom(list, index, rand) {
@@ -178,13 +187,36 @@
       const p = queue[index] ? original.findIndex((t) => t.id === queue[index].id) : -1;
       return { queue: q, original: p >= 0 ? insertNext(original, p, track) : original.slice() };
     }
-    // At the end; a copy already upcoming is moved to the end.
+    // At the end of what the user queued: before the first upcoming autoplay item, else at the very end.
+    // A copy already upcoming (autoplay or not) is moved there.
     function append(queue, index, track) {
       const q = queue.slice();
       const at = upcomingAt(q, index, track.id);
       if (at >= 0) q.splice(at, 1);
-      q.push(track);
+      const a = q.findIndex((t, k) => k > index && t.auto);
+      if (a >= 0) q.splice(a, 0, track); else q.push(track);
       return q;
+    }
+    // Append the tracks not already anywhere in the queue (by id, deduped among themselves too), at most
+    // `limit` of them; `auto` marks them as autoplay items ({...t, auto: true}).
+    function appendNew(queue, tracks, { limit = Infinity, auto = false } = {}) {
+      const seen = new Set(queue.map((t) => t.id));
+      const out = queue.slice();
+      for (const t of tracks || []) {
+        if (out.length - queue.length >= limit) break;
+        if (!t || !t.id || seen.has(t.id)) continue;
+        seen.add(t.id);
+        out.push(auto ? { ...t, auto: true } : t);
+      }
+      return out;
+    }
+    // Drop the upcoming autoplay items (autoplay turned off); history and the current track stay.
+    const stripAuto = (queue, index) => queue.filter((t, k) => k <= index || !t.auto);
+    // Upcoming tracks split for display: [manual, autoplay block]. `at` = queue index of the block's first item.
+    function upcomingParts(queue, index) {
+      const up = queue.slice(index + 1);
+      const a = up.findIndex((t) => t.auto);
+      return a < 0 ? { manual: up, auto: [], at: -1 } : { manual: up.slice(0, a), auto: up.slice(a), at: index + 1 + a };
     }
     function removeAt(queue, index, i) {
       if (!(i >= 0 && i < queue.length)) return { queue: queue.slice(), index };
@@ -202,13 +234,21 @@
     }
     // -1 = restart the current track.
     const prevIndex = (len, index) => (len && index > 0 ? Math.min(index, len) - 1 : -1);
-    return { shuffled, shuffleUpcoming, shuffleFrom, unshuffle, insertNext, playNext, append, removeAt, clearUpcoming, nextIndex, prevIndex };
+    return { shuffled, shuffleUpcoming, shuffleFrom, unshuffle, insertNext, playNext, append, appendNew, stripAuto, upcomingParts, removeAt, clearUpcoming, nextIndex, prevIndex };
   })();
   // ==== queue-core:end ====
 
   const navidromeUrl = (path) => `${location.protocol}//${location.hostname}:4533${path}`;
   const cur = () => state.queue[state.index];
-  const slim = (t) => ({ id: t.id, title: t.title, channel: t.channel, duration: t.duration, source: t.source || srcKey(t.id), ...(t.codec ? { codec: t.codec } : {}), ...(t.album ? { album: t.album } : {}) });
+  // What a queued / remembered track keeps (queue, session, "plays"). `auto` (an autoplay item) is dropped
+  // here; only the live queue and its saved session keep it, via qslim.
+  const slim = (t) => ({
+    id: t.id, title: t.title, channel: t.channel, duration: t.duration, source: t.source || srcKey(t.id),
+    ...(t.codec ? { codec: t.codec } : {}), ...(t.album ? { album: t.album } : {}), ...(t.album_id ? { album_id: t.album_id } : {}),
+    ...(Array.isArray(t.artists) && t.artists.length ? { artists: t.artists.map((a) => ({ name: a?.name, id: a?.id ?? null })) } : {}),
+    ...(t.explicit ? { explicit: true } : {}),
+  });
+  const qslim = (t) => (t.auto ? { ...slim(t), auto: true } : slim(t));
 
   // YouTube serves a 120x90 placeholder (sometimes with status 404) when maxres art is missing.
   function fallbackImg(img) {
@@ -314,7 +354,7 @@
 
   function row(t, i, list, sub) {
     const playing = cur()?.id === t.id;
-    const subtitle = sub ?? `${esc(t.channel)}${t.duration ? ` · ${fmt(t.duration)}` : ""}${srcBadge(t)}`;
+    const subtitle = sub != null ? xBadge(t) + sub : trackSub(t);
     return `<li class="row${playing ? " playing" : ""}" data-track="${esc(t.id)}">
       <button class="row-main" data-play="${i}" data-list="${list}">
         <span class="row-art">${art(t.id)}${eqIfPlaying(t.id)}</span>
@@ -370,8 +410,63 @@
       `<button class="chip${x.key === on ? " on" : ""}" data-source="${esc(x.key)}">${esc(x.name)}</button>`).join("")}</div>`;
   }
 
+  // Suggestion rows: tap runs the search; ↖ puts the text in the box to keep typing.
+  function suggestRows(typed) {
+    const items = sug.list.length ? sug.list : [typed];
+    const low = typed.toLowerCase();
+    return `<ul class="rows sug">${items.map((s) => {
+      const n = s.toLowerCase().startsWith(low) ? typed.length : 0;
+      return `<li class="row sug-row"><button class="row-main" data-search="${esc(s)}"><span class="sug-ic">${icon("search")}</span>
+        <span class="sug-t">${n ? `<b>${esc(s.slice(0, n))}</b>${esc(s.slice(n))}` : esc(s)}</span></button>
+        <button class="icon-btn sm sug-fill" data-fill="${esc(s)}" aria-label="Edit “${esc(s)}”">${icon("fill")}</button></li>`;
+    }).join("")}</ul>`;
+  }
+
+  function topCard(t) {
+    return `<div class="top-card" data-track="${esc(t.id)}">
+        <span class="top-art">${art(t.id)}</span>
+        <div class="top-meta">
+          <div class="top-t">${esc(t.title)}</div>
+          <div class="top-s">Song · ${trackSub(t)}</div>
+          <div class="top-actions">
+            <button class="play-round" data-play="0" data-list="results" aria-label="Play">${icon("play", "fill")}</button>
+            ${keepBtn(t.id, "results")}
+            ${moreBtn(t, 0, "results")}
+          </div>
+        </div>
+      </div>`;
+  }
+
+  // A pasted playlist / album: header, Play all + Shuffle, then its tracks.
+  function playlistView(res) {
+    const album = res.length > 0 && res.every((t) => t.album_id && t.album_id === res[0].album_id);
+    const total = res.reduce((a, t) => a + (Number(t.duration) || 0), 0);
+    const mins = Math.round(total / 60);
+    const len = total ? ` · ${mins >= 60 ? `${Math.floor(mins / 60)} hr ${mins % 60} min` : `${mins} min`}` : "";
+    const artist = album && res[0].channel ? `<span class="pl-a">${esc(res[0].channel)}</span>` : "";
+    return `<div class="pl-head">
+        <span class="pl-art">${res.length ? art(res[0].id, true) : icon("note")}</span>
+        <div class="pl-meta"><span class="eyebrow">${album ? "Album" : "Playlist"}</span>
+          <h2 class="pl-t">${esc(state.link.title || (album ? res[0].album : "") || "Playlist")}</h2>${artist}
+          <span class="pl-s">${res.length} song${res.length === 1 ? "" : "s"}${len}</span></div>
+      </div>
+      ${res.length ? `<div class="actions">
+        <button class="pill-btn" data-play-all="results">${icon("play", "fill")}Play</button>
+        <button class="pill-btn" data-shuffle-all="results">${icon("shuffle")}Shuffle</button>
+      </div>
+      <ul class="rows" style="margin-top:12px">${res.map((r, i) => row(r, i, "results")).join("")}</ul>`
+        : emptyState("note", "Nothing playable", "This playlist has no tracks Reef can play.")}`;
+  }
+
   function renderSearch() {
     const el = $("#view-search");
+    const typed = suggesting();
+    searchMode = typed ? "suggest" : "results";
+    if (typed) {
+      el.innerHTML = suggestRows(typed);
+      fitSuggest();
+      return;
+    }
     if (!state.query) {
       const searches = store.get("searches", []);
       el.innerHTML = sourceChips() + (searches.length ? `
@@ -381,40 +476,32 @@
       return;
     }
 
-    const chips = sourceChips() + `<div class="chips">${[["top", "Top Results"], ["songs", "Songs"], ["kept", "In library"]].map(([k, l]) =>
+    // Pasted links ignore the source and the filters: they always resolve on YouTube.
+    const link = state.link;
+    const chips = link ? "" : sourceChips() + `<div class="chips">${[["top", "Top Results"], ["songs", "Songs"], ["kept", "In library"]].map(([k, l]) =>
       `<button class="chip${state.filter === k ? " on" : ""}" data-filter="${k}">${l}</button>`).join("")}</div>`;
 
     if (state.searching) {
-      el.innerHTML = chips + `<h2 class="section-title">Top result</h2><div class="sk sk-top"></div><h2 class="section-title">Songs</h2>`
-        + `<div class="sk-row"><div class="sk a"></div><div class="sk l"></div></div>`.repeat(5);
+      el.innerHTML = chips + `<h2 class="section-title">${link ? "Opening link…" : "Top result"}</h2><div class="sk sk-top"></div>${link ? "" : `<h2 class="section-title">Songs</h2>`}`
+        + `<div class="sk-row"><div class="sk a"></div><div class="sk l"></div></div>`.repeat(link ? 3 : 5);
       return;
     }
     if (state.searchError) {
-      el.innerHTML = chips + emptyState("alert", "Search failed", state.searchError);
+      el.innerHTML = chips + emptyState("alert", link ? "Couldn't open link" : "Search failed", state.searchError);
       return;
     }
     const res = state.results;
+    if (link?.kind === "playlist") { el.innerHTML = playlistView(res); return; }
     if (!res.length) {
       el.innerHTML = chips + emptyState("search", "No results", `Nothing found for “${state.query}”.`);
       return;
     }
 
     let html = chips;
-    if (state.filter === "top") {
-      const t = res[0];
-      html += `<h2 class="section-title">Top result</h2>
-        <div class="top-card" data-track="${esc(t.id)}">
-          <span class="top-art">${art(t.id)}</span>
-          <div class="top-meta">
-            <div class="top-t">${esc(t.title)}</div>
-            <div class="top-s">Song · ${esc(t.channel)}${t.duration ? ` · ${fmt(t.duration)}` : ""}${srcBadge(t)}</div>
-            <div class="top-actions">
-              <button class="play-round" data-play="0" data-list="results" aria-label="Play">${icon("play", "fill")}</button>
-              ${keepBtn(t.id, "results")}
-              ${moreBtn(t, 0, "results")}
-            </div>
-          </div>
-        </div>`;
+    if (link) {
+      html += `<h2 class="section-title">Top result</h2>${topCard(res[0])}`;
+    } else if (state.filter === "top") {
+      html += `<h2 class="section-title">Top result</h2>${topCard(res[0])}`;
       if (res.length > 1) html += `<h2 class="section-title">Songs</h2><ul class="rows">${res.slice(1).map((r, i) => row(r, i + 1, "results")).join("")}</ul>`;
     } else {
       const items = res.map((r, i) => [r, i]).filter(([r]) => state.filter === "songs" || keepState(r.id) === "kept");
@@ -565,24 +652,53 @@
   }
 
   // ---------- search ----------
+  // A YouTube / YT Music URL (with or without the scheme) or a bare 11-character video id. Bare ids need a
+  // digit, - or _, or mixed case, so ordinary 11-letter words still search; the server has the final say.
+  const LINK_RE = /^(?:https?:\/\/)?(?:[\w-]+\.)*(?:youtube\.com|youtu\.be)\/\S*$/i;
+  const isBareId = (q) => /^[A-Za-z0-9_-]{11}$/.test(q) && (/[0-9_-]/.test(q) || (/[a-z]/.test(q) && /[A-Z]/.test(q)));
+  const looksLikeLink = (q) => LINK_RE.test(q) || isBareId(q);
+
   let searchSeq = 0;
-  async function runSearch(q) {
+  // `link`: q is a link (from the share target); `plain`: search the words even if they look like an id.
+  async function runSearch(q, { link = false, plain = false } = {}) {
     q = String(q || "").trim();
     if (!q) return;
+    const asLink = !plain && (link || looksLikeLink(q));
     state.query = q;
+    state.link = asLink ? { kind: "", title: "" } : null;
     state.searching = true;
     state.searchError = "";
     state.filter = "top";
+    clearTimeout(sug.timer);
+    sug.seq++;
     $("#q").value = q;
     $("#q-clear").hidden = false;
     $("#q").blur();
-    store.set("searches", [q, ...store.get("searches", []).filter((s) => s.toLowerCase() !== q.toLowerCase())].slice(0, 8));
+    if (!asLink) rememberSearch(q);
     if (location.hash !== "#search") location.hash = "#search"; else renderSearch();
     const seq = ++searchSeq;
     try {
-      const r = await api(`/api/search?q=${encodeURIComponent(q)}&src=${encodeURIComponent(currentSource())}`);
-      if (seq !== searchSeq) return;
-      state.results = r;
+      if (asLink) {
+        let r;
+        try {
+          r = await api(`/api/link?url=${encodeURIComponent(q)}`);
+        } catch (e) {
+          // Something like "Beyonce2024" looks like a video id; if it isn't one, search for it instead.
+          if (seq === searchSeq && !link && !LINK_RE.test(q)) { runSearch(q, { plain: true }); return; }
+          throw e;
+        }
+        if (seq !== searchSeq) return;
+        state.results = Array.isArray(r?.tracks) ? r.tracks : [];
+        state.link = { kind: r?.kind === "playlist" ? "playlist" : "track", title: r?.title || "" };
+        // Recent searches get a name, never the raw URL.
+        const t = state.results[0];
+        const name = state.link.kind === "playlist" ? state.link.title : t ? `${t.title} ${t.channel || ""}`.trim() : "";
+        if (name) rememberSearch(name);
+      } else {
+        const r = await api(`/api/search?q=${encodeURIComponent(q)}&src=${encodeURIComponent(currentSource())}`);
+        if (seq !== searchSeq) return;
+        state.results = r;
+      }
     } catch (e) {
       if (seq !== searchSeq) return;
       state.results = [];
@@ -591,6 +707,62 @@
     state.searching = false;
     if (state.view === "search") renderSearch();
   }
+
+  function rememberSearch(q) {
+    store.set("searches", [q, ...store.get("searches", []).filter((s) => s.toLowerCase() !== q.toLowerCase())].slice(0, 8));
+  }
+
+  // ---------- search suggestions ----------
+  // Shown in place of Recent / the results while the box holds text that hasn't been searched yet.
+  // Debounced; `seq` drops stale answers; `cache` is per typed text (lowercased), successes only.
+  const sug = { seq: 0, timer: 0, cache: new Map(), list: [] };
+  let searchMode = "";
+  const suggesting = () => {
+    const typed = $("#q").value.trim();
+    return typed && typed !== state.query && !looksLikeLink(typed) ? typed : "";
+  };
+
+  function suggest() {
+    clearTimeout(sug.timer);
+    const typed = suggesting();
+    if (typed) {
+      const key = typed.toLowerCase();
+      if (sug.cache.has(key)) {
+        sug.seq++;
+        sug.list = sug.cache.get(key);
+      } else {
+        const seq = ++sug.seq;
+        sug.timer = setTimeout(async () => {
+          let list;
+          try { list = await api(`/api/suggest?q=${encodeURIComponent(typed)}`); } catch { list = null; }
+          if (Array.isArray(list)) {
+            list = list.filter((x) => typeof x === "string" && x.trim()).slice(0, 8);
+            sug.cache.set(key, list);
+            if (sug.cache.size > 200) sug.cache.delete(sug.cache.keys().next().value);
+          }
+          if (seq !== sug.seq || suggesting() !== typed) return;
+          sug.list = list || [];
+          if (state.view === "search") renderSearch();
+        }, 250);
+      }
+    }
+    // Re-render on every keystroke while suggesting (cheap), but the results only when the mode flips.
+    if (state.view === "search" && (typed || searchMode === "suggest")) renderSearch();
+  }
+
+  // With the iOS keyboard up, Safari pans the page up to show the bottom search bar, which can hide the
+  // top of the view (the suggestions). Push the list down into what's visible (visualViewport) if so.
+  const vv = window.visualViewport;
+  function fitSuggest() {
+    const list = $("#view-search .sug");
+    if (!list) return;
+    list.style.marginTop = "";
+    if (!vv || document.activeElement !== $("#q")) return;
+    const top = list.getBoundingClientRect().top;
+    const want = vv.offsetTop + 12;
+    if (top < want) list.style.marginTop = `${Math.round(want - top)}px`;
+  }
+  if (vv) vv.addEventListener("resize", fitSuggest);
 
   // ---------- player ----------
   function play(listName, i, { shuffle = false } = {}) {
@@ -608,10 +780,15 @@
     } else {
       state.queue = tracks; state.index = i; state.original = null;
     }
-    state.from = FROM[listName] || "";
+    queueGen++;
+    state.from = fromLabel(listName);
     prefetch([cur()?.id]);
     load();
   }
+
+  // "Now playing from …": a pasted playlist shows its own name.
+  const fromLabel = (listName) => (listName === "results" && state.link?.kind === "playlist"
+    ? state.link.title || "Playlist" : FROM[listName] || "");
 
   function rememberPlay(t) {
     store.set("plays", [slim(t), ...store.get("plays", []).filter((p) => p.id !== t.id)].slice(0, 12));
@@ -647,6 +824,7 @@
     setMediaMeta(t);
     saveSession(0);
     renderQueue();
+    autoFill();
   }
 
   // Play (or resume) whatever is current. A restored session has no src yet: set it on this first
@@ -668,6 +846,7 @@
     prefetched = null;
     prefetchNext = upcomingId();
     audio.play().catch(() => {});
+    autoFill(); // a restored queue near its end
   }
 
   function next() {
@@ -675,12 +854,27 @@
     if (!n) return;
     const i = Q.nextIndex(n, state.index, state.repeat);
     if (i < 0) {
-      audio.pause();
-      if (resume) { resume.position = 0; setProgress(0, duration()); saveSession(); } else audio.currentTime = 0;
+      // End of the queue: if autoplay is fetching (or can fetch) similar tracks, wait and go on.
+      const at = state.index, gen = queueGen, wait = autoFill();
+      if (wait) {
+        setLoading(true);
+        wait.then(() => {
+          if (gen !== queueGen || state.index !== at) return; // the user moved on meanwhile
+          setLoading(false);
+          if (at + 1 < state.queue.length) { state.index = at + 1; load(); } else stopAtEnd();
+        });
+        return;
+      }
+      stopAtEnd();
       return;
     }
     state.index = i;
     load();
+  }
+
+  function stopAtEnd() {
+    audio.pause();
+    if (resume) { resume.position = 0; setProgress(0, duration()); saveSession(); } else audio.currentTime = 0;
   }
 
   function prev() {
@@ -705,6 +899,81 @@
     saveSession();
     planPrefetch();
     renderQueue();
+    autoFill();
+  }
+
+  // ---------- autoplay ----------
+  // With repeat off and <= 2 tracks left, append up to AUTO_LIMIT tracks from the radio of the queue's last
+  // YouTube track (each seed once per session), marked `auto`: the Up next sheet shows them as a block,
+  // "Add to queue" goes before them, turning autoplay off removes them. Failures stay silent.
+  // `queueGen` changes whenever the queue is replaced, so an answer for an old queue is dropped.
+  let queueGen = 0;
+  const autoplay = { on: store.get("autoplay", true), inflight: null, used: new Set(), failedAt: 0 };
+
+  // The pending fill (a Promise of "appended anything?"), or null when there's nothing to do.
+  function autoFill() {
+    if (!autoplay.on || state.repeat !== "off" || !cur()) return null;
+    if (autoplay.inflight) return autoplay.inflight;
+    if (state.queue.length - state.index - 1 > 2) return null;
+    const seed = state.queue.slice().reverse().find((t) => srcKey(t.id) === "yt");
+    if (!seed || autoplay.used.has(seed.id) || Date.now() - autoplay.failedAt < 30000) return null;
+    autoplay.used.add(seed.id);
+    const gen = queueGen;
+    const p = api(`/api/radio/${encodeURIComponent(seed.id)}`).then((list) => {
+      if (gen !== queueGen || !autoplay.on || state.repeat !== "off" || !Array.isArray(list)) return false;
+      const before = state.queue.length;
+      state.queue = Q.appendNew(state.queue, list.map(slim), { limit: AUTO_LIMIT, auto: true });
+      if (state.queue.length === before) return false;
+      autoplay.inflight = null; // so queueChanged() may chain another fill if still short
+      queueChanged();
+      return true;
+    }).catch((e) => {
+      console.warn("autoplay: radio failed for", seed.id, e.message);
+      autoplay.used.delete(seed.id); // a blip shouldn't end autoplay for good; retry after a pause
+      autoplay.failedAt = Date.now();
+      return false;
+    }).finally(() => { if (autoplay.inflight === p) autoplay.inflight = null; });
+    autoplay.inflight = p;
+    renderQueue(); // "finding similar tracks…" while it loads
+    return p;
+  }
+
+  function setAutoplay(on) {
+    autoplay.on = on;
+    store.set("autoplay", on);
+    if (!on) state.queue = Q.stripAuto(state.queue, state.index);
+    else autoplay.used.clear(); // switched back on: the seeds may fill again (their tracks were removed)
+    renderQueueModes();
+    queueChanged();
+  }
+
+  // ---------- radio ----------
+  // Replace the queue with the seed + its YT Music radio. A seed that's already playing keeps playing
+  // (only what comes after it is replaced); otherwise it starts at once and the radio fills in behind it.
+  async function startRadio(t) {
+    t = slim(t);
+    if (srcKey(t.id) !== "yt") return;
+    const gen = ++queueGen;
+    autoplay.used.add(t.id); // its radio is the queue now; autoplay continues from the last track
+    state.from = "Radio";
+    if (state.shuffle) { state.shuffle = false; state.original = null; }
+    if (cur()?.id !== t.id) {
+      state.queue = [t]; state.index = 0;
+      load();
+    } else {
+      updatePlayer();
+    }
+    toast(`Starting radio from “${t.title}”`);
+    let list;
+    try {
+      list = await api(`/api/radio/${encodeURIComponent(t.id)}`);
+    } catch (e) {
+      if (gen === queueGen) toast(`Couldn't start radio: ${e.message}`);
+      return;
+    }
+    if (gen !== queueGen || cur()?.id !== t.id || !Array.isArray(list)) return;
+    state.queue = Q.appendNew(Q.clearUpcoming(state.queue, state.index), list.map(slim));
+    queueChanged();
   }
 
   function addToQueue(t, listName, mode) {
@@ -713,7 +982,8 @@
     if (!cur()) {
       // Nothing loaded: either action just starts playing it.
       state.queue = [t]; state.index = 0; state.original = state.shuffle ? [t] : null;
-      state.from = FROM[listName] || "";
+      queueGen++;
+      state.from = fromLabel(listName);
       load();
       return;
     }
@@ -871,8 +1141,8 @@
     posSavedAt = Date.now();
     store.set("session", {
       v: 1, rev: ++sessionRev,
-      queue: state.queue.map(slim), index: state.index, from: state.from,
-      shuffle: state.shuffle, original: state.shuffle && state.original ? state.original.map(slim) : null,
+      queue: state.queue.map(qslim), index: state.index, from: state.from,
+      shuffle: state.shuffle, original: state.shuffle && state.original ? state.original.map(qslim) : null,
       repeat: state.repeat, position: Math.round(position * 10) / 10, savedAt: Date.now(),
     });
   }
@@ -884,12 +1154,12 @@
     if (!s || s.v !== 1 || !Array.isArray(s.queue) || !s.queue.length || !s.queue.every(validTrack)) return;
     const index = Number(s.index);
     if (!Number.isInteger(index) || index < 0 || index >= s.queue.length) return;
-    state.queue = s.queue.map(slim);
+    state.queue = s.queue.map(qslim);
     state.index = index;
     state.from = typeof s.from === "string" ? s.from : "";
     state.repeat = ["off", "all", "one"].includes(s.repeat) ? s.repeat : "off";
     state.shuffle = !!s.shuffle;
-    state.original = state.shuffle && Array.isArray(s.original) ? s.original.filter(validTrack).map(slim) : null;
+    state.original = state.shuffle && Array.isArray(s.original) ? s.original.filter(validTrack).map(qslim) : null;
     const t = cur();
     let pos = Number(s.position);
     if (!isFinite(pos) || pos < 0 || (t.duration && pos >= t.duration - 1)) pos = 0;
@@ -1350,12 +1620,13 @@
     const { t } = actTarget;
     const ks = keepState(t.id);
     $("#act-head").innerHTML = `<span class="row-art">${art(t.id)}</span>
-      <span class="row-text"><span class="row-t">${esc(t.title)}</span><span class="row-s">${esc(t.channel)}${srcBadge(t)}</span></span>`;
+      <span class="row-text"><span class="row-t">${esc(t.title)}</span><span class="row-s">${xBadge(t)}${esc(t.channel)}${srcBadge(t)}</span></span>`;
     const item = (act, ic, label, extra = "") => `<button class="menu-item" data-act="${act}"${extra}>${icon(ic)}<span class="menu-l">${label}</span></button>`;
     const keepItem = ks === "kept" ? item("keep", "check", "In your library", " disabled")
       : ks === "pending" ? item("keep", "download", "Keeping…")
       : canKeep(t.id) ? item("keep", "plus", "Keep in library") : "";
-    $("#act-menu").innerHTML = item("next", "play-next", "Play next") + item("queue", "queue-add", "Add to queue") + keepItem + item("share", "share", "Share");
+    const radioItem = srcKey(t.id) === "yt" ? item("radio", "radio", "Start radio") : "";
+    $("#act-menu").innerHTML = item("next", "play-next", "Play next") + item("queue", "queue-add", "Add to queue") + radioItem + keepItem + item("share", "share", "Share");
   }
   function runAction(act) {
     const a = actTarget;
@@ -1364,6 +1635,7 @@
     if (act === "next" || act === "queue") addToQueue(a.t, a.list, act);
     else if (act === "keep") keep(a.t.id, a.list);
     else if (act === "share") share(a.t);
+    else if (act === "radio") startRadio(a.t);
   }
 
   // ---------- queue sheet ----------
@@ -1378,11 +1650,12 @@
     if (!el || $("#queue-sheet").hidden) return;
     const rep = { off: "Repeat", all: "Repeat all", one: "Repeat one" }[state.repeat];
     el.innerHTML = `<button class="chip sm${state.shuffle ? " on" : ""}" data-q-mode="shuffle" aria-pressed="${state.shuffle}">${icon("shuffle")}Shuffle</button>
-      <button class="chip sm${state.repeat !== "off" ? " on" : ""}" data-q-mode="repeat" aria-pressed="${state.repeat !== "off"}">${icon("repeat")}${rep}</button>`;
+      <button class="chip sm${state.repeat !== "off" ? " on" : ""}" data-q-mode="repeat" aria-pressed="${state.repeat !== "off"}">${icon("repeat")}${rep}</button>
+      <button class="chip sm${autoplay.on ? " on" : ""}" data-q-mode="autoplay" aria-pressed="${autoplay.on}">${icon("infinity")}Autoplay</button>`;
   }
   function qRow(t, i, now) {
     const body = `<span class="row-art">${art(t.id)}${now ? eqIfPlaying(t.id) : ""}</span>
-      <span class="row-text"><span class="row-t">${esc(t.title)}</span><span class="row-s">${esc(t.channel)}${t.duration ? ` · ${fmt(t.duration)}` : ""}</span></span>`;
+      <span class="row-text"><span class="row-t">${esc(t.title)}</span><span class="row-s">${trackSub(t)}</span></span>`;
     return now
       ? `<li class="row playing" data-track="${esc(t.id)}"><span class="row-main">${body}</span></li>`
       : `<li class="row q-row"><button class="row-main" data-q-jump="${i}" aria-label="Play ${esc(t.title)}">${body}</button>
@@ -1392,11 +1665,17 @@
     if ($("#queue-sheet").hidden) return;
     const t = cur();
     if (!t) { $("#q-body").innerHTML = emptyState("note", "Nothing playing", "Play a song to start a queue."); return; }
-    const up = state.queue.slice(state.index + 1);
+    const { manual, auto, at } = Q.upcomingParts(state.queue, state.index);
+    const any = manual.length + auto.length;
+    const empty = state.repeat === "all" && state.queue.length > 1 ? "Repeat is on: the queue starts over after this."
+      : autoplay.on && state.repeat === "off" && autoplay.inflight ? "Autoplay is finding similar tracks…"
+      : "Nothing queued. Use ⋯ on a song to add it.";
     $("#q-body").innerHTML = `<h4 class="q-label">Now playing</h4><ul class="rows">${qRow(t, state.index, true)}</ul>
-      <div class="head-row q-up"><h4 class="q-label">Up next${up.length ? ` · ${up.length}` : ""}</h4>${up.length ? `<button class="link-btn" data-q-clear>Clear</button>` : ""}</div>
-      ${up.length ? `<ul class="rows">${up.map((x, k) => qRow(x, state.index + 1 + k)).join("")}</ul>`
-        : `<p class="q-empty">${state.repeat === "all" && state.queue.length > 1 ? "Repeat is on: the queue starts over after this." : "Nothing queued. Use ⋯ on a song to add it."}</p>`}`;
+      <div class="head-row q-up"><h4 class="q-label">Up next${manual.length ? ` · ${manual.length}` : ""}</h4>${any ? `<button class="link-btn" data-q-clear>Clear</button>` : ""}</div>
+      ${manual.length ? `<ul class="rows">${manual.map((x, k) => qRow(x, state.index + 1 + k)).join("")}</ul>`
+        : auto.length ? "" : `<p class="q-empty">${empty}</p>`}
+      ${auto.length ? `<h4 class="q-auto">${icon("infinity")}Autoplay · similar tracks</h4>
+        <ul class="rows">${auto.map((x, k) => qRow(x, at + k)).join("")}</ul>` : ""}`;
   }
 
   // ---------- toast ----------
@@ -1411,7 +1690,7 @@
 
   // ---------- events ----------
   document.addEventListener("click", (e) => {
-    const t = e.target.closest("[data-keep],[data-play],[data-search],[data-source],[data-home-tab],[data-filter],[data-dismiss],[data-play-all],[data-shuffle-all],[data-close],[data-clear-finished],[data-clear-searches],[data-more],[data-act],[data-q-jump],[data-q-remove],[data-q-clear],[data-q-mode],[data-sleep]");
+    const t = e.target.closest("[data-keep],[data-play],[data-search],[data-source],[data-home-tab],[data-filter],[data-dismiss],[data-play-all],[data-shuffle-all],[data-close],[data-clear-finished],[data-clear-searches],[data-more],[data-act],[data-q-jump],[data-q-remove],[data-q-clear],[data-q-mode],[data-sleep],[data-fill]");
     if (!t) return;
     const d = t.dataset;
     if ("keep" in d) { e.preventDefault(); if (d.keep) keep(d.keep, d.list); return; }
@@ -1420,7 +1699,18 @@
     if ("qJump" in d) { jumpTo(Number(d.qJump)); return; }
     if ("qRemove" in d) { removeFromQueue(Number(d.qRemove)); return; }
     if ("qClear" in d) { clearUpcoming(); return; }
-    if ("qMode" in d) { if (d.qMode === "shuffle") toggleShuffle(); else cycleRepeat(); return; }
+    if ("qMode" in d) {
+      if (d.qMode === "shuffle") toggleShuffle(); else if (d.qMode === "autoplay") setAutoplay(!autoplay.on); else cycleRepeat();
+      return;
+    }
+    if ("fill" in d) {
+      const q = $("#q");
+      q.value = d.fill + " ";
+      q.focus();
+      q.setSelectionRange(q.value.length, q.value.length);
+      suggest();
+      return;
+    }
     if ("sleep" in d) { setSleep(d.sleep); closeSheet("#sleep-sheet"); return; }
     if ("play" in d) { play(d.list, Number(d.play)); return; }
     if ("search" in d) { runSearch(d.search); return; }
@@ -1457,13 +1747,20 @@
   });
 
   $("#search-bar").addEventListener("submit", (e) => { e.preventDefault(); runSearch($("#q").value); });
-  $("#q").addEventListener("input", () => { $("#q-clear").hidden = !$("#q").value; });
+  $("#q").addEventListener("input", () => { $("#q-clear").hidden = !$("#q").value; suggest(); });
+  $("#q").addEventListener("focus", () => { document.body.classList.add("typing"); setTimeout(fitSuggest, 350); });
+  $("#q").addEventListener("blur", () => { document.body.classList.remove("typing"); fitSuggest(); });
+  // Keep the keyboard up when ↖ is tapped: don't let the button take focus from the box.
+  $("#view-search").addEventListener("mousedown", (e) => { if (e.target.closest("[data-fill]")) e.preventDefault(); });
   $("#q-clear").addEventListener("click", () => {
     $("#q").value = "";
     $("#q-clear").hidden = true;
     state.query = "";
+    state.link = null;
     state.results = [];
     searchSeq++;
+    sug.seq++;
+    clearTimeout(sug.timer);
     renderSearch();
     $("#q").focus();
   });
@@ -1496,7 +1793,13 @@
   // ---------- boot ----------
   state.view = "";
   restoreSession();
+  // Share target / deep links: /?link=<url>#search or /?q=<text>#search. Drop the query string first.
+  const bootArgs = new URLSearchParams(location.search);
+  const bootLink = bootArgs.get("link")?.trim(), bootQ = bootArgs.get("q")?.trim();
+  if (location.search) history.replaceState(null, "", location.pathname + (bootLink || bootQ ? "#search" : location.hash));
   route();
+  if (bootLink) runSearch(bootLink, { link: true });
+  else if (bootQ) runSearch(bootQ);
   setLyricsOn(lyr.on);
   loadSources();
   loadHealth();

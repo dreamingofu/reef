@@ -3,6 +3,7 @@ import os
 import re
 import threading
 import time
+from urllib.parse import parse_qs, quote, urlsplit
 
 import yt_dlp
 from flask import Flask, Response, abort, jsonify, redirect, render_template, request
@@ -16,6 +17,7 @@ import sources
 import streamer
 import tagging
 import tiles
+import ytmusic
 
 VIDEO_ID = re.compile(r"^[A-Za-z0-9_-]{11}$")
 TRACK_ID = re.compile(r"^(?:[a-z]{2}:)?[\w.-]{1,128}$")
@@ -23,6 +25,13 @@ COVER_ID = re.compile(r"^[\w.-]{1,128}$")
 ART_CACHE = "public, max-age=86400"
 ART_LOOKUP_BACKOFF = 600  # seconds before retrying a Navidrome lookup that found nothing
 HINT_MAX = 200
+LINK_MAX = 2048
+LIST_ID = re.compile(r"^[A-Za-z0-9_-]{12,80}$")
+ALBUM_ID = re.compile(r"^MPRE[A-Za-z0-9_-]{6,60}$")
+YT_HOSTS = {"youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com"}
+SHORT_HOSTS = {"youtu.be", "www.youtu.be"}
+# A YouTube link inside shared text ("Check this out https://youtu.be/... via app").
+SHARED_LINK = re.compile(r"(?<![\w./-])(?:https?://)?(?:(?:www|m|music)\.)?(?:youtube\.com|youtu\.be)/[^\s<>\"']+", re.I)
 
 app = Flask(__name__)
 
@@ -65,6 +74,7 @@ def health():
         "yt_fallbacks": sources.youtube.fallback_names(),
         "stream_timing": streamer.last_timing,
         "sources": list(sources.SOURCES),
+        "ytmusic": {"enabled": ytmusic.enabled(), "version": ytmusic.VERSION},
     })
 
 
@@ -86,6 +96,156 @@ def api_search():
         r.setdefault("source", src.key)
         r["kept"] = r.get("kept") or r["id"] in kept
     return jsonify(results)
+
+
+@app.get("/api/suggest")
+def api_suggest():
+    """Search-box suggestions. Called per keystroke, so it never fails: errors are an empty list."""
+    q = request.args.get("q", "").strip()[:HINT_MAX]
+    out = []
+    if q and ytmusic.enabled():
+        try:
+            out = ytmusic.suggestions(q)
+        except Exception as e:
+            print(f"suggest failed: {str(e)[:160]!r}", flush=True)
+    resp = jsonify(out)
+    resp.headers["Cache-Control"] = "private, max-age=600"
+    return resp
+
+
+def _mark_kept(tracks):
+    kept = history.ids()
+    for t in tracks:
+        t["kept"] = t["id"] in kept
+    return tracks
+
+
+@app.get("/api/radio/<track_id>")
+def api_radio(track_id):
+    """The YT Music radio mix for a YouTube track (seed usually first; the client dedupes)."""
+    t = _track(track_id)
+    if not t or t[0].key != "yt":
+        abort(404)
+    if not ytmusic.enabled():
+        return jsonify({"error": "YouTube Music is off (REEF_YTMUSIC=0)"}), 502
+    try:
+        tracks = ytmusic.radio(t[2])
+    except Exception as e:
+        return jsonify({"error": str(e)[:300]}), 502
+    streamer.prefetch([r["id"] for r in tracks if r["id"] != t[1]][:2])
+    return jsonify(_mark_kept(tracks))
+
+
+def parse_link(raw):
+    """What a pasted YouTube / YT Music link points at, parsed only (never fetched):
+    ("track", video_id, list_id|None), ("playlist", list_id), ("album", browse_id), or None."""
+    if not isinstance(raw, str):
+        return None
+    raw = raw.strip()
+    if not raw or len(raw) > LINK_MAX:
+        return None
+    if VIDEO_ID.match(raw):
+        return ("track", raw, None)
+    if "://" not in raw and re.match(r"^(?:[\w-]+\.)*(?:youtube\.com|youtu\.be)/", raw, re.I):
+        raw = "https://" + raw
+    try:
+        u = urlsplit(raw)
+        port = u.port
+    except ValueError:
+        return None
+    host = (u.hostname or "").lower()
+    if u.scheme.lower() not in ("http", "https") or port is not None or u.username or u.password:
+        return None
+    qs = parse_qs(u.query)
+    v = (qs.get("v") or [""])[0]
+    lst = (qs.get("list") or [""])[0]
+    lst = lst if LIST_ID.match(lst) else None
+    parts = [p for p in u.path.split("/") if p]
+    if host in SHORT_HOSTS:
+        return ("track", parts[0], lst) if len(parts) == 1 and VIDEO_ID.match(parts[0]) else None
+    if host not in YT_HOSTS or not parts:
+        return None
+    if parts == ["watch"]:
+        if VIDEO_ID.match(v):
+            return ("track", v, lst)
+        return ("playlist", lst) if lst else None
+    if len(parts) == 2 and parts[0] in ("shorts", "live", "embed", "v") and VIDEO_ID.match(parts[1]):
+        return ("track", parts[1], lst)
+    if parts == ["playlist"] and lst:
+        return ("playlist", lst)
+    if len(parts) == 2 and parts[0] == "browse":
+        if ALBUM_ID.match(parts[1]):
+            return ("album", parts[1])
+        if parts[1].startswith("VL") and LIST_ID.match(parts[1][2:]):
+            return ("playlist", parts[1][2:])
+    return None
+
+
+def _link_track(video_id):
+    if ytmusic.enabled():
+        try:
+            found = ytmusic.song(video_id)
+            if found:
+                return found
+        except Exception as e:
+            print(f"link: ytmusic song {video_id} failed: {str(e)[:160]!r}", flush=True)
+    return sources.youtube.lookup(video_id)
+
+
+def _link_playlist(list_id):
+    if ytmusic.enabled():
+        try:
+            title, tracks = ytmusic.playlist(list_id)
+            if tracks:
+                return title, tracks
+        except Exception as e:
+            print(f"link: ytmusic playlist {list_id} failed: {str(e)[:160]!r}", flush=True)
+    return sources.youtube.playlist_flat(list_id)
+
+
+@app.get("/api/link")
+def api_link():
+    """Tracks behind a pasted YouTube / YT Music link (watch, youtu.be, shorts, playlist, album, bare id)."""
+    parsed = parse_link(request.args.get("url", ""))
+    if not parsed:
+        return jsonify({"error": "Not a YouTube or YouTube Music link"}), 400
+    kind = parsed[0]
+    try:
+        if kind == "track":
+            body = {"kind": "track", "tracks": [_link_track(parsed[1])], "title": None, "list": parsed[2]}
+        elif kind == "album":
+            if not ytmusic.enabled():
+                return jsonify({"error": "Album links need YouTube Music (REEF_YTMUSIC=1)"}), 502
+            title, tracks = ytmusic.album(parsed[1])
+            body = {"kind": "playlist", "tracks": tracks, "title": title}
+        else:
+            title, tracks = _link_playlist(parsed[1])
+            body = {"kind": "playlist", "tracks": tracks, "title": title}
+    except Exception as e:
+        return jsonify({"error": str(e)[:300]}), 502
+    body["tracks"] = [t for t in body["tracks"] or [] if t]
+    if not body["tracks"]:
+        msg = "Video not found or unavailable" if kind == "track" else "Playlist is empty or unavailable"
+        return jsonify({"error": msg}), 404
+    _mark_kept(body["tracks"])
+    streamer.prefetch([t["id"] for t in body["tracks"][:1]])
+    return jsonify(body)
+
+
+@app.get("/share")
+def share_target():
+    """PWA Web Share Target (GET): open the first shared YouTube link in Search as `/?link=<url>#search`;
+    otherwise search for the shared text as `/?q=<text>#search`."""
+    fields = [str(request.args.get(k) or "")[:LINK_MAX] for k in ("url", "text", "title")]
+    for field in fields:
+        for m in SHARED_LINK.finditer(field):
+            link = m.group(0).rstrip(".,;:!?)]}")
+            link = link if "://" in link else "https://" + link
+            if parse_link(link):
+                return redirect("/?link=" + quote(link, safe="") + "#search", 302)
+    # Other apps share "Song by Artist https://..."; search for the words, without the link.
+    text = next((t for t in (" ".join(re.sub(r"https?://\S+", " ", f).split()) for f in fields[1:]) if t), "")
+    return redirect(("/?q=" + quote(text[:HINT_MAX], safe="") if text else "/") + "#search", 302)
 
 
 @app.get("/api/sources")
