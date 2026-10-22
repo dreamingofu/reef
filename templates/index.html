@@ -150,11 +150,6 @@
       </div>
       <span class="np-tapseek" id="np-tapseek" aria-hidden="true"></span>
     </div>
-    <div class="np-lyrics-wrap">
-      <div class="np-lyrics" id="np-lyrics" role="region" aria-label="Lyrics"></div>
-      <button class="lyr-more" id="lyr-more" aria-label="Lyrics timing and source" aria-expanded="false" aria-controls="lyr-pop"><svg class="i"><use href="#i-more"/></svg></button>
-      <div class="lyr-pop" id="lyr-pop" role="group" aria-label="Lyrics options" hidden></div>
-    </div>
     <div class="np-title-row">
       <div class="np-titles"><h2 class="mq" id="np-t"></h2><button class="np-s" id="np-s"></button></div>
       <div class="np-cap">
@@ -198,6 +193,22 @@
       </div>
       <div class="qs-body" id="q-body"></div>
     </div>
+  </div>
+  <!-- full-screen lyrics (§5): rises over the player; depth, interlude dots, word fill, resync -->
+  <div class="lyv" id="lyv" role="dialog" aria-label="Lyrics" aria-hidden="true">
+    <div class="lyv-bg" aria-hidden="true"><img class="lyv-blur" id="lyv-blur" alt=""></div>
+    <div class="np-lyrics" id="np-lyrics" role="region" aria-label="Lyrics" tabindex="-1"></div>
+    <header class="lyv-top" id="lyv-grab">
+      <button class="lyv-pill" id="lyv-pill" aria-label="Back to the player">
+        <img id="lyv-art" alt=""><span class="lyv-tt"><b id="lyv-t"></b><span id="lyv-s"></span></span>
+      </button>
+    </header>
+    <button class="lyv-resync" id="lyv-resync" aria-label="Scroll back to the current line" tabindex="-1">Resync</button>
+    <footer class="lyv-bar">
+      <button class="lyv-btn" id="lyv-back" aria-label="Back to the player"><svg class="i"><use href="#i-chev-down"/></svg></button>
+      <button class="lyv-play" id="lyv-play" aria-label="Play"><svg class="i fill"><use href="#i-play"/></svg></button>
+      <button class="lyv-btn" id="lyr-more" aria-label="Lyrics options" aria-haspopup="dialog"><svg class="i"><use href="#i-more"/></svg></button>
+    </footer>
   </div>
 </section>
 
@@ -287,6 +298,15 @@
   <div class="sheet" role="dialog" aria-label="Sleep timer">
     <div class="sheet-top"><div class="grabber"></div><h3>Sleep timer</h3></div>
     <div class="menu" id="sleep-menu"></div>
+  </div>
+</div>
+
+<div class="sheet-wrap lite" id="lyr-opts-sheet" hidden>
+  <div class="scrim" data-close></div>
+  <div class="sheet" role="dialog" aria-label="Lyrics options">
+    <div class="sheet-top"><div class="grabber"></div><h3>Lyrics</h3></div>
+    <div class="lyr-opts" id="lyr-pop"></div>
+    <button class="btn-wide" data-close>Done</button>
   </div>
 </div>
 

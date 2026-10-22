@@ -520,6 +520,146 @@
   })();
   // ==== lyrics-core:end ====
 
+  // ---------- lyrics view core ----------
+  // Timing and selection maths for the full-screen lyrics view (UI_REMAKE_PLAN §5): the rows it shows (lines plus
+  // interlude gaps), the active row / word at a time, word fill, interlude dot progress, depth by distance from the
+  // active row, the auto-scroll anchor and stagger, long-line shrink. Pure, no DOM; unit-checked from node by slicing
+  // between these sentinels (scratchpad u3/lyrics_view_core_check.js).
+  // ==== lyrics-view-core:start ====
+  const LV = (() => {
+    const GAP_MIN = 4; // s: a break at least this long shows interlude dots
+    const GAP_FADE = 0.65; // s: the dots fade out this long before the next line
+    const STEPS = 4; // depth classes d0 (active) .. d4 by exact distance; then d5 (5..FAR away: blurless, near-invisible)
+    const FAR = 8; // ... and d9 beyond FAR rows (hidden outside a manual scroll), so few rows ever carry a blur
+    const ANCHOR = 0.35; // the active row sits at 35% of the view's height
+    const STAGGER = 20, STAGGER_MAX = 200; // ms per row when rows move to a new active line, capped
+    const HOLD_MS = 3500; // a manual scroll pauses auto-follow this long
+    const GLOW_HELD = 1.1; // s: words held longer glow
+    const clamp = (x, a, b) => Math.min(b, Math.max(a, x));
+    // A line with nothing to sing ("", "♪", "♫ ♫") is a break, not a lyric.
+    const isBreak = (text) => !/[^\s♪♫♬♩·•.…-]/.test(String(text || ""));
+    // Index of the last item of sorted `times` at or before `now`, else -1 (binary search).
+    function indexAt(times, now) {
+      let lo = 0, hi = times.length - 1, i = -1;
+      while (lo <= hi) {
+        const mid = (lo + hi) >> 1;
+        if (times[mid] <= now) { i = mid; lo = mid + 1; } else hi = mid - 1;
+      }
+      return i;
+    }
+    // When a word-timed line's last word ends (s), or null when the timing doesn't say.
+    function lineEnd(words) {
+      const w = words && words.length ? words[words.length - 1] : null;
+      return w && Number.isFinite(w.d) && w.d >= 0 ? w.t + w.d : null;
+    }
+    // Parsed LRC lines ([{t, text, words?}] sorted) -> rows [{kind: "line", t, text, words, src} | {kind: "gap", t, end}].
+    // Gaps: an intro before a first line at >= minGap s, a blank line followed by >= minGap s of nothing, and (word
+    // timing only) the silence after a line's last word when the next line starts >= minGap s later. Shorter blanks are
+    // dropped (the line before stays active); touching gaps merge.
+    function rows(lines, { minGap = GAP_MIN } = {}) {
+      const out = [];
+      const push = (r) => {
+        const last = out[out.length - 1];
+        if (r.kind === "gap" && last && last.kind === "gap" && r.t <= last.end + 1e-6) { last.end = Math.max(last.end, r.end); return; }
+        out.push(r);
+      };
+      const list = (lines || []).filter((l) => l && Number.isFinite(l.t));
+      for (let i = 0; i < list.length; i++) {
+        const l = list[i];
+        let j = i + 1;
+        while (j < list.length && list[j].t <= l.t) j++; // the next entry that comes later
+        const nextT = j < list.length ? list[j].t : null;
+        if (isBreak(l.text)) {
+          if (nextT != null && nextT - l.t >= minGap) push({ kind: "gap", t: l.t, end: nextT });
+          continue;
+        }
+        push({ kind: "line", t: l.t, text: l.text, words: l.words && l.words.length ? l.words : null, src: i });
+        const end = lineEnd(l.words);
+        const next = list[i + 1];
+        if (end != null && next && !isBreak(next.text) && next.t - end >= minGap) push({ kind: "gap", t: Math.max(l.t, end), end: next.t });
+      }
+      if (out.length) {
+        if (out[0].kind === "gap") out[0].t = Math.min(out[0].t, 0);
+        else if (out[0].t >= minGap) out.unshift({ kind: "gap", t: 0, end: out[0].t });
+      }
+      return out;
+    }
+    // The word being sung in a word-timed line at `now`: the last one started, -1 before the first.
+    function wordAt(words, now) {
+      let lo = 0, hi = (words ? words.length : 0) - 1, i = -1;
+      while (lo <= hi) {
+        const mid = (lo + hi) >> 1;
+        if (words[mid].t <= now) { i = mid; lo = mid + 1; } else hi = mid - 1;
+      }
+      return i;
+    }
+    // How much of word k is filled at `now` (0..1): over its own duration, else until the next word (or `end`, the
+    // line's end / the next row), else half a second.
+    function wordFill(words, k, now, end = null) {
+      const w = words && words[k];
+      if (!w) return 0;
+      const nx = words[k + 1];
+      const dur = Number.isFinite(w.d) && w.d > 0 ? w.d : nx ? nx.t - w.t : Number.isFinite(end) && end > w.t ? end - w.t : 0.5;
+      return dur > 0 ? clamp((now - w.t) / dur, 0, 1) : 1;
+    }
+    // Words held long enough to glow while they're sung.
+    const glows = (w, next) => {
+      const d = Number.isFinite(w?.d) && w.d > 0 ? w.d : next ? next.t - w.t : 0;
+      return d > GLOW_HELD;
+    };
+    // Interlude progress: p 0..1 (dot k is filled by clamp(3p - k, 0, 1)) over the gap less its fade-out, and `out`
+    // once the dots should fade (GAP_FADE before the next line).
+    function gapProgress(gap, now, fade = GAP_FADE) {
+      if (!gap) return { p: 0, out: false };
+      const span = Math.max(0.1, gap.end - gap.t - fade);
+      return { p: clamp((now - gap.t) / span, 0, 1), out: now >= gap.end - fade };
+    }
+    const dotFill = (p, k) => clamp(3 * p - k, 0, 1);
+    // Depth level for a distance: 0..4 as is, 5 for 5..FAR, 9 beyond FAR.
+    const level = (d) => (d <= STEPS ? d : d <= FAR ? 5 : 9);
+    // Depth class of row i when `active` is the active row: "d0".."d4", "d5", "d9" by distance (-1 = nothing active
+    // yet: row 0 is one step away), " past" for rows above the active one (they fade out slower).
+    function depth(i, active) {
+      const d = active < 0 ? i + 1 : Math.abs(i - active);
+      return "d" + level(d) + (active >= 0 && i < active ? " past" : "");
+    }
+    // The rows whose depth class can differ between active rows `a` and `b` (n rows): [lo, hi], or null.
+    function depthRange(a, b, n, reach = FAR + 1) {
+      if (!(n > 0)) return null;
+      const lo = Math.max(0, Math.min(a, b) - reach), hi = Math.min(n - 1, Math.max(a, b, 0) + reach);
+      return lo <= hi ? [lo, hi] : null;
+    }
+    // Where the view scrolls for an active row whose top is `top` px down the content: that top at 35% of `viewH`.
+    const anchorTop = (top, viewH, frac = ANCHOR) => Math.max(0, Math.round(top - frac * viewH));
+    // Rows move to a new active line as a wave: rows above it first, 20 ms per row after, at most 200 ms.
+    const stagger = (i, active) => clamp((i - active + 2) * STAGGER, 0, STAGGER_MAX);
+    // An auto-scroll animates (rows slide by `delta`) only when it's a real move that stays near the screen.
+    const glides = (delta, viewH) => Math.abs(delta) >= 1 && Math.abs(delta) <= 1.5 * viewH;
+    // The rAF loop is needed only while the active row fills smoothly: a word-timed line or an interlude (a line-timed
+    // row in mixed lyrics follows timeupdate like any other).
+    const needsFrames = (row) => !!row && (row.kind === "gap" || (row.kind === "line" && !!(row.words && row.words.length)));
+    // Long lines shrink so they don't wrap into walls of text (>42 chars ×.9, >54 ×.8, >72 ×.72, >92 ×.66).
+    function sizeFactor(len) {
+      const n = Number(len) || 0;
+      return n > 92 ? 0.66 : n > 72 ? 0.72 : n > 54 ? 0.8 : n > 42 ? 0.9 : 1;
+    }
+    // Word-timed spans grouped into words: syllables with no space between stay together (one unbreakable group).
+    // -> [{from, to (inclusive), space (a space follows the group)}]
+    function groups(words) {
+      const out = [];
+      let from = 0;
+      for (let i = 0; i < (words ? words.length : 0); i++) {
+        const t = String(words[i].text || ""), nx = words[i + 1];
+        const space = /\s$/.test(t) || (nx && /^\s/.test(String(nx.text || "")));
+        if (space || !nx) { out.push({ from, to: i, space: !!space && !!nx }); from = i + 1; }
+      }
+      return out;
+    }
+    return { GAP_MIN, GAP_FADE, STEPS, FAR, ANCHOR, level, HOLD_MS, isBreak, indexAt, lineEnd, rows, wordAt, wordFill, glows,
+      gapProgress, dotFill, depth, depthRange, anchorTop, stagger, glides, needsFrames, sizeFactor, groups };
+  })();
+  // ==== lyrics-view-core:end ====
+
   // ---------- palette core ----------
   // Cover colours (UI_REMAKE_PLAN §1.1) from an image's RGBA pixels (a 64 px canvas of /api/art): pure
   // functions, no DOM. Pixels go into coarse RGB buckets ranked by population, vivid ones (HSV saturation > .3,
@@ -2676,7 +2816,7 @@
   function updatePlayState() {
     const playing = !audio.paused && !audio.ended;
     document.body.classList.toggle("is-playing", playing);
-    for (const id of ["#mini-play", "#np-play"]) {
+    for (const id of ["#mini-play", "#np-play", "#lyv-play"]) {
       const b = $(id);
       b.querySelector("use").setAttribute("href", playing ? "#i-pause" : "#i-play");
       b.setAttribute("aria-label", playing ? "Pause" : "Play");
@@ -3153,7 +3293,7 @@
       rec.pos = audio.currentTime;
       if (rec.tries) rec.tries = R.settledTries({ tries: rec.tries, from: rec.from, at: rec.pos });
       setProgress(audio.currentTime, duration());
-      if (lyr.times.length) syncLyrics();
+      if (lyr.times.length && lyrVisible()) { syncLyrics(); kickLyrics(); }
       skipSegment();
     }
     if (sleep.mode === "time") checkSleep();
@@ -3170,6 +3310,7 @@
   audio.addEventListener("play", () => {
     rec.want = true;
     updatePlayState();
+    kickLyrics();
     if (miniGone) { miniGone = false; updatePlayer(); } // pulled away earlier: playing brings it back
   });
   audio.addEventListener("pause", () => { rec.want = false; updatePlayState(); if (cur()) saveSession(); });
@@ -3199,6 +3340,7 @@
 
   document.addEventListener("visibilitychange", () => {
     checkSleep();
+    if (document.visibilityState === "visible" && lyrVisible() && lyr.times.length) { syncLyrics(true); kickLyrics(); }
     if (document.visibilityState === "visible" && state.view === "home" && homeDue()) loadHome();
     if (document.visibilityState === "hidden" && cur()) saveSession();
     // iOS may kill a hidden Home Screen app without a pagehide: report the play so far (updated later if it goes on).
@@ -3286,6 +3428,8 @@
       window.removeEventListener("pointermove", move);
       window.removeEventListener("pointerup", end);
       window.removeEventListener("pointercancel", end);
+      // the release point counts: a finger that stopped before lifting has no velocity left
+      if (!cancelled) samples.push({ t: e.timeStamp, x: e.clientX, y: e.clientY });
       Object.assign(done, PC.velocity(samples));
       if (done.axis && done.axis !== "none") { swallowClick(el); opts.onEnd?.(done, cancelled); }
       else if (!done.axis && !cancelled) opts.onTap?.(e, done);
@@ -3349,7 +3493,7 @@
   // springs back. With no neighbour that way it moves at 30% of the finger. Immersive moves its full-bleed art instead.
   (function artGestures() {
     const wrap = $("#np-art-wrap"), track = $("#np-art-track"), bubble = $("#np-tapseek");
-    let tap = null, busy = false;
+    let tap = null, busy = false, lyricsTimer = 0;
     const setX = (x, anim = "none") => {
       track.style.transition = anim;
       track.style.transform = x ? `translate3d(${x}px, 0, 0)` : "";
@@ -3357,6 +3501,7 @@
       npEl.style.setProperty("--imm-x", `${x}px`);
     };
     drag(wrap, {
+      onStart() { clearTimeout(lyricsTimer); }, // a tap then a swipe: the swipe wins
       onMove(g) {
         if (g.axis === "y") { npPull.move(g.dy); return; }
         if (busy) return;
@@ -3394,7 +3539,13 @@
         if (busy || !cur()) return;
         const r = wrap.getBoundingClientRect();
         const side = e.clientX < r.left + r.width / 2 ? -1 : 1;
+        const was = tap;
         tap = PC.tapSeek(tap, performance.now(), side);
+        clearTimeout(lyricsTimer);
+        // A lone tap opens the lyrics (§5), once it's clear no second tap (a double-tap seek) follows.
+        if (!tap.seek && !(was && was.total > 0 && tap.at - was.at <= 1000)) {
+          lyricsTimer = setTimeout(() => { if (npOpen() && !qs.open && cur()) setLyricsOn(true); }, 380);
+        }
         if (!tap.seek) return;
         const d = duration();
         seekTo(PC.clamp(playPos() + tap.seek, 0, d ? Math.max(0, d - 0.5) : Infinity));
@@ -3758,24 +3909,37 @@
     });
   })();
 
-  // ---------- lyrics ----------
-  const LYRIC_LEAD = 0.2; // Safari fires timeupdate ~4x/s; showing a line (or word) a beat early reads as on time
+  // ---------- lyrics (§5): a full-screen view that rises over the player ----------
+  // Rows (lines + interlude gaps, LV.rows) get a depth class by distance from the active one (static opacity / scale
+  // / blur, toggled only when the active row changes). The active row sits at 35% of the view; when it changes, the
+  // rows glide there in a short wave (FLIP on `translate`). A manual scroll pauses that for LV.HOLD_MS and shows a
+  // Resync pill. Word-timed lines fill word by word (`--wf` on the current word), interlude dots fill in turn
+  // (`--gp` on the gap row): both on one rAF loop that runs only while the view is visible, playing, and on such a
+  // row (the active one, not the track); everything else follows `timeupdate`.
+  const LYRIC_LEAD = 0.2; // a line shows a beat early: it reads as on time (and timeupdate is only ~4/s on Safari)
+  const WORD_LEAD = 0.05; // words run on rAF: about a frame and a bit
   const lyr = {
-    on: store.get("lyricsOn", false),
-    cache: new Map(), // track id -> Promise of the /api/lyrics body | null (misses too)
-    seq: 0, id: null, data: null, lines: [], times: [], els: [], wordEls: [], active: -1, word: -1,
-    held: false, holdTimer: 0, offset: 0, offsetTimer: 0,
+    on: store.get("lyricsOn", false), // the view is open (remembered: reopening the player comes back to it)
+    only: store.get("lyricsOnly", false), // "Lyrics only": the chrome hides
+    cache: new Map(), // track id -> Promise of the /api/lyrics body | null (a miss) | {error} (a failure, not kept)
+    seq: 0, id: null, data: null, lines: [], rows: [], times: [], els: [], wordEls: [], base: [], cls: [],
+    active: -1, word: -1, wf: -1, gapP: -1, gapOut: false, wordy: false,
+    held: false, holdTimer: 0, offset: 0, offsetTimer: 0, ourTop: 0, raf: 0,
   };
   const lyricsPanel = $("#np-lyrics");
+  const lyv = $("#lyv");
   const lyrPop = $("#lyr-pop");
   const npOpen = () => $("#np").classList.contains("open");
+  // The view is on screen (and the page too): only then does the DOM follow the song.
+  const lyrVisible = () => lyr.on && npOpen() && document.visibilityState !== "hidden";
 
   function fetchLyrics(t) {
     let p = lyr.cache.get(t.id);
     if (!p) {
       p = api(`/api/lyrics/${encodeURIComponent(t.id)}?${lyricsHints(t)}`).catch((e) => {
-        if (e.status !== 404) lyr.cache.delete(t.id); // a network blip shouldn't stick; a real miss should
-        return null;
+        if (e.status === 404) return null; // a real miss sticks
+        lyr.cache.delete(t.id); // a network blip or a server error doesn't
+        return { error: e };
       });
       lyr.cache.set(t.id, p);
     }
@@ -3787,147 +3951,311 @@
     return q;
   }
 
-  function lyricsMsg(text, cls = "") {
-    lyricsPanel.innerHTML = `<div class="lyr-msg ${cls}">${cls ? icon("note") : ""}${esc(text)}</div>`;
+  function clearLyr() {
+    stopLyrFrames();
+    releaseLyrics(false);
+    Object.assign(lyr, { data: null, lines: [], rows: [], times: [], els: [], wordEls: [], base: [], cls: [],
+      active: -1, word: -1, wf: -1, gapP: -1, gapOut: false, wordy: false });
+  }
+
+  // One row of synced lyrics. Line-timed lines hold one span per word (they pop in turn when the line starts);
+  // word-timed ones one per timed word, syllables of a word grouped so they never wrap apart.
+  function lyrRowHtml(r, j) {
+    if (r.kind === "gap") {
+      return `<button class="${lyr.cls[j]}" data-r="${j}" aria-label="Instrumental break"><span class="dots" aria-hidden="true"><i></i><i></i><i></i></span></button>`;
+    }
+    const fz = LV.sizeFactor(r.text.length);
+    let body;
+    if (r.words) {
+      body = LV.groups(r.words).map((g) => `<span class="wg">${r.words.slice(g.from, g.to + 1).map((w, k) =>
+        `<span class="w${LV.glows(w, r.words[g.from + k + 1]) ? " long" : ""}">${esc(w.text.trim())}</span>`).join("")}</span>${g.space ? " " : ""}`).join("");
+    } else {
+      body = r.text.split(/\s+/).filter(Boolean).map((w, k) => `<span class="w" style="--k:${Math.min(k, 12)}">${esc(w)}</span>`).join(" ");
+    }
+    return `<button class="${lyr.cls[j]}" data-r="${j}"${fz < 1 ? ` style="--fz:${fz}"` : ""}>${body}</button>`;
   }
 
   function renderLyrics(data) {
-    lyr.data = data;
-    lyr.offset = Number(data?.offset_ms) || 0;
-    const lines = data?.synced ? LY.attachWords(LY.parseLRC(data.synced), data.words) : [];
-    lyr.lines = lines;
-    lyr.times = lines.map((l) => l.t);
-    lyr.active = -1;
-    lyr.word = -1;
-    if (lines.length) {
-      // Word-timed lines hold one span per word; syncWords lights them up as they're sung.
-      const body = (l) => (l.words ? l.words.map((w) => `<span class="w">${esc(w.text)}</span>`).join("") : esc(l.text));
-      lyricsPanel.innerHTML = `<div class="lyr synced${lines.some((l) => l.words) ? " wordy" : ""}">${lines.map((l, i) => l.text
-        ? `<button class="lyr-line" data-i="${i}">${body(l)}</button>`
-        : `<button class="lyr-line gap" data-i="${i}" aria-label="Instrumental break">♪</button>`).join("")}</div>`;
-    } else if (data?.plain || data?.synced) {
-      const text = data.plain || data.synced.replace(/^(\s*\[[^\]]*\])+/gm, ""); // unparseable synced: show its words
-      lyricsPanel.innerHTML = `<div class="lyr plain">${text.split(/\r?\n/).map((l) => (l.trim()
+    clearLyr();
+    lyr.data = data && !data.error ? data : null;
+    lyr.offset = Number(lyr.data?.offset_ms) || 0;
+    const d = lyr.data;
+    const lines = d?.synced ? LY.attachWords(LY.parseLRC(d.synced), d.words) : [];
+    const rows = LV.rows(lines);
+    let kind;
+    if (rows.some((r) => r.kind === "line")) {
+      kind = "synced";
+      lyr.lines = lines;
+      lyr.rows = rows;
+      lyr.times = rows.map((r) => r.t);
+      lyr.wordy = rows.some((r) => r.words);
+      lyr.base = rows.map((r) => (r.kind === "gap" ? "lyr-row gap" : `lyr-row line${r.words ? " wordy" : ""}`));
+      lyr.cls = rows.map((r, j) => `${lyr.base[j]} ${LV.depth(j, -1)}`);
+      lyricsPanel.innerHTML = `<div class="lyr synced">${rows.map(lyrRowHtml).join("")}</div>`;
+      lyr.els = $$(".lyr-row", lyricsPanel);
+      lyr.wordEls = lyr.els.map((el, j) => (rows[j].words ? $$(".w", el) : null));
+    } else if (d?.plain || d?.synced) {
+      kind = "plain";
+      const text = d.plain || d.synced.replace(/^(\s*\[[^\]]*\])+/gm, ""); // unparseable synced: show its words
+      lyricsPanel.innerHTML = `<div class="lyr plain"><p class="lyr-note">Not synced to the song</p>${text.split(/\r?\n/).map((l) => (l.trim()
         ? `<p>${esc(l.trim())}</p>` : `<p class="gap"></p>`)).join("")}</div>`;
-    } else if (data?.instrumental) {
-      lyricsMsg("Instrumental", "instrumental");
+    } else if (data?.error) {
+      kind = "error";
+      lyricsPanel.innerHTML = errorState(data.error, { title: "Couldn't load the lyrics", retry: "data-lyr-retry" });
+    } else if (d?.instrumental) {
+      kind = "instrumental";
+      lyricsPanel.innerHTML = emptyState("note", "Instrumental", "No words in this one: just listen.");
     } else {
-      lyricsMsg("No lyrics for this track");
+      kind = "none";
+      lyricsPanel.innerHTML = emptyState("lyrics", "No lyrics for this song", "Know they exist? Search LRCLIB and pick the right ones.",
+        `<button class="pill-btn" data-lyr-search>${icon("search")}Find lyrics</button>`);
     }
-    lyr.els = $$(".lyr-line", lyricsPanel);
-    lyr.wordEls = lyr.els.map((el) => $$(".w", el));
+    lyv.dataset.kind = kind;
     lyricsPanel.scrollTop = 0;
+    lyr.ourTop = 0;
     renderLyrTools();
-    syncLyrics(true);
+    if (lyrVisible()) syncLyrics(true);
+    kickLyrics();
   }
 
-  // Show the current track's lyrics in the panel (no-op when they're already there).
+  // The pill at the top: round art + title (only repainted when the track changes).
+  function paintLyricsHead(t) {
+    const art = $("#lyv-art");
+    if (art.dataset.id === t.id) return;
+    art.dataset.id = t.id;
+    art.src = artUrl(t.id, artSize(t.id, "mini"));
+    $("#lyv-blur").src = artUrl(t.id, artSize(t.id, "bg"));
+    $("#lyv-t").textContent = t.title || "";
+    $("#lyv-s").textContent = t.channel || "";
+  }
+
+  // Show the current track's lyrics (no-op past a re-sync when they're already there).
   async function showLyrics() {
     const t = cur();
     if (!lyr.on || !t) return;
-    if (lyr.id === t.id) { syncLyrics(true); return; }
+    paintLyricsHead(t);
+    if (lyr.id === t.id) { if (lyr.times.length && lyrVisible()) syncLyrics(true); kickLyrics(); return; }
     lyr.id = t.id;
     const seq = ++lyr.seq;
-    lyr.data = null; lyr.lines = []; lyr.times = []; lyr.els = []; lyr.wordEls = []; lyr.active = -1; lyr.word = -1;
-    lyricsPanel.innerHTML = `<div class="lyr-sk" role="status" aria-label="Loading lyrics…"><i class="sk"></i><i class="sk"></i><i class="sk"></i><i class="sk"></i></div>`;
+    clearLyr();
+    lyv.dataset.kind = "loading";
+    lyricsPanel.innerHTML = `<div class="lyr-sk" role="status" aria-label="Loading lyrics…">${"<i class=\"sk\"></i>".repeat(5)}</div>`;
     renderLyrTools();
     const data = await fetchLyrics(t);
     if (seq !== lyr.seq || cur()?.id !== t.id) return; // the track changed while this was loading
     renderLyrics(data);
   }
 
-  // New track: drop what the panel shows, then load if it's visible.
+  // New track: drop what the view shows, then load if it's visible.
   function resetLyrics() {
     lyr.id = null; lyr.seq++;
-    lyr.data = null; lyr.lines = []; lyr.times = []; lyr.els = []; lyr.wordEls = []; lyr.active = -1; lyr.word = -1;
+    clearLyr();
     lyr.offset = 0;
-    showLyrTools(false);
     if (lyr.on && npOpen()) showLyrics();
   }
 
-  function scrollToLine(el, smooth) {
-    if (!el || lyr.held || !npOpen() || !lyr.on) return;
-    const top = el.offsetTop + el.offsetHeight / 2 - lyricsPanel.clientHeight / 3;
-    const reduce = matchMedia("(prefers-reduced-motion: reduce)").matches;
-    lyricsPanel.scrollTo({ top: Math.max(0, top), behavior: smooth && !reduce ? "smooth" : "auto" });
-  }
-
-  // Highlight the line for the playhead (in lyrics time: the track's offset applied): binary search, and the DOM
-  // is touched only when the line (or, in a word-timed line, the word) changes.
+  // Follow the playhead (in lyrics time: the track's offset applied). The DOM changes only when the active row, the
+  // word being sung, its fill (by >= 1%) or the interlude progress does.
   function syncLyrics(force = false, smooth = !force) {
     if (!lyr.times.length) return;
-    const now = LY.lyricTime(audio.currentTime, lyr.offset) + LYRIC_LEAD;
-    const i = LY.indexAt(lyr.times, now);
-    if (i !== lyr.active || force) {
-      for (const w of lyr.wordEls[lyr.active] || []) w.classList.remove("on");
-      lyr.word = -1;
-      lyr.els[lyr.active]?.classList.remove("on");
-      lyr.els[i]?.classList.add("on");
-      lyr.active = i;
-      if (i < 0) { if (force && !lyr.held) lyricsPanel.scrollTop = 0; } else scrollToLine(lyr.els[i], smooth);
+    const now = LY.lyricTime(audio.currentTime, lyr.offset);
+    const i = LV.indexAt(lyr.times, now + LYRIC_LEAD);
+    if (i !== lyr.active || force) setLyrActive(i, smooth);
+    const r = lyr.rows[i];
+    if (r?.words) syncWords(r, now + WORD_LEAD);
+    else if (r?.kind === "gap") syncGap(r, now);
+  }
+  // Undo the word / interlude state the active row carries.
+  function clearRowState(j) {
+    const r = lyr.rows[j];
+    if (r?.words) {
+      const ws = lyr.wordEls[j] || [];
+      for (let k = 0; k <= Math.min(lyr.word, ws.length - 1); k++) ws[k].classList.remove("sung", "now");
+      ws[lyr.word]?.style.removeProperty("--wf");
+    } else if (r?.kind === "gap") {
+      lyr.els[j].style.removeProperty("--gp");
+      lyr.els[j].classList.remove("out");
     }
-    syncWords(now);
+    Object.assign(lyr, { word: -1, wf: -1, gapP: -1, gapOut: false });
   }
-  // Word-timed line: every word sung so far is lit (a seek back unlights the ones after the playhead).
-  function syncWords(now) {
-    const words = lyr.lines[lyr.active]?.words;
-    if (!words) return;
-    const k = LY.wordAt(words, now);
-    if (k === lyr.word) return;
-    (lyr.wordEls[lyr.active] || []).forEach((el, j) => el.classList.toggle("on", j <= k));
-    lyr.word = k;
+  function setLyrActive(i, smooth) {
+    const old = lyr.active;
+    clearRowState(old);
+    const range = LV.depthRange(old, i, lyr.rows.length);
+    const pop = !reducedMotion();
+    if (range) {
+      for (let j = range[0]; j <= range[1]; j++) {
+        let c = `${lyr.base[j]} ${LV.depth(j, i)}`;
+        if (j === i && pop && lyr.rows[j].kind === "line" && !lyr.rows[j].words) c += " pop"; // line bounce
+        if (c !== lyr.cls[j]) { lyr.els[j].className = c; lyr.cls[j] = c; }
+      }
+    }
+    lyr.active = i;
+    if (!lyr.held) scrollToActive(smooth);
   }
+  // Word-timed line: words before the current one are sung (full), the current one fills.
+  function syncWords(r, now) {
+    const ws = lyr.wordEls[lyr.active];
+    if (!ws) return;
+    const k = LV.wordAt(r.words, now);
+    if (k !== lyr.word) {
+      for (let j = Math.max(0, Math.min(k, lyr.word)); j <= Math.max(k, lyr.word); j++) {
+        ws[j].classList.toggle("sung", j < k);
+        ws[j].classList.toggle("now", j === k);
+        if (j !== k) ws[j].style.removeProperty("--wf");
+      }
+      lyr.word = k;
+      lyr.wf = -1;
+    }
+    if (k < 0) return;
+    const f = LV.wordFill(r.words, k, now, lyr.rows[lyr.active + 1]?.t);
+    if (Math.abs(f - lyr.wf) >= 0.01 || (f === 1 && lyr.wf !== 1)) {
+      ws[k].style.setProperty("--wf", f.toFixed(3));
+      lyr.wf = f;
+    }
+  }
+  // Interlude: three dots fill in turn, then fade just before the next line.
+  function syncGap(r, now) {
+    const el = lyr.els[lyr.active], g = LV.gapProgress(r, now);
+    if (Math.abs(g.p - lyr.gapP) >= 0.005 || (g.p === 1 && lyr.gapP !== 1)) { el.style.setProperty("--gp", g.p.toFixed(3)); lyr.gapP = g.p; }
+    if (g.out !== lyr.gapOut) { el.classList.toggle("out", g.out); lyr.gapOut = g.out; }
+  }
+
+  // Put the active row at 35% of the view. With `smooth`, the rows near the screen keep their place for a frame
+  // (translate by the scroll distance), then glide to it in a 20 ms-per-row wave; big jumps (a seek) just land.
+  function scrollToActive(smooth) {
+    if (!lyrVisible()) return;
+    const el = lyr.els[lyr.active];
+    const viewH = lyricsPanel.clientHeight;
+    const from = lyricsPanel.scrollTop;
+    const target = el ? LV.anchorTop(el.offsetTop, viewH) : 0;
+    if (Math.abs(target - from) < 1) { lyr.ourTop = from; return; }
+    lyricsPanel.scrollTop = target;
+    lyr.ourTop = lyricsPanel.scrollTop;
+    const delta = lyr.ourTop - from;
+    if (!smooth || reducedMotion() || !LV.glides(delta, viewH)) return;
+    const a = Math.max(0, lyr.active);
+    const lo = Math.max(0, a - 10), hi = Math.min(lyr.els.length - 1, a + 16);
+    for (let j = lo; j <= hi; j++) {
+      const s = lyr.els[j].style;
+      s.setProperty("--tt", "0s");
+      s.translate = `0 ${delta}px`;
+    }
+    void lyricsPanel.offsetHeight; // the rows start where they were
+    for (let j = lo; j <= hi; j++) {
+      const s = lyr.els[j].style;
+      s.removeProperty("--tt");
+      s.setProperty("--dl", `${LV.stagger(j, a)}ms`);
+      s.translate = "";
+    }
+  }
+
+  // The rAF loop: only while the view is visible, playing, and the ACTIVE row is a word-timed line or an interlude
+  // (timeupdate starts it again when such a row becomes active).
+  function lyrNeedsFrames() {
+    if (audio.paused || !lyrVisible() || !lyr.times.length) return false;
+    return LV.needsFrames(lyr.rows[lyr.active]);
+  }
+  function lyrFrame() {
+    lyr.raf = 0;
+    if (!lyrNeedsFrames()) return;
+    syncLyrics();
+    lyr.raf = requestAnimationFrame(lyrFrame);
+  }
+  function kickLyrics() { if (!lyr.raf && lyrNeedsFrames()) lyr.raf = requestAnimationFrame(lyrFrame); }
+  function stopLyrFrames() { if (lyr.raf) cancelAnimationFrame(lyr.raf); lyr.raf = 0; }
 
   function setLyricsOn(on) {
     lyr.on = on;
     store.set("lyricsOn", on);
     $("#np").classList.toggle("show-lyrics", on);
+    lyv.setAttribute("aria-hidden", String(!on));
+    lyv.inert = !on;
     $("#np-lyr").setAttribute("aria-pressed", String(on));
     $("#np-lyr").classList.toggle("on", on);
-    if (!on) showLyrTools(false);
-    if (on) showLyrics();
+    if (on) { showLyrics(); return; }
+    closeSheet("#lyr-opts-sheet");
+    releaseLyrics(false);
+    stopLyrFrames();
+  }
+  function setLyricsOnly(on) {
+    lyr.only = on;
+    store.set("lyricsOnly", on);
+    lyv.classList.toggle("only", on);
   }
 
-  // Reading ahead or back: let the user scroll for 4 s before following the song again.
+  // Reading ahead or back: a manual scroll pauses auto-follow for LV.HOLD_MS after it stops; Resync ends it at once.
   function holdLyrics() {
-    lyr.held = true;
+    if (!lyr.held) {
+      lyr.held = true;
+      lyv.classList.add("held");
+      $("#lyv-resync").tabIndex = 0;
+    }
     clearTimeout(lyr.holdTimer);
-    lyr.holdTimer = setTimeout(() => { lyr.held = false; syncLyrics(true, true); }, 4000);
+    lyr.holdTimer = setTimeout(() => releaseLyrics(true), LV.HOLD_MS);
   }
-  for (const ev of ["touchstart", "touchmove", "wheel", "pointerdown"]) lyricsPanel.addEventListener(ev, holdLyrics, { passive: true });
-  lyricsPanel.addEventListener("click", (e) => {
-    const line = e.target.closest(".lyr-line");
-    if (!line || !lyr.lines[line.dataset.i]) return;
+  function releaseLyrics(scroll) {
     clearTimeout(lyr.holdTimer);
+    if (!lyr.held) return;
     lyr.held = false;
-    seekTo(LY.seekTime(lyr.lines[line.dataset.i].t, lyr.offset));
+    lyv.classList.remove("held");
+    $("#lyv-resync").tabIndex = -1;
+    if (scroll) scrollToActive(true);
+  }
+  // Any scroll that isn't ours (touch, momentum, wheel, keys) is the user reading.
+  lyricsPanel.addEventListener("scroll", () => {
+    if (lyr.times.length && Math.abs(lyricsPanel.scrollTop - lyr.ourTop) >= 2) holdLyrics();
+  }, { passive: true });
+  lyricsPanel.addEventListener("click", (e) => {
+    if (e.target.closest("[data-lyr-search]")) { openLyricsSearch(); return; }
+    if (e.target.closest("[data-lyr-retry]")) { if (lyr.id) lyr.cache.delete(lyr.id); lyr.id = null; showLyrics(); return; }
+    const row = e.target.closest(".lyr-row");
+    const r = row && lyr.rows[row.dataset.r];
+    if (!r) return;
+    releaseLyrics(false);
+    seekTo(LY.seekTime(r.t, lyr.offset)); // tap a line: play from there
     if (audio.paused) playAudio();
     syncLyrics(true, true);
   });
+  $("#lyv-resync").addEventListener("click", () => releaseLyrics(true));
+  for (const id of ["#lyv-back", "#lyv-pill"]) $(id).addEventListener("click", () => setLyricsOn(false));
+  $("#lyv-play").addEventListener("click", () => togglePlay());
+  // Pull the view down by its top to go back to the player.
+  drag($("#lyv-grab"), {
+    x: false,
+    onMove(g) { lyv.classList.add("dragging"); lyv.style.transform = `translate3d(0, ${Math.max(0, g.dy)}px, 0)`; },
+    onEnd(g, cancelled) {
+      lyv.classList.remove("dragging");
+      lyv.style.transform = "";
+      if (!cancelled && PC.npClose(g.dy, g.vy, { dist: 90 })) setLyricsOn(false);
+    },
+  });
 
-  // ---------- lyrics tools: timing nudge, source, "Wrong lyrics?" ----------
-  // A small ⋯ over the panel's top corner opens them; the full lyrics UI (UI_REMAKE_PLAN §5) comes later.
+  // ---------- lyrics options: timing nudge, "Lyrics only", source, "Wrong lyrics?" (a light sheet from ⋯) ----------
   function renderLyrTools() {
     const synced = lyr.times.length > 0, d = lyr.data;
-    const src = d?.provider ? `From ${esc(LY.sourceLabel(d.provider))}${lyr.lines.some((l) => l.words) ? " · word timing" : ""}` : "";
-    lyrPop.innerHTML = `
-      <div class="lyr-pop-row"><span class="k">Timing</span>
-        <button class="lyr-nudge" data-lyr-nudge="${-LY.NUDGE}" aria-label="Show lyrics half a second sooner" ${synced ? "" : "disabled"}>−0.5</button>
-        <button class="lyr-nudge lyr-off" data-lyr-nudge="reset" aria-label="Reset lyrics timing" ${synced && lyr.offset ? "" : "disabled"}>${esc(LY.fmtOffset(lyr.offset))}</button>
-        <button class="lyr-nudge" data-lyr-nudge="${LY.NUDGE}" aria-label="Show lyrics half a second later" ${synced ? "" : "disabled"}>+0.5</button></div>
-      ${synced ? `<p class="lyr-hint">Lyrics ahead of the song? Tap +0.5.</p>` : ""}
-      <button class="lyr-pop-item" data-lyr-search>${icon("search")}<span>Wrong lyrics? Search</span></button>
-      ${src ? `<p class="lyr-src">${src}</p>` : ""}`;
-  }
-  function showLyrTools(open) {
-    lyrPop.hidden = !open;
-    $("#lyr-more").setAttribute("aria-expanded", String(open));
+    const src = d?.provider ? `From ${esc(LY.sourceLabel(d.provider))}${lyr.wordy ? " · word timing" : ""}` : "";
+    lyrPop.innerHTML = `${src ? `<p class="lyr-src">${src}</p>` : ""}
+      <div class="lyr-group">
+        <div class="lyr-opt lyr-timing">
+          <span class="lyr-opt-l"><span>Timing</span><small>${synced ? "Lyrics ahead of the song? Tap +0.5." : "Only synced lyrics can be nudged."}</small></span>
+          <div class="lyr-nudges">
+            <button class="lyr-nudge" data-lyr-nudge="${-LY.NUDGE}" aria-label="Show lyrics half a second sooner" ${synced ? "" : "disabled"}>−0.5</button>
+            <button class="lyr-nudge lyr-off" data-lyr-nudge="reset" aria-label="Reset lyrics timing" ${synced && lyr.offset ? "" : "disabled"}>${esc(LY.fmtOffset(lyr.offset))}</button>
+            <button class="lyr-nudge" data-lyr-nudge="${LY.NUDGE}" aria-label="Show lyrics half a second later" ${synced ? "" : "disabled"}>+0.5</button>
+          </div>
+        </div>
+        <label class="lyr-opt"><span class="lyr-opt-l"><span>Lyrics only</span><small>Hide the song and the controls</small></span>
+          <input type="checkbox" class="sw" data-lyr-only${lyr.only ? " checked" : ""} aria-label="Lyrics only"></label>
+        <button class="lyr-opt" data-lyr-search><span class="lyr-opt-l"><span>Wrong lyrics?</span><small>Search LRCLIB and pick the right ones</small></span>${icon("search")}</button>
+      </div>`;
   }
   function setLyricsOffset(ms) {
     const id = lyr.id;
     lyr.offset = ms;
     if (lyr.data) lyr.data.offset_ms = ms; // the cached promise holds this object: reopening keeps the nudge
-    renderLyrTools();
+    const off = $(".lyr-off", lyrPop);
+    if (off) { off.textContent = LY.fmtOffset(ms); off.disabled = !ms; }
     syncLyrics(true, true);
     clearTimeout(lyr.offsetTimer);
     lyr.offsetTimer = setTimeout(() => {
@@ -3936,18 +4264,15 @@
       }).catch(() => toast("Couldn't save the lyrics timing"));
     }, 600); // several taps, one save
   }
-  $("#lyr-more").addEventListener("click", (e) => { e.stopPropagation(); renderLyrTools(); showLyrTools(lyrPop.hidden); });
+  $("#lyr-more").addEventListener("click", () => { renderLyrTools(); openSheet("#lyr-opts-sheet"); });
   lyrPop.addEventListener("click", (e) => {
-    e.stopPropagation(); // re-rendering detaches the target: the outside-click check below would misread it
     const b = e.target.closest("[data-lyr-nudge],[data-lyr-search]");
     if (!b || b.disabled) return;
-    if ("lyrSearch" in b.dataset) { showLyrTools(false); openLyricsSearch(); return; }
+    if ("lyrSearch" in b.dataset) { closeSheet("#lyr-opts-sheet"); openLyricsSearch(); return; }
     const v = b.dataset.lyrNudge;
     setLyricsOffset(v === "reset" ? 0 : LY.nudge(lyr.offset, Number(v)));
   });
-  document.addEventListener("click", (e) => {
-    if (!lyrPop.hidden && !e.target.closest("#lyr-pop,#lyr-more")) showLyrTools(false);
-  });
+  lyrPop.addEventListener("change", (e) => { if ("lyrOnly" in e.target.dataset) setLyricsOnly(e.target.checked); });
 
   // "Wrong lyrics?": search LRCLIB and pin a result to this track (the server never replaces a pin).
   const lyrSearch = { seq: 0, id: null };
@@ -5036,6 +5361,7 @@
   document.addEventListener("keydown", (e) => {
     if (e.key !== "Escape") return;
     if (topSheet()) closeSheet(topSheet());
+    else if (lyr.on && npOpen()) setLyricsOn(false);
     else if (qs.open) closeQ();
     else if ($("#np").classList.contains("open")) closeNP();
   });
@@ -5065,6 +5391,7 @@
   if (bootLink) runSearch(bootLink, { link: true });
   else if (bootQ) runSearch(bootQ);
   setLyricsOn(lyr.on);
+  setLyricsOnly(lyr.only);
   loadSources();
   loadSettings();
   loadHealth();

@@ -1,6 +1,6 @@
 # Reef — handoff notes (resume on another machine)
 
-Last updated: 2026-10-22 (Round 16).
+Last updated: 2026-10-22 (Round 16, UI remake step 3).
 
 ## What's running
 
@@ -827,6 +827,38 @@ Settings / Stats / Recap screens. Prerequisite: serve Reef over HTTPS with `tail
   *paused* still starts playback (relies on WebKit forwarding the tap to a ≤ 1 s timer); blur + two-layer cross-fade
   cost on long sessions; locked-screen playback, mediaSession and the sleep timer unchanged; AirPlay button appears and
   opens the picker; Safari-tab height (~550 px on a 375 × 667 phone) leaves a usable art size.
+
+### UI remake step 3: Lyrics (2026-10-22, uncommitted on `dreamingofu/codebase-overview-and-risk`)
+
+- Lyrics are now a **full-screen view** (`#lyv`, inside `#np`, over the queue sheet) instead of replacing the art.
+  Opens from the action row's Lyrics toggle or a single tap on the art (after the 380 ms double-tap window); rises from
+  the bottom (scale .92 × .78, 16% lower, radius 32 → 0). Closes with ⌄, the top pill, a pull down on the top, or
+  Escape. `reef.lyricsOn` still remembers it (reopening the player comes back to it). Background: `--c-base` 30%
+  toward black, plus the static blurred 64 px art when the player background is Ambient / Immersive.
+- `lyrics-view-core` (`LV` in app.js, node check `scratchpad/u3/lyrics_view_core_check.js`): rows (lines + interlude
+  gaps: intro ≥ 4 s, blank / ♪ lines ≥ 4 s, and with word timing the silence after a line's last word), active row /
+  word, word fill, dot progress, depth classes + the range that can change, 35% anchor, 20 ms stagger, long-line
+  shrink, syllable groups. `lyrics-core` (`LY`) is unchanged.
+- Depth: classes `d0`..`d4`, `d5` (±5..±8), `d9` (beyond ±8) (+ `past`): opacity 1 / .52 / .30 / .18 / .10 / .06,
+  scale 1.05 / .95, blur 2 px for ±1 and 5 px for ±2..±4, none from ±5 (at .06, effectively invisible) and `d9`
+  `visibility: hidden` outside a manual scroll: at most 8 blurred rows (static, never animated), opacity in 330 ms / out 500 ms; only the rows whose class changes are touched. Active
+  row at 35%; rows glide there by FLIP on `translate` in a 20 ms wave (big jumps land). Line bounce: words pop in turn
+  (40 ms) on line-timed lines. Word fill (BetterLyrics `words`): `background-clip: text` gradient with a .9em edge,
+  sung words lift 3 px, words held > 1.1 s glow. Interlude dots fill in turn, pulse 1.6 s, fade 650 ms before the next
+  line. One rAF loop only while the view is visible + playing + the ACTIVE row is a word-timed line or a gap
+  (`LV.needsFrames`; mixed-timing lyrics don't run it on line-timed rows; one `--wf` / `--gp` write per frame); otherwise `timeupdate`. Nothing is touched while the view is hidden.
+- Manual scroll (any scroll that isn't ours) pauses auto-follow for 3.5 s after it stops, sharpens the other rows and
+  shows **Resync**; tapping a row seeks there (+ offset). States: skeleton, plain ("Not synced" note, 21 px / 1.75),
+  instrumental, no lyrics (+ Find lyrics), error (+ Retry; non-404 failures aren't cached). ⋯ opens a light sheet:
+  source, Timing −0.5 / value (reset) / +0.5, **Lyrics only** (hides the pill + bar, `reef.lyricsOnly`), Wrong
+  lyrics? → the Find lyrics sheet (results now a joined block). Reduced motion: fade only, no zoom / glide / pops.
+- Also: `.np` / `.lyv` are `overflow: clip` (focus or scroll-into-view can't scroll them); `drag()` counts the release
+  point in the velocity (a finger that stopped before lifting no longer reads as a flick); tall sheets keep the
+  Done button's height.
+- **Check on the iPhone**: word fill smoothness and battery/heat with the rAF loop on a long word-timed song; that the
+  2 / 5 px blur on up to 8 rows plus the static background blur stays smooth while rows glide; momentum scroll → Resync
+  timing; `background-clip: text` rendering of word gradients (and the glow) in Safari; the open transition at 60 fps;
+  single tap on art vs double-tap seek feel; safe areas of the pill / bar in the Home Screen app.
 
 ## Ideas / next steps
 
