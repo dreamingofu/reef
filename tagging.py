@@ -26,13 +26,14 @@ def _strip_noise(title):
         title = title[:m.start()]
 
 
-def _clean_artist(name):
+def clean_artist(name):
+    """An artist name without YouTube's " - Topic" / "VEVO" channel suffixes."""
     name = re.sub(r"\s+-\s+Topic$", "", str(name or "").strip(), flags=re.I)
     return re.sub(r"\s*VEVO$", "", name).strip()
 
 
 def _names(value):
-    return [n for n in (_clean_artist(v) for v in (value if isinstance(value, list) else [value])) if n]
+    return [n for n in (clean_artist(v) for v in (value if isinstance(value, list) else [value])) if n]
 
 
 def _year(info):
@@ -71,6 +72,23 @@ def music_tags(info):
         tags["meta_track"] = str(info["track_number"])
     tags["meta_date"] = _year(info)
     return {k: v for k, v in tags.items() if v}
+
+
+_HINT_TAGS = (("album", "meta_album"), ("album_artist", "meta_album_artist"), ("track_number", "meta_track"),
+              ("year", "meta_date"))
+
+
+def with_hints(tags, hints):
+    """`music_tags` output with album-page hints laid over it. yt-dlp's per-video album/track/date are often
+    missing or name a single, so an album kept from its page would scatter across Navidrome without these."""
+    hints = hints or {}
+    out = dict(tags)
+    if hints.get("album") and hints["album"] != out.get("meta_album") and not hints.get("track_number"):
+        out.pop("meta_track", None)  # a track number from another release of the song would be wrong here
+    for key, meta in _HINT_TAGS:
+        if hints.get(key) not in (None, ""):
+            out[meta] = str(hints[key])
+    return out
 
 
 def guess(title, channel):

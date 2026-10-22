@@ -135,7 +135,17 @@ result card, Songs rows with **+**, and filter chips. Design tokens are at the t
 - Paste a YouTube / YT Music link (track, playlist, album) into search (`/api/link`); Android share sheet → `/share`.
 - ⋯ → Start radio; Autoplay (Up next toggle, default on) appends ~20 similar tracks when ≤2 remain (`/api/radio`).
 - **Phone update now needs pip**: `cd ~/reef && git pull --ff-only && pip install -r requirements.txt && ~/.termux/boot/reef.sh`.
-- Next (Phase 4b): YT Music moods/genres home, album/artist pages + keep whole album, blocked artists.
+
+## Round 7 (2026-10-21): browse (Phase 4b)
+
+- Home tiles are YouTube Music moods & genres (`/api/moods`, cached 7 days in `browse.json`; the hard-coded
+  `tiles.py` list is the fallback). Pages on the hash: `#moods`, `#mood/<params>`, `#playlist/<id>`, `#album/<id>`,
+  `#artist/<id>` (`/api/mood`, `/api/playlist`, `/api/album`, `/api/artist`).
+- Album pages swap official-video ids for the album's audio-track ids (OLAK5uy_ playlist, title-checked), and
+  **Keep album** (`/api/download/batch`) writes album / album artist / track number / year so Navidrome groups it.
+- Hidden artists: `blocklist.json` (`/api/blocklist`), filtered server-side from search, radio, playlists, tiles;
+  managed from ⋯ → Hide artist, the artist page, and the status sheet.
+- Tap an artist name in any row (or in Now Playing) to open the artist page.
 
 ## Production plan (2026-10-21)
 

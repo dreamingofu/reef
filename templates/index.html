@@ -37,6 +37,9 @@
   <symbol id="i-share" viewBox="0 0 24 24"><path d="M12 3.5v11.5M7.8 7.6 12 3.5l4.2 4.1M8 10.5H6.5A1.5 1.5 0 0 0 5 12v7a1.5 1.5 0 0 0 1.5 1.5h11A1.5 1.5 0 0 0 19 19v-7a1.5 1.5 0 0 0-1.5-1.5H16"/></symbol>
   <symbol id="i-chev-down" viewBox="0 0 24 24"><path d="m6 9.5 6 6 6-6"/></symbol>
   <symbol id="i-chev-right" viewBox="0 0 24 24"><path d="m9.5 6 6 6-6 6"/></symbol>
+  <symbol id="i-chev-left" viewBox="0 0 24 24"><path d="m14.5 5.5-6.5 6.5 6.5 6.5"/></symbol>
+  <symbol id="i-person" viewBox="0 0 24 24"><circle cx="12" cy="8.2" r="3.9"/><path d="M4.6 20.2c.9-3.7 3.8-5.9 7.4-5.9s6.5 2.2 7.4 5.9"/></symbol>
+  <symbol id="i-hide" viewBox="0 0 24 24"><path d="M3.5 12s3.1-6 8.5-6c1.6 0 3 .5 4.2 1.2M20.5 12s-3.1 6-8.5 6c-1.6 0-3-.5-4.2-1.2M9.9 14.1a3 3 0 0 1 4.2-4.2M4.5 19.5l15-15"/></symbol>
   <symbol id="i-x" viewBox="0 0 24 24"><path d="M6.5 6.5l11 11m0-11-11 11"/></symbol>
   <symbol id="i-server" viewBox="0 0 24 24"><rect x="3.8" y="4" width="16.4" height="6.6" rx="2"/><rect x="3.8" y="13.4" width="16.4" height="6.6" rx="2"/><path d="M7.6 7.3h.01M7.6 16.7h.01"/></symbol>
   <symbol id="i-sparkle" viewBox="0 0 24 24"><path d="m11 3.5 1.7 4.6 4.6 1.7-4.6 1.7L11 16.1l-1.7-4.6-4.6-1.7 4.6-1.7zM18 14.5l.8 2.1 2.1.8-2.1.8-.8 2.1-.8-2.1-2.1-.8 2.1-.8z"/></symbol>
@@ -59,6 +62,8 @@
 </svg>
 
 <header class="top" id="top">
+  <button class="hbtn top-back" id="top-back" aria-label="Back"><svg class="i"><use href="#i-chev-left"/></svg></button>
+  <span class="top-title" id="top-title" aria-hidden="true"></span>
   <a class="brand" href="#home" aria-label="Reef home">
     <svg class="brand-logo" aria-hidden="true"><use href="#i-logo"/></svg>
     <span>Reef</span>
@@ -80,6 +85,7 @@
   <section class="view" id="view-search" hidden></section>
   <section class="view" id="view-kept" hidden></section>
   <section class="view" id="view-downloads" hidden></section>
+  <section class="view" id="view-detail" hidden></section>
 </main>
 
 <div class="mini glass" id="mini" hidden>
@@ -121,7 +127,7 @@
     <div class="np-art-wrap"><img class="np-art" id="np-art" alt=""></div>
     <div class="np-lyrics" id="np-lyrics" role="region" aria-label="Lyrics"></div>
     <div class="np-title-row">
-      <div class="np-titles"><h2 id="np-t"></h2><p id="np-s"></p></div>
+      <div class="np-titles"><h2 id="np-t"></h2><button class="np-s" id="np-s"></button></div>
       <button class="icon-btn" id="np-share" aria-label="Share"><svg class="i"><use href="#i-share"/></svg></button>
       <button class="keep none lg" id="np-keep" data-keep="" aria-label="Keep in library"><svg class="i"><use href="#i-plus"/></svg></button>
     </div>
@@ -152,6 +158,15 @@
   <div class="sheet" role="dialog" aria-label="Server status">
     <div class="sheet-top"><div class="grabber"></div><h3>Server</h3></div>
     <ul class="status-list" id="status-list"></ul>
+    <button class="btn-wide" data-close>Done</button>
+  </div>
+</div>
+
+<div class="sheet-wrap" id="hidden-sheet" hidden>
+  <div class="scrim" data-close></div>
+  <div class="sheet tall" role="dialog" aria-label="Hidden artists">
+    <div class="sheet-top"><div class="grabber"></div><h3>Hidden artists</h3></div>
+    <div class="sheet-body" id="hidden-list"></div>
     <button class="btn-wide" data-close>Done</button>
   </div>
 </div>

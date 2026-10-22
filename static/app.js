@@ -8,6 +8,10 @@
   const ACTIVE = ["queued", "downloading", "converting"];
   const FROM = { results: "From search", history: "Kept", recent: "Recently played" };
   const AUTO_LIMIT = 20; // autoplay tracks appended per radio fetch
+  const PAGE_TTL = 5 * 60 * 1000; // browse pages (album, artist, playlist, moods) stay in memory this long
+  // Ids the server accepts for artist / album pages; anything else isn't linked.
+  const ARTIST_ID = /^UC[\w-]{22}$/;
+  const ALBUM_ID = /^(?:MPRE|OLAK5uy_)[\w-]{6,60}$/;
 
   const store = {
     get(k, d) { try { const v = localStorage.getItem("reef." + k); return v ? JSON.parse(v) : d; } catch { return d; } },
@@ -16,6 +20,7 @@
 
   const state = {
     view: "home",
+    parent: "home", // the main view a detail page (album, artist, ...) was opened from: its tab and bottom bar stay
     homeTab: "foryou",
     query: "",
     results: [],
@@ -33,6 +38,7 @@
     original: null, // play order before shuffling (snapshot restored when shuffle goes off)
     repeat: "off",
     health: null,
+    blocked: null, // hidden artists from /api/blocklist (null until loaded)
     // Search sources from /api/sources; `source` is the chip picked for searching.
     sources: [{ key: "yt", name: "YouTube", can_keep: true, codec_label: "AAC" }],
     source: store.get("source", null),
@@ -44,6 +50,7 @@
     results: () => state.results,
     history: () => state.history,
     recent: () => store.get("plays", []),
+    page: () => pageTracks(), // the open album / playlist / artist page
   };
 
   // ---------- helpers ----------
@@ -86,8 +93,24 @@
   const codecLabel = (t) => (t.codec ? String(t.codec).toUpperCase() : srcInfo(srcKey(t.id)).codec_label);
   const xBadge = (t) => (t.explicit ? `<span class="xbadge" role="img" aria-label="Explicit">E</span>` : "");
   // "[E] Artist · Album · 3:45 · Source": the subtitle of search / link / queue rows.
-  const trackSub = (t) => xBadge(t) + [esc(t.channel), t.album ? esc(t.album) : "", t.duration ? fmt(t.duration) : ""]
+  const trackSub = (t) => xBadge(t) + [artistLinks(t), t.album ? esc(t.album) : "", t.duration ? fmt(t.duration) : ""]
     .filter(Boolean).join(" · ") + srcBadge(t);
+  // A track's artists that have a page ([{name, id}]).
+  const linkable = (t) => (Array.isArray(t?.artists) ? t.artists : []).filter((a) => a && a.name && ARTIST_ID.test(a.id || ""));
+  // The artist names, each one with a page as its own link (rows play on tap; the link sits above that).
+  function artistLinks(t) {
+    const all = Array.isArray(t.artists) ? t.artists.filter((a) => a && a.name) : [];
+    if (!all.length || !linkable(t).length) return esc(t.channel);
+    return all.map((a) => (ARTIST_ID.test(a.id || "")
+      ? `<a class="row-link" href="#artist/${encodeURIComponent(a.id)}">${esc(a.name)}</a>` : esc(a.name))).join(", ");
+  }
+  // "1 hr 2 min" / "45 min" ("" for 0).
+  function fmtLen(total) {
+    const mins = Math.round((Number(total) || 0) / 60);
+    if (!total) return "";
+    return mins >= 60 ? `${Math.floor(mins / 60)} hr ${mins % 60} min` : `${Math.max(1, mins)} min`;
+  }
+  const songs = (n) => `${n} song${n === 1 ? "" : "s"}`;
 
   function fmt(sec) {
     if (!isFinite(sec) || sec < 0) sec = 0;
@@ -252,7 +275,10 @@
 
   // YouTube serves a 120x90 placeholder (sometimes with status 404) when maxres art is missing.
   function fallbackImg(img) {
-    if (img.tagName === "IMG" && img.dataset.fallback && img.src !== img.dataset.fallback) img.src = img.dataset.fallback;
+    if (img.tagName !== "IMG") return;
+    // Browse art (mood tiles, covers) that fails just goes: the tile's gradient / the empty frame shows instead.
+    if ("drop" in img.dataset) { img.parentElement?.classList.remove("has-art"); img.remove(); return; }
+    if (img.dataset.fallback && img.src !== img.dataset.fallback) img.src = img.dataset.fallback;
   }
   document.addEventListener("error", (e) => fallbackImg(e.target), true);
   document.addEventListener("load", (e) => {
@@ -261,10 +287,18 @@
   }, true);
 
   // ---------- keep state ----------
+  // /api/history is only the latest 50 keeps; lists from the server also mark `kept`, so older keeps count too.
+  const keptIds = new Set();
+  function noteKept(tracks) {
+    for (const t of tracks || []) {
+      if (!t || !t.id || typeof t.kept !== "boolean") continue;
+      if (t.kept) keptIds.add(t.id); else keptIds.delete(t.id);
+    }
+  }
   function keepState(id) {
     if (!id) return "none";
     if (srcKey(id) === "nd") return "kept"; // Navidrome results are the library itself
-    if (state.history.some((h) => h.id === id)) return "kept";
+    if (state.history.some((h) => h.id === id) || keptIds.has(id)) return "kept";
     if (state.jobs.some((j) => j.video_id === id && ACTIVE.includes(j.status))) return "pending";
     return "none";
   }
@@ -285,7 +319,9 @@
       b.setAttribute("aria-label", s === "kept" ? "In your library" : "Keep in library");
       const use = b.querySelector("use");
       if (use) use.setAttribute("href", `#i-${s === "kept" ? "check" : "plus"}`);
-    });    if (!$("#act-sheet").hidden) renderActions();
+    });
+    refreshKeepAll();
+    if (!$("#act-sheet").hidden) renderActions();
   }
 
   function markPlaying() {
@@ -343,8 +379,15 @@
       </a>`).join("")}</div>`;
   }
 
-  function tiles() {
-    return `<div class="tiles">${state.tiles.map((t) => {
+  // A YouTube Music mood / genre ({label, color, params, art}) opens its page; the art is the cover of its
+  // first playlist, over the color gradient (which shows on its own when there's no art or it fails).
+  const moodTile = (t) => `<a class="tile${t.art ? " has-art" : ""}" style="--c:${esc(t.color)}" href="#mood/${encodeURIComponent(t.params)}">${t.art
+    ? `<img src="${esc(t.art)}" alt="" loading="lazy" data-drop>` : ""}<span>${esc(t.label)}</span>${t.art ? "" : icon("note")}</a>`;
+  const moodsOn = () => state.tiles.some((t) => t.params);
+
+  function tiles(list = state.tiles) {
+    return `<div class="tiles">${list.map((t) => {
+      if (t.params) return moodTile(t);
       const id = (t.ids || [])[0];
       return id
         ? `<button class="tile has-art" style="--c:${esc(t.color)}" data-search="${esc(t.query)}"><img src="${artUrl(id, artSize(id, "tile"))}" alt="" loading="lazy"><span>${esc(t.label)}</span></button>`
@@ -352,14 +395,17 @@
     }).join("")}</div>`;
   }
 
-  function row(t, i, list, sub) {
+  // A track row. The title button's ::after covers the whole row (tap = play); the artist links, + and ⋯ sit
+  // above it. `num` shows the track number instead of the art (album pages).
+  function row(t, i, list, sub, { num } = {}) {
     const playing = cur()?.id === t.id;
     const subtitle = sub != null ? xBadge(t) + sub : trackSub(t);
-    return `<li class="row${playing ? " playing" : ""}" data-track="${esc(t.id)}">
-      <button class="row-main" data-play="${i}" data-list="${list}">
-        <span class="row-art">${art(t.id)}${eqIfPlaying(t.id)}</span>
-        <span class="row-text"><span class="row-t">${esc(t.title)}</span><span class="row-s">${subtitle}</span></span>
-      </button>
+    const lead = num != null
+      ? `<span class="row-art row-num">${esc(num)}${eqIfPlaying(t.id)}</span>`
+      : `<span class="row-art">${art(t.id)}${eqIfPlaying(t.id)}</span>`;
+    return `<li class="row trk${playing ? " playing" : ""}" data-track="${esc(t.id)}">
+      ${lead}
+      <span class="row-text"><button class="row-hit" data-play="${i}" data-list="${list}"><span class="row-t">${esc(t.title)}</span></button><span class="row-s">${subtitle}</span></span>
       ${keepBtn(t.id, list)}
       ${moreBtn(t, i, list)}
     </li>`;
@@ -387,7 +433,9 @@
       if (searches.length) {
         html += shelf({ title: "Recent searches", ic: "search", body: `<div class="chips wrap">${searches.map((q) => `<button class="chip" data-search="${esc(q)}">${esc(q)}</button>`).join("")}</div>` });
       }
-      html += shelf({ title: "Browse moods & genres", ic: "trend", sub: "Tap one to search YouTube", body: tiles() });
+      html += moodsOn()
+        ? shelf({ title: "Browse moods & genres", ic: "trend", sub: "Playlists from YouTube Music", more: "#moods", body: tiles() })
+        : shelf({ title: "Browse moods & genres", ic: "trend", sub: "Tap one to search YouTube", body: tiles() });
     } else if (state.library === null) {
       html += `<div class="shelf"><div class="scroller">${'<div class="card"><div class="card-art sk"></div></div>'.repeat(4)}</div></div>`;
     } else if (!state.library.length) {
@@ -441,8 +489,7 @@
   function playlistView(res) {
     const album = res.length > 0 && res.every((t) => t.album_id && t.album_id === res[0].album_id);
     const total = res.reduce((a, t) => a + (Number(t.duration) || 0), 0);
-    const mins = Math.round(total / 60);
-    const len = total ? ` · ${mins >= 60 ? `${Math.floor(mins / 60)} hr ${mins % 60} min` : `${mins} min`}` : "";
+    const len = total ? ` · ${fmtLen(total)}` : "";
     const artist = album && res[0].channel ? `<span class="pl-a">${esc(res[0].channel)}</span>` : "";
     return `<div class="pl-head">
         <span class="pl-art">${res.length ? art(res[0].id, true) : icon("note")}</span>
@@ -472,7 +519,7 @@
       el.innerHTML = sourceChips() + (searches.length ? `
         <div class="head-row"><h2 class="section-title">Recent</h2><button class="link-btn" data-clear-searches>Clear</button></div>
         <ul class="rows">${searches.map((q) => `<li class="row"><button class="row-main" data-search="${esc(q)}"><span class="row-art" style="display:grid;place-items:center;color:var(--faint)">${icon("clock")}</span><span class="row-text"><span class="row-t">${esc(q)}</span></span></button></li>`).join("")}</ul>` : "")
-        + `<h2 class="section-title">Browse Categories</h2>${tiles()}`;
+        + `<div class="head-row sec"><h2 class="section-title">Browse Categories</h2>${moodsOn() ? `<a class="link-btn" href="#moods">See all</a>` : ""}</div>${tiles()}`;
       return;
     }
 
@@ -565,7 +612,418 @@
     $("#view-downloads").innerHTML = html;
   }
 
-  const RENDER = { home: renderHome, search: renderSearch, kept: renderKept, downloads: renderDownloads };
+  // ---------- browse pages: album, artist, playlist, mood, all moods ----------
+  // #album/<id> #artist/<id> #playlist/<id> #mood/<params> #moods render into #view-detail. Page data stays
+  // in memory per route for PAGE_TTL, so back / forward are instant; an older entry still shows at once and
+  // is refreshed behind it. A failed first load shows an error with Retry.
+  const detail = { kind: "", id: "", key: "", cache: new Map(), errors: new Map(), inflight: new Map(), restore: null, about: false };
+  const releaseType = new Map(); // album id -> "Album" | "Single" | "EP", learned from artist pages
+  const PAGE_API = {
+    album: (id) => `/api/album/${encodeURIComponent(id)}`,
+    artist: (id) => `/api/artist/${encodeURIComponent(id)}`,
+    playlist: (id) => `/api/playlist/${encodeURIComponent(id)}`,
+    mood: (id) => `/api/mood?params=${encodeURIComponent(id)}`,
+    moods: () => "/api/moods",
+  };
+
+  const pageData = () => detail.cache.get(detail.key)?.data || null;
+  function pageTracks() {
+    const d = pageData();
+    if (!d) return [];
+    return (detail.kind === "artist" ? d.songs : detail.kind === "album" || detail.kind === "playlist" ? d.tracks : null) || [];
+  }
+  function moodName(params) {
+    const t = state.tiles.find((x) => x.params === params);
+    if (t) return t.label;
+    for (const sec of detail.cache.get("moods")?.data?.sections || []) {
+      const m = (sec.items || []).find((x) => x.params === params);
+      if (m) return m.title;
+    }
+    return "";
+  }
+  // The page's name: the header title, and "Playing from" in the player.
+  function pageTitle(kind = detail.kind, d = pageData(), id = detail.id) {
+    if (kind === "moods") return "Moods & genres";
+    if (kind === "mood") return d?.title || moodName(id) || "Mood";
+    if (!d) return "";
+    if (kind === "artist") return d.name || "Artist";
+    return d.title || (kind === "album" ? "Album" : "Playlist");
+  }
+
+  function loadPage(key = detail.key, { force = false } = {}) {
+    const hit = detail.cache.get(key);
+    if (!force && hit && Date.now() - hit.at < PAGE_TTL) return null;
+    if (detail.inflight.has(key)) return detail.inflight.get(key);
+    const slash = key.indexOf("/");
+    const kind = slash < 0 ? key : key.slice(0, slash), id = slash < 0 ? "" : key.slice(slash + 1);
+    const p = (async () => {
+      let changed = true;
+      try {
+        const data = await api(PAGE_API[kind](id));
+        noteKept(kind === "artist" ? data.songs : data.tracks);
+        if (kind === "artist") for (const r of [...(data.albums || []), ...(data.singles || [])]) if (r.type) releaseType.set(r.id, r.type);
+        const old = detail.cache.get(key);
+        changed = !old || JSON.stringify(old.data) !== JSON.stringify(data);
+        detail.cache.delete(key); // re-insert: the Map's order is the eviction order
+        detail.cache.set(key, { at: Date.now(), data });
+        while (detail.cache.size > 40) detail.cache.delete(detail.cache.keys().next().value);
+        detail.errors.delete(key);
+      } catch (e) {
+        if (detail.cache.has(key)) changed = false; // a failed refresh keeps what's shown
+        else detail.errors.set(key, e);
+      } finally {
+        detail.inflight.delete(key);
+      }
+      if (changed && state.view === "detail" && detail.key === key) renderDetail();
+    })();
+    detail.inflight.set(key, p);
+    return p;
+  }
+
+  function pageSkeleton(kind) {
+    if (kind === "moods" || kind === "mood") {
+      const grid = kind === "mood" ? `<div class="grid2">${'<div><div class="sk sk-sq"></div><div class="sk sk-line"></div></div>'.repeat(4)}</div>`
+        : `<div class="tiles">${'<div class="sk sk-tile"></div>'.repeat(8)}</div>`;
+      return `<div role="status" aria-label="Loading…"><div class="sk sk-title"></div>${grid}</div>`;
+    }
+    return `<div role="status" aria-label="Loading…"><div class="hero"><div class="hero-art${kind === "artist" ? " circle" : ""} sk"></div>
+        <div class="sk sk-line" style="width:56%"></div><div class="sk sk-line sm" style="width:34%"></div></div>
+      <div class="actions"><div class="sk sk-btn"></div><div class="sk sk-btn"></div></div>
+      ${'<div class="sk-row"><div class="sk a"></div><div class="sk l"></div></div>'.repeat(5)}</div>`;
+  }
+
+  // Upstream failures can carry a parser dump; a short message (e.g. "YouTube Music is off") is shown as is.
+  function pageError(e) {
+    const msg = e.status === 404 ? "YouTube Music doesn't have this page."
+      : e.message && e.message.length <= 90 ? e.message : "YouTube Music didn't answer. Try again in a moment.";
+    return emptyState("alert", e.status === 404 ? "Not found" : "Couldn't load this page", msg,
+      `<button class="pill-btn" data-retry>${icon("repeat")}Retry</button>`);
+  }
+
+  // The glyph sits under the cover, so it shows while the cover loads or if it fails.
+  function heroArt(src, tracks, round = false) {
+    const img = src ? `<img src="${esc(src)}" alt="" data-drop>` : tracks?.length ? art(tracks[0].id, true) : "";
+    return `<span class="hero-art${round ? " circle" : ""}">${icon(round ? "person" : "note")}${img}</span>`;
+  }
+  const pageActions = () => `<div class="actions">
+      <button class="pill-btn" data-play-all="page">${icon("play", "fill")}Play</button>
+      <button class="pill-btn" data-shuffle-all="page">${icon("shuffle")}Shuffle</button>
+    </div>`;
+  const hiddenBanner = (unhide) => `<div class="banner">${icon("hide")}<span>You've hidden this artist</span>${unhide
+    ? `<button class="chip sm" data-unhide-page>Unhide</button>` : ""}</div>`;
+
+  // Keep album / Keep all: "none" (something to keep), "pending" (the rest is being kept), "kept", "" (nothing keepable).
+  function keepAllState() {
+    const st = pageTracks().filter((t) => canKeep(t.id) || keepState(t.id) === "kept").map((t) => keepState(t.id));
+    if (!st.length) return "";
+    return st.every((x) => x === "kept") ? "kept" : st.every((x) => x !== "none") ? "pending" : "none";
+  }
+  const keepAllInner = (s) => (s === "kept" ? `${icon("check")}In your library`
+    : s === "pending" ? `${icon("download")}Keeping…` : `${icon("plus")}${detail.kind === "album" ? "Keep album" : "Keep all"}`);
+  function keepAllBtn() {
+    const s = keepAllState();
+    return s ? `<button class="keep-all ${s}" data-keep-all data-state="${s}">${keepAllInner(s)}</button>` : "";
+  }
+  function refreshKeepAll() {
+    const b = $("#view-detail [data-keep-all]");
+    if (!b || state.view !== "detail") return;
+    const s = keepAllState();
+    if (b.dataset.state === s) return;
+    b.dataset.state = s;
+    b.className = `keep-all ${s}`;
+    b.innerHTML = keepAllInner(s);
+  }
+
+  // Tags for keeps from an album page, so the files land as that album (the server validates them too).
+  function albumHints(t, a) {
+    const h = {};
+    if (!a) return h;
+    if (a.title) h.album = String(a.title).slice(0, 200);
+    if (a.artist) h.album_artist = String(a.artist).slice(0, 200);
+    const n = Number(t.track_number);
+    if (Number.isInteger(n) && n > 0 && n < 1000) h.track_number = n;
+    if (/^\d{4}$/.test(String(a.year || ""))) h.year = String(a.year);
+    return h;
+  }
+
+  async function keepAll() {
+    const d = pageData();
+    if (!d || (detail.kind !== "album" && detail.kind !== "playlist")) return;
+    const s = keepAllState();
+    if (s === "kept") { toast("Already in your library"); return; }
+    if (s === "pending") { location.hash = "#downloads"; return; }
+    const album = detail.kind === "album";
+    const tracks = pageTracks();
+    const already = tracks.filter((t) => keepState(t.id) === "kept").length;
+    const items = tracks.filter((t) => canKeep(t.id) && keepState(t.id) === "none").slice(0, 100)
+      .map((t) => ({ id: t.id, title: t.title || "", channel: t.channel || "", ...(album ? albumHints(t, d) : {}) }));
+    let r;
+    try {
+      r = await api("/api/download/batch", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ tracks: items }),
+      });
+    } catch (e) {
+      toast(e.message);
+      return;
+    }
+    const queued = Array.isArray(r?.queued) ? r.queued : [];
+    const skipped = Array.isArray(r?.skipped) ? r.skipped : [];
+    const kept = skipped.filter((x) => x.reason === "kept" && x.id);
+    for (const x of kept) keptIds.add(x.id); // kept from another device meanwhile
+    const known = new Set(state.jobs.map((j) => j.id));
+    state.jobs = queued.filter((j) => !known.has(j.id)).concat(state.jobs);
+    const m = already + kept.length;
+    toast(queued.length ? `Keeping ${songs(queued.length)}${m ? ` (${m} already in library)` : ""}`
+      : skipped.some((x) => x.reason === "keeping") ? "Already keeping these" : "Already in your library");
+    refreshKeepButtons();
+    renderBadges();
+    if (queued.length) pollJobs();
+    if (kept.length) loadHistory();
+  }
+
+  function albumPage(a) {
+    const tracks = a.tracks || [];
+    const total = a.duration || tracks.reduce((x, t) => x + (Number(t.duration) || 0), 0);
+    const meta = [releaseType.get(a.id) || "Album", a.year, songs(tracks.length), fmtLen(total)].filter(Boolean).join(" · ");
+    const by = (a.artists || []).filter((x) => x && x.name);
+    const artists = by.length ? by.map((x) => (ARTIST_ID.test(x.id || "")
+      ? `<a href="#artist/${encodeURIComponent(x.id)}">${esc(x.name)}</a>` : esc(x.name))).join(", ") : esc(a.artist);
+    // Rows name the artist only when it isn't the album's (features, compilations).
+    const sub = (t) => [t.channel && t.channel !== a.artist ? artistLinks(t) : "", t.duration ? fmt(t.duration) : ""].filter(Boolean).join(" · ");
+    return `<div class="hero">${heroArt(a.thumb, tracks)}
+        <h1 class="hero-t" data-anchor>${esc(a.title || "Album")}</h1>
+        ${artists ? `<p class="hero-a">${artists}</p>` : ""}
+        <p class="hero-s">${esc(meta)}</p>
+      </div>
+      ${a.blocked ? hiddenBanner(true) : ""}
+      ${tracks.length ? `${pageActions()}${keepAllBtn()}
+        <ul class="rows d-rows">${tracks.map((t, i) => row(t, i, "page", sub(t), { num: t.track_number || i + 1 })).join("")}</ul>`
+        : emptyState("note", "Nothing playable", "This album has no tracks Reef can play.")}`;
+  }
+
+  function playlistPage(p) {
+    const tracks = p.tracks || [];
+    const total = tracks.reduce((x, t) => x + (Number(t.duration) || 0), 0);
+    return `<div class="hero">${heroArt(p.thumb, tracks)}
+        <h1 class="hero-t" data-anchor>${esc(pageTitle("playlist", p))}</h1>
+        ${p.author ? `<p class="hero-a plain">${esc(p.author)}</p>` : ""}
+        <p class="hero-s">${esc([songs(tracks.length), fmtLen(total)].filter(Boolean).join(" · "))}</p>
+      </div>
+      ${tracks.length ? `${pageActions()}${keepAllBtn()}
+        <ul class="rows d-rows">${tracks.map((t, i) => row(t, i, "page")).join("")}</ul>`
+        : emptyState("note", "Nothing playable", "This playlist has no tracks Reef can play.")}`;
+  }
+
+  const releaseCards = (items) => `<div class="scroller">${items.map((r) => `
+      <a class="card" href="#album/${encodeURIComponent(r.id)}">
+        <span class="card-art">${r.thumb ? `<img src="${esc(r.thumb)}" alt="" loading="lazy" data-drop>` : ""}</span>
+        <div class="card-t">${esc(r.title)}</div>
+        <div class="card-s">${esc([r.year, r.type].filter(Boolean).join(" · "))}</div>
+      </a>`).join("")}</div>`;
+  const artistCards = (items) => `<div class="scroller">${items.map((r) => `
+      <a class="card av" href="#artist/${encodeURIComponent(r.id)}">
+        <span class="card-art">${r.thumb ? `<img src="${esc(r.thumb)}" alt="" loading="lazy" data-drop>` : icon("person")}</span>
+        <div class="card-t">${esc(r.name)}</div>
+      </a>`).join("")}</div>`;
+
+  function artistPage(a) {
+    const list = a.songs || [];
+    // With a full "Songs" playlist to go to, show the first five here (Apple Music style); else all of them.
+    const top = a.songs_playlist_id ? list.slice(0, 5) : list;
+    let html = `<div class="hero artist">${heroArt(a.thumb, null, true)}
+        <h1 class="hero-t" data-anchor>${esc(a.name)}</h1>
+        <div class="actions">
+          ${list.length ? `<button class="pill-btn" data-play-all="page">${icon("play", "fill")}Play</button>
+          <button class="pill-btn" data-page-radio>${icon("radio")}Radio</button>` : ""}
+          <button class="pill-btn${a.blocked ? " on" : ""}" data-artist-hide aria-pressed="${a.blocked ? "true" : "false"}">${icon("hide")}${a.blocked ? "Unhide" : "Hide"}</button>
+        </div>
+      </div>
+      ${a.blocked ? hiddenBanner(false) : ""}`;
+    if (top.length) {
+      html += shelf({ title: "Top songs", more: a.songs_playlist_id ? `#playlist/${encodeURIComponent(a.songs_playlist_id)}` : "",
+        body: `<ul class="rows">${top.map((t, i) => row(t, i, "page")).join("")}</ul>` });
+    }
+    if (a.albums?.length) html += shelf({ title: "Albums", body: releaseCards(a.albums) });
+    if (a.singles?.length) html += shelf({ title: "Singles & EPs", body: releaseCards(a.singles) });
+    if (a.related?.length) html += shelf({ title: "Fans also like", body: artistCards(a.related) });
+    if (a.description) {
+      const long = a.description.length > 220;
+      html += `<section class="shelf"><div class="shelf-head"><h2>About</h2></div>
+        <p class="about${long && !detail.about ? " clamp" : ""}" id="about">${esc(a.description)}</p>
+        ${long ? `<button class="link-btn about-more" data-about aria-expanded="${detail.about}">${detail.about ? "Less" : "More"}</button>` : ""}</section>`;
+    }
+    return html;
+  }
+
+  function moodsPage(d) {
+    const secs = (d.sections || []).filter((x) => x.items?.length);
+    return `<h1 class="page-title" data-anchor>Moods & genres</h1>${secs.length
+      ? secs.map((x) => `<h2 class="section-title">${esc(x.title)}</h2>${tiles(x.items.map((m) => ({ label: m.title, color: m.color, params: m.params, art: m.art })))}`).join("")
+      : emptyState("note", "Nothing to browse", "YouTube Music didn't send any moods or genres.")}`;
+  }
+
+  function moodPage(d) {
+    const seen = new Set(); // a playlist can sit in several of the mood's shelves
+    const pls = (d.playlists || []).filter((p) => p && p.id && !seen.has(p.id) && seen.add(p.id));
+    return `<h1 class="page-title" data-anchor>${esc(pageTitle("mood", d))}</h1>${pls.length ? `<div class="grid2">${pls.map((p) => `
+      <a class="pcard" href="#playlist/${encodeURIComponent(p.id)}">
+        <span class="pcard-art">${p.thumb ? `<img src="${esc(p.thumb)}" alt="" loading="lazy" data-drop>` : icon("note")}</span>
+        <span class="pcard-t">${esc(p.title)}</span>${p.subtitle ? `<span class="pcard-s">${esc(p.subtitle)}</span>` : ""}
+      </a>`).join("")}</div>` : emptyState("note", "No playlists", "YouTube Music has nothing here right now.")}`;
+  }
+
+  const PAGES = { album: albumPage, artist: artistPage, playlist: playlistPage, mood: moodPage, moods: moodsPage };
+
+  function renderDetail() {
+    const el = $("#view-detail");
+    const entry = detail.cache.get(detail.key);
+    const err = detail.errors.get(detail.key);
+    $("#top-title").textContent = pageTitle();
+    if (entry) {
+      el.innerHTML = PAGES[detail.kind](entry.data);
+      if (detail.restore != null) { window.scrollTo(0, detail.restore); detail.restore = null; }
+    } else {
+      el.innerHTML = err ? pageError(err) : pageSkeleton(detail.kind);
+      if (err) detail.restore = null;
+    }
+    syncTopTitle();
+  }
+
+  // The header shows the page's name once its big title has scrolled under it.
+  function syncTopTitle() {
+    let on = false;
+    if (state.view === "detail") {
+      const a = $("#view-detail [data-anchor]");
+      on = !a || a.getBoundingClientRect().bottom < $("#top").offsetHeight;
+    }
+    $("#top").classList.toggle("title-on", on);
+  }
+
+  // ---------- hidden artists ----------
+  // Comparable artist name, as the server's blocklist.key(): no " - Topic" / "VEVO", casefolded, no punctuation.
+  function nameKey(n) {
+    const s = String(n || "").trim().replace(/\s+-\s+Topic$/i, "").replace(/\s*VEVO$/, "").trim().toLowerCase();
+    return s.replace(/[^\p{L}\p{N}]+/gu, "") || s;
+  }
+  function byArtist(t, a) {
+    const k = nameKey(a.name);
+    const all = Array.isArray(t.artists) ? t.artists.filter((x) => x && x.name) : [];
+    if (all.length) return all.some((x) => (a.id && x.id === a.id) || nameKey(x.name) === k);
+    return nameKey(t.channel) === k;
+  }
+  // Who "Hide artist" hides for a track: its first artist (with the channel id when known), else the channel.
+  function hideTarget(t) {
+    if (!t || srcKey(t.id) !== "yt") return null;
+    const a = (Array.isArray(t.artists) ? t.artists : []).find((x) => x && x.name);
+    if (a) return { name: a.name, id: ARTIST_ID.test(a.id || "") ? a.id : null };
+    return t.channel ? { name: t.channel, id: null } : null;
+  }
+
+  async function loadBlocklist() {
+    try {
+      const list = await api("/api/blocklist");
+      if (Array.isArray(list)) state.blocked = list;
+    } catch { /* keep the last list */ }
+    if (!$("#status-sheet").hidden) renderStatus();
+    if (!$("#hidden-sheet").hidden) renderHidden();
+  }
+
+  async function hideArtist(a) {
+    if (!a?.name) return;
+    try {
+      await api("/api/blocklist", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(a.id ? { name: a.name, id: a.id } : { name: a.name }),
+      });
+    } catch (e) {
+      toast(`Couldn't hide: ${e.message}`);
+      return;
+    }
+    toast(`Hidden “${a.name}”`);
+    blockedChanged(a);
+  }
+
+  async function unhideArtists(list) {
+    list = (list || []).filter((a) => a && (a.id || a.name));
+    if (!list.length) return;
+    for (const a of list) {
+      const q = new URLSearchParams();
+      if (a.id) q.set("id", a.id);
+      if (a.name) q.set("name", a.name);
+      try {
+        await api(`/api/blocklist?${q}`, { method: "DELETE" });
+      } catch (e) {
+        if (e.status !== 404) { toast(`Couldn't unhide: ${e.message}`); blockedChanged(null); return; }
+      }
+    }
+    toast(`Unhid “${list.map((a) => a.name).filter(Boolean).join(", ")}”`);
+    blockedChanged(null);
+  }
+
+  function toggleArtistHidden() {
+    const a = pageData();
+    if (!a || detail.kind !== "artist") return;
+    const who = { id: a.id, name: a.name };
+    a.blocked = !a.blocked; // flip at once; the refetch confirms
+    renderDetail();
+    if (a.blocked) hideArtist(who); else unhideArtists([who]);
+  }
+
+  // The blocklist changed: what's on screen drops (hide) or may regain (unhide) their songs.
+  function blockedChanged(hid) {
+    for (const e of detail.cache.values()) e.at = 0; // any page may hold their songs: refetch on the next visit
+    if (hid) {
+      if (state.results.some((t) => byArtist(t, hid))) {
+        state.results = state.results.filter((t) => !byArtist(t, hid));
+        if (state.view === "search") renderSearch();
+      }
+      const d = pageData();
+      if (detail.kind === "playlist" && d?.tracks) d.tracks = d.tracks.filter((t) => !byArtist(t, hid));
+    } else if (state.query && !state.link && !state.searching) {
+      refetchSearch();
+    }
+    if (state.view === "detail") { renderDetail(); loadPage(detail.key, { force: true }); }
+    loadBlocklist();
+  }
+
+  // Re-run the current search in place (no skeleton, no navigation), e.g. after an artist was unhidden.
+  async function refetchSearch() {
+    const q = state.query, seq = ++searchSeq;
+    try {
+      const r = await api(`/api/search?q=${encodeURIComponent(q)}&src=${encodeURIComponent(currentSource())}`);
+      if (seq !== searchSeq || !Array.isArray(r)) return;
+      state.results = r;
+      noteKept(r);
+      if (state.view === "search") renderSearch();
+    } catch { /* keep what's shown */ }
+  }
+
+  function renderHidden() {
+    const list = state.blocked;
+    $("#hidden-list").innerHTML = list == null
+      ? '<div class="sk-row"><div class="sk a"></div><div class="sk l"></div></div>'.repeat(2)
+      : !list.length
+        ? emptyState("hide", "No hidden artists", "Hide an artist from a song's ⋯ menu to keep them out of search, radio and playlists.")
+        : `<ul class="rows">${list.map((e) => `<li class="row hid-row">
+            <span class="hid-ic">${icon("person")}</span>
+            <span class="row-text">${ARTIST_ID.test(e.id || "")
+              ? `<a class="row-t" href="#artist/${encodeURIComponent(e.id)}">${esc(e.name)}</a>` : `<span class="row-t">${esc(e.name)}</span>`}
+              <span class="row-s">Hidden ${esc(timeAgo(e.at))}</span></span>
+            <button class="chip sm" data-unhide="${esc(e.id || "")}" data-name="${esc(e.name)}" aria-label="Unhide ${esc(e.name)}">Unhide</button>
+          </li>`).join("")}</ul>`;
+  }
+
+  function openHidden() {
+    closeSheet("#status-sheet");
+    renderHidden();
+    openSheet("#hidden-sheet");
+    loadBlocklist();
+  }
+
+  const RENDER = { home: renderHome, search: renderSearch, kept: renderKept, downloads: renderDownloads, detail: renderDetail };
 
   function renderBadges() {
     const n = state.jobs.filter((j) => ACTIVE.includes(j.status)).length;
@@ -576,24 +1034,91 @@
   }
 
   // ---------- routing ----------
+  // Main views #home #search #kept #downloads; browse pages (#album/<id>, #artist/<id>, #playlist/<id>,
+  // #mood/<params>, #moods) show in #view-detail on top of the main view they were opened from, whose tab
+  // and bottom bar stay. Every history entry carries {reef: depth, parent}: depth > 0 means Back has an
+  // in-app page to return to, and each depth's scroll position comes back on back / forward (iOS edge swipe).
+  const DETAIL_RE = /^(album|artist|playlist|mood)\/(.+)$/;
+  let navDepth = 0, navReplace = false, routeKey = "";
+  const scrollAt = new Map(); // history depth -> scrollY
+  if ("scrollRestoration" in history) history.scrollRestoration = "manual";
+
+  function parseHash() {
+    const h = location.hash.slice(1);
+    if (VIEWS.includes(h)) return { view: h, key: h };
+    if (h === "moods") return { view: "detail", kind: "moods", id: "", key: "moods" };
+    const m = DETAIL_RE.exec(h);
+    if (m) {
+      let id = "";
+      try { id = decodeURIComponent(m[2]); } catch { /* malformed escape */ }
+      if (id) return { view: "detail", kind: m[1], id, key: `${m[1]}/${id}` };
+    }
+    return { view: "home", key: "home" };
+  }
+
+  // True when the entry was visited before (back / forward / reload); a new one gets the next depth.
+  function trackNav() {
+    const hs = history.state;
+    if (hs && typeof hs.reef === "number") { navDepth = hs.reef; return true; }
+    if (navReplace) { navReplace = false; return false; } // goBack()'s replace keeps the depth
+    navDepth += 1;
+    for (const k of [...scrollAt.keys()]) if (k >= navDepth) scrollAt.delete(k);
+    return false;
+  }
+
   function route() {
-    const v = location.hash.slice(1);
-    const view = VIEWS.includes(v) ? v : "home";
-    const changed = view !== state.view;
-    state.view = view;
-    document.body.dataset.view = view;
-    $$(".view").forEach((s) => { s.hidden = s.id !== `view-${view}`; });
-    $$(".tab").forEach((t) => t.classList.toggle("active", t.dataset.view === view));
-    if (view === "home" && state.homeTab === "library" && state.library === null) loadLibrary();
-    RENDER[view]();
-    if (changed) window.scrollTo(0, 0);
-    if ($("#np").classList.contains("open") && changed) closeNP();
+    const r = parseHash();
+    const hs = history.state;
+    const visited = trackNav();
+    if (r.view !== "detail") state.parent = r.view;
+    else if (visited && VIEWS.includes(hs?.parent)) state.parent = hs.parent;
+    else if (VIEWS.includes(state.view)) state.parent = state.view; // opened from a main view (else: from a page, same parent)
+    if (hs?.reef !== navDepth || hs?.parent !== state.parent) {
+      try { history.replaceState({ ...(hs || {}), reef: navDepth, parent: state.parent }, ""); } catch { /* ignore */ }
+    }
+    const changed = r.key !== routeKey;
+    routeKey = r.key;
+    state.view = r.view;
+    const tab = r.view === "detail" ? state.parent : r.view;
+    document.body.dataset.view = tab;
+    document.body.classList.toggle("in-detail", r.view === "detail");
+    $$(".view").forEach((s) => { s.hidden = s.id !== `view-${r.view}`; });
+    $$(".tab").forEach((t) => t.classList.toggle("active", t.dataset.view === tab));
+    const y = visited ? scrollAt.get(navDepth) || 0 : 0;
+    if (r.view === "detail") {
+      if (changed) Object.assign(detail, { kind: r.kind, id: r.id, key: r.key, about: false });
+      detail.restore = changed ? y : null; // applied once the page has content
+      renderDetail();
+      loadPage(r.key);
+    } else {
+      if (r.view === "home" && state.homeTab === "library" && state.library === null) loadLibrary();
+      RENDER[r.view]();
+      if (changed) window.scrollTo(0, y);
+    }
+    syncTopTitle();
+    if (changed) {
+      if (npOpen()) closeNP();
+      $$(".sheet-wrap.open").forEach((w) => closeSheet(w));
+    }
+  }
+
+  // The header's back button: the previous in-app page, else (opened from a link) the parent view.
+  function goBack() {
+    if (navDepth > 0) { history.back(); return; }
+    navReplace = true;
+    location.replace(`#${state.parent}`);
+  }
+  // Go to a route; already there, just close the player / sheets on top of it.
+  function openRoute(hash) {
+    if (location.hash === hash) { if (npOpen()) closeNP(); return; }
+    location.hash = hash;
   }
 
   // ---------- data ----------
   async function loadHistory() {
     try { state.history = await api("/api/history"); } catch { /* keep previous */ }
-    if (state.view !== "search") RENDER[state.view]();
+    // Search and browse pages only need their + buttons updated (a re-render would reset their scrollers).
+    if (state.view !== "search" && state.view !== "detail") RENDER[state.view]();
     refreshKeepButtons();
     updatePlayer();
   }
@@ -699,6 +1224,7 @@
         if (seq !== searchSeq) return;
         state.results = r;
       }
+      noteKept(state.results);
     } catch (e) {
       if (seq !== searchSeq) return;
       state.results = [];
@@ -786,9 +1312,9 @@
     load();
   }
 
-  // "Now playing from …": a pasted playlist shows its own name.
-  const fromLabel = (listName) => (listName === "results" && state.link?.kind === "playlist"
-    ? state.link.title || "Playlist" : FROM[listName] || "");
+  // "Now playing from …": a pasted playlist and a browse page show their own name.
+  const fromLabel = (listName) => (listName === "page" ? pageTitle()
+    : listName === "results" && state.link?.kind === "playlist" ? state.link.title || "Playlist" : FROM[listName] || "");
 
   function rememberPlay(t) {
     store.set("plays", [slim(t), ...store.get("plays", []).filter((p) => p.id !== t.id)].slice(0, 12));
@@ -1054,6 +1580,7 @@
     }
     $("#np-t").textContent = t.title;
     $("#np-s").textContent = t.channel;
+    $("#np-s").disabled = !linkable(t).length; // tapping the artist opens their page
     $("#np-from").textContent = state.from;
     const yt = srcKey(t.id) === "yt";
     $("#np-yt").style.visibility = yt ? "" : "hidden"; // keeps the header centered
@@ -1504,11 +2031,13 @@
     if (s === "kept") { toast("Already in your library"); return; }
     if (s === "pending") { location.hash = "#downloads"; return; }
     const t = (lists[listName]?.() || []).find((x) => x.id === id) || state.queue.find((x) => x.id === id) || { id, title: "" };
+    // From an album page, the keep carries the album's tags (as Keep album does).
+    const hints = listName === "page" && detail.kind === "album" ? albumHints(t, pageData()) : {};
     try {
       const job = await api("/api/download", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ id, title: t.title, channel: t.channel || "" }),
+        body: JSON.stringify({ id, title: t.title, channel: t.channel || "", ...hints }),
       });
       state.jobs.unshift(job);
       refreshKeepButtons();
@@ -1562,11 +2091,14 @@
       ["yt-dlp", h?.ytdlp || "—", ""],
       ["Web player", navidromeUrl("/app"), ""],
     ];
-    $("#status-list").innerHTML = rows.map(([k, v, c]) => `<li><span class="k">${esc(k)}</span><span class="v ${c}">${esc(v)}</span></li>`).join("");
+    const n = state.blocked?.length;
+    $("#status-list").innerHTML = rows.map(([k, v, c]) => `<li><span class="k">${esc(k)}</span><span class="v ${c}">${esc(v)}</span></li>`).join("")
+      + `<li class="st-link"><button data-open-hidden><span class="k">Hidden artists</span><span class="v">${n == null ? "" : n}${icon("chev-right")}</span></button></li>`;
   }
   async function openStatus() {
     renderStatus();
     openSheet("#status-sheet");
+    loadBlocklist();
     await loadHealth();
     renderStatus();
   }
@@ -1626,9 +2158,17 @@
       : ks === "pending" ? item("keep", "download", "Keeping…")
       : canKeep(t.id) ? item("keep", "plus", "Keep in library") : "";
     const radioItem = srcKey(t.id) === "yt" ? item("radio", "radio", "Start radio") : "";
-    $("#act-menu").innerHTML = item("next", "play-next", "Play next") + item("queue", "queue-add", "Add to queue") + radioItem + keepItem + item("share", "share", "Share");
+    // One "Go to artist", or one per artist ("Go to Daft Punk", "Go to Pharrell Williams") when there are several.
+    const as = linkable(t).slice(0, 4);
+    const artistItems = as.length === 1 ? item("artist", "person", "Go to artist", ` data-arg="${esc(as[0].id)}"`)
+      : as.map((a) => item("artist", "person", `Go to ${esc(a.name)}`, ` data-arg="${esc(a.id)}"`)).join("");
+    const albumItem = ALBUM_ID.test(t.album_id || "") ? item("album", "disc", "Go to album", ` data-arg="${esc(t.album_id)}"`) : "";
+    const ha = hideTarget(t);
+    const hideItem = ha ? item("hide", "hide", as.length > 1 ? `Hide ${esc(ha.name)}` : "Hide artist") : "";
+    $("#act-menu").innerHTML = item("next", "play-next", "Play next") + item("queue", "queue-add", "Add to queue") + radioItem + keepItem
+      + artistItems + albumItem + item("share", "share", "Share") + hideItem;
   }
-  function runAction(act) {
+  function runAction(act, arg) {
     const a = actTarget;
     closeSheet("#act-sheet");
     if (!a) return;
@@ -1636,6 +2176,9 @@
     else if (act === "keep") keep(a.t.id, a.list);
     else if (act === "share") share(a.t);
     else if (act === "radio") startRadio(a.t);
+    else if (act === "artist" && arg) openRoute(`#artist/${encodeURIComponent(arg)}`);
+    else if (act === "album" && arg) openRoute(`#album/${encodeURIComponent(arg)}`);
+    else if (act === "hide") hideArtist(hideTarget(a.t));
   }
 
   // ---------- queue sheet ----------
@@ -1654,11 +2197,12 @@
       <button class="chip sm${autoplay.on ? " on" : ""}" data-q-mode="autoplay" aria-pressed="${autoplay.on}">${icon("infinity")}Autoplay</button>`;
   }
   function qRow(t, i, now) {
-    const body = `<span class="row-art">${art(t.id)}${now ? eqIfPlaying(t.id) : ""}</span>
-      <span class="row-text"><span class="row-t">${esc(t.title)}</span><span class="row-s">${trackSub(t)}</span></span>`;
+    const sub = `<span class="row-s">${trackSub(t)}</span>`;
     return now
-      ? `<li class="row playing" data-track="${esc(t.id)}"><span class="row-main">${body}</span></li>`
-      : `<li class="row q-row"><button class="row-main" data-q-jump="${i}" aria-label="Play ${esc(t.title)}">${body}</button>
+      ? `<li class="row playing" data-track="${esc(t.id)}"><span class="row-main"><span class="row-art">${art(t.id)}${eqIfPlaying(t.id)}</span>
+          <span class="row-text"><span class="row-t">${esc(t.title)}</span>${sub}</span></span></li>`
+      : `<li class="row trk q-row"><span class="row-art">${art(t.id)}</span>
+          <span class="row-text"><button class="row-hit" data-q-jump="${i}" aria-label="Play ${esc(t.title)}"><span class="row-t">${esc(t.title)}</span></button>${sub}</span>
           <button class="icon-btn sm" data-q-remove="${i}" aria-label="Remove ${esc(t.title)} from queue">${icon("x")}</button></li>`;
   }
   function renderQueue() {
@@ -1690,12 +2234,30 @@
 
   // ---------- events ----------
   document.addEventListener("click", (e) => {
-    const t = e.target.closest("[data-keep],[data-play],[data-search],[data-source],[data-home-tab],[data-filter],[data-dismiss],[data-play-all],[data-shuffle-all],[data-close],[data-clear-finished],[data-clear-searches],[data-more],[data-act],[data-q-jump],[data-q-remove],[data-q-clear],[data-q-mode],[data-sleep],[data-fill]");
+    const t = e.target.closest("[data-keep],[data-play],[data-search],[data-source],[data-home-tab],[data-filter],[data-dismiss],[data-play-all],[data-shuffle-all],[data-close],[data-clear-finished],[data-clear-searches],[data-more],[data-act],[data-q-jump],[data-q-remove],[data-q-clear],[data-q-mode],[data-sleep],[data-fill],[data-keep-all],[data-retry],[data-page-radio],[data-artist-hide],[data-unhide],[data-unhide-page],[data-open-hidden],[data-about]");
     if (!t) return;
     const d = t.dataset;
     if ("keep" in d) { e.preventDefault(); if (d.keep) keep(d.keep, d.list); return; }
     if ("more" in d) { openActions(d.more, d.list, Number(d.i)); return; }
-    if ("act" in d) { if (!t.disabled) runAction(d.act); return; }
+    if ("act" in d) { if (!t.disabled) runAction(d.act, d.arg); return; }
+    if ("keepAll" in d) { keepAll(); return; }
+    if ("retry" in d) { detail.errors.delete(detail.key); renderDetail(); loadPage(detail.key, { force: true }); return; }
+    if ("pageRadio" in d) { const s = pageTracks()[0]; if (s) startRadio(s); return; }
+    if ("artistHide" in d) { toggleArtistHidden(); return; }
+    if ("unhidePage" in d) {
+      const a = pageData();
+      if (a) unhideArtists(detail.kind === "artist" ? [{ id: a.id, name: a.name }] : a.artists || []);
+      return;
+    }
+    if ("unhide" in d) { unhideArtists([{ id: d.unhide, name: d.name }]); return; }
+    if ("openHidden" in d) { openHidden(); return; }
+    if ("about" in d) {
+      detail.about = !detail.about;
+      $("#about")?.classList.toggle("clamp", !detail.about);
+      t.textContent = detail.about ? "Less" : "More";
+      t.setAttribute("aria-expanded", String(detail.about));
+      return;
+    }
     if ("qJump" in d) { jumpTo(Number(d.qJump)); return; }
     if ("qRemove" in d) { removeFromQueue(Number(d.qRemove)); return; }
     if ("qClear" in d) { clearUpcoming(); return; }
@@ -1748,7 +2310,11 @@
 
   $("#search-bar").addEventListener("submit", (e) => { e.preventDefault(); runSearch($("#q").value); });
   $("#q").addEventListener("input", () => { $("#q-clear").hidden = !$("#q").value; suggest(); });
-  $("#q").addEventListener("focus", () => { document.body.classList.add("typing"); setTimeout(fitSuggest, 350); });
+  $("#q").addEventListener("focus", () => {
+    document.body.classList.add("typing");
+    if (state.view === "detail") location.hash = "#search"; // a page opened from Search: typing goes back to searching
+    setTimeout(fitSuggest, 350);
+  });
   $("#q").addEventListener("blur", () => { document.body.classList.remove("typing"); fitSuggest(); });
   // Keep the keyboard up when ↖ is tapped: don't let the button take focus from the box.
   $("#view-search").addEventListener("mousedown", (e) => { if (e.target.closest("[data-fill]")) e.preventDefault(); });
@@ -1780,6 +2346,11 @@
   $("#np-shuffle").addEventListener("click", toggleShuffle);
   $("#np-repeat").addEventListener("click", cycleRepeat);
   $("#status-btn").addEventListener("click", openStatus);
+  $("#top-back").addEventListener("click", goBack);
+  $("#np-s").addEventListener("click", () => {
+    const a = linkable(cur())[0];
+    if (a) openRoute(`#artist/${encodeURIComponent(a.id)}`);
+  });
   document.addEventListener("keydown", (e) => {
     if (e.key !== "Escape") return;
     if (topSheet()) closeSheet(topSheet());
@@ -1787,7 +2358,11 @@
   });
 
   const top = $("#top");
-  window.addEventListener("scroll", () => top.classList.toggle("scrolled", window.scrollY > 4), { passive: true });
+  window.addEventListener("scroll", () => {
+    top.classList.toggle("scrolled", window.scrollY > 4);
+    scrollAt.set(navDepth, window.scrollY);
+    if (state.view === "detail") syncTopTitle();
+  }, { passive: true });
   window.addEventListener("hashchange", route);
 
   // ---------- boot ----------
@@ -1796,7 +2371,8 @@
   // Share target / deep links: /?link=<url>#search or /?q=<text>#search. Drop the query string first.
   const bootArgs = new URLSearchParams(location.search);
   const bootLink = bootArgs.get("link")?.trim(), bootQ = bootArgs.get("q")?.trim();
-  if (location.search) history.replaceState(null, "", location.pathname + (bootLink || bootQ ? "#search" : location.hash));
+  if (location.search) history.replaceState({ reef: 0 }, "", location.pathname + (bootLink || bootQ ? "#search" : location.hash));
+  else if (typeof history.state?.reef !== "number") history.replaceState({ reef: 0 }, ""); // the app's first entry
   route();
   if (bootLink) runSearch(bootLink, { link: true });
   else if (bootQ) runSearch(bootQ);

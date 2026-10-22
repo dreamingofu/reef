@@ -10,3 +10,7 @@ __pycache__/
 .playwright-cli/
 lyrics.json
 lyrics.json.tmp
+browse.json
+browse.json.tmp
+blocklist.json
+blocklist.json.tmp

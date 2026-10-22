@@ -31,6 +31,8 @@ DOWNLOAD_DIR = MUSIC_DIR / os.environ.get("REEF_SUBFOLDER", "Reef")
 TMP_DIR = Path(os.environ.get("REEF_TMP_DIR") or BASE_DIR / "tmp")
 HISTORY_FILE = Path(os.environ.get("REEF_HISTORY_FILE") or BASE_DIR / "history.json")
 TILES_FILE = BASE_DIR / "tiles.json"
+# YouTube Music moods & genres and their artwork, so a restart doesn't refetch them (git-ignored).
+BROWSE_FILE = Path(os.environ.get("REEF_BROWSE_FILE") or BASE_DIR / "browse.json")
 AUDIO_FORMAT = os.environ.get("REEF_AUDIO_FORMAT", "opus")
 SEARCH_LIMIT = int(os.environ.get("REEF_SEARCH_LIMIT", "10"))
 NAVIDROME_URL = os.environ.get("REEF_NAVIDROME_URL", "http://127.0.0.1:4533").rstrip("/")
@@ -54,6 +56,8 @@ SPONSORBLOCK = os.environ.get("REEF_SPONSORBLOCK", "0").strip() == "1"
 LYRICS_FILE = Path(os.environ.get("REEF_LYRICS_FILE") or HISTORY_FILE.with_name("lyrics.json"))
 # Also write synced lyrics as a `<file>.lrc` sidecar next to each kept track (the tag alone is enough for Navidrome).
 LRC_SIDECAR = os.environ.get("REEF_LRC_SIDECAR", "0").strip() == "1"
+# Blocked artists, hidden from search, radio, playlists and album pages. Defaults next to history.json.
+BLOCKLIST_FILE = Path(os.environ.get("REEF_BLOCKLIST_FILE") or HISTORY_FILE.with_name("blocklist.json"))
 # Search, suggestions, radio and link metadata via YouTube Music (ytmusicapi, anonymous).
 # 0 = yt-dlp search only (no suggestions or radio).
 YTMUSIC = os.environ.get("REEF_YTMUSIC", "1").strip() != "0"

@@ -64,8 +64,9 @@ def fake(monkeypatch):
     f = FakeYT()
     monkeypatch.setattr(config, "YTMUSIC", True)
     monkeypatch.setattr(ytmusic, "_yt", f)
-    ytmusic._suggest_cache.clear()
-    ytmusic._radio_cache.clear()
+    for cache in (ytmusic._suggest_cache, ytmusic._radio_cache, ytmusic._album_cache, ytmusic._playlist_cache,
+                  ytmusic._artist_cache, ytmusic._mood_cache):
+        cache.clear()
     with ytmusic._art_lock:
         ytmusic._art.clear()
     return f
@@ -155,12 +156,13 @@ def test_song_prefers_video_details_then_watch(fake, monkeypatch):
 
 
 def test_playlist_album_and_mix(fake):
-    title, tracks = ytmusic.playlist("PLxxxxxxxxxxxx")
-    assert title == "Mix" and [t["id"] for t in tracks] == ["ccccccccccc"]
-    title, tracks = ytmusic.playlist("RDAMVMdQw4w9WgXcQ")
-    assert title is None and fake.calls[-1][2]["playlistId"] == "RDAMVMdQw4w9WgXcQ"
-    title, tracks = ytmusic.album("MPREb_7ltM34kr0mH")
-    assert title == "Discovery"
+    page = ytmusic.playlist("PLxxxxxxxxxxxx")
+    assert page["title"] == "Mix" and [t["id"] for t in page["tracks"]] == ["ccccccccccc"]
+    page = ytmusic.playlist("RDAMVMdQw4w9WgXcQ")
+    assert page["title"] is None and fake.calls[-1][2]["playlistId"] == "RDAMVMdQw4w9WgXcQ"
+    page = ytmusic.album("MPREb_7ltM34kr0mH")
+    assert page["title"] == "Discovery"
+    tracks = page["tracks"]
     assert tracks[0]["album"] == "Discovery" and tracks[0]["album_id"] == "MPREb_7ltM34kr0mH"
     assert tracks[0]["thumb"] == SQ + "=w544-h544-l90-rj" and tracks[0]["duration"] == 321
 

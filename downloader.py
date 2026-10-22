@@ -11,7 +11,7 @@ import requests
 import yt_dlp
 from mutagen import File as MutagenFile
 from mutagen.flac import FLAC, Picture
-from mutagen.id3 import APIC, ID3, TALB, TIT2, TPE1
+from mutagen.id3 import APIC, ID3, TALB, TDRC, TIT2, TPE1, TPE2, TRCK
 from mutagen.mp3 import MP3
 from mutagen.mp4 import MP4, MP4Cover
 from mutagen.ogg import OggFileType
@@ -29,7 +29,7 @@ import navidrome
 import sources
 import streamer
 from config import AUDIO_FORMAT, DOWNLOAD_DIR, TMP_DIR
-from tagging import music_tags
+from tagging import music_tags, with_hints
 
 ACTIVE = ("queued", "downloading", "converting")
 
@@ -38,13 +38,15 @@ _queue = queue.Queue()
 _lock = threading.Lock()
 
 
-def _new_job(track_id, title, channel):
+def _new_job(track_id, title, channel, hints=None):
     return {
         "id": uuid.uuid4().hex[:8],
         "video_id": track_id,  # the full track id ("mc:..." for non-YouTube sources); name kept for the client
         "source": sources.parse(track_id)[0],
         "title": title,
         "channel": channel,
+        # Album-page tags ({album, album_artist, track_number, year}, all optional) that override yt-dlp's.
+        "hints": dict(hints or {}),
         "status": "queued",
         "percent": 0,
         "file": None,
@@ -54,22 +56,22 @@ def _new_job(track_id, title, channel):
     }
 
 
-def enqueue(track_id, title="", channel=""):
-    job = _new_job(track_id, title, channel)
+def enqueue(track_id, title="", channel="", hints=None):
+    job = _new_job(track_id, title, channel, hints)
     with _lock:
         _jobs[job["id"]] = job
     _queue.put(job["id"])
     return job
 
 
-def enqueue_unique(track_id, title="", channel=""):
+def enqueue_unique(track_id, title="", channel="", hints=None):
     """(job, created): the track's keep that is still running, else a new queued one. Check and insert
     happen under one lock, so two quick taps can't start two keeps writing the same file."""
     with _lock:
         job = next((j for j in _jobs.values() if j["video_id"] == track_id and j["status"] in ACTIVE), None)
         if job:
             return job, False
-        job = _new_job(track_id, title, channel)
+        job = _new_job(track_id, title, channel, hints)
         _jobs[job["id"]] = job
     _queue.put(job["id"])
     return job, True
@@ -91,9 +93,17 @@ def remove(job_id):
 
 # ---------- yt-dlp keep path ----------
 
+def _tags(info, hints):
+    return with_hints(music_tags(info), hints)
+
+
 class _MusicTagsPP(PostProcessor):
+    def __init__(self, downloader=None, hints=None):
+        super().__init__(downloader)
+        self.hints = hints or {}
+
     def run(self, info):
-        info.update(music_tags(info))
+        info.update(_tags(info, self.hints))
         return [], info
 
 
@@ -189,10 +199,10 @@ def _options(job):
     return opts
 
 
-def _custom_pps(ydl):
+def _custom_pps(ydl, hints=None):
     """(postprocessor, when) pairs that need our own classes, so they can't go in the options dict."""
     # add_post_processor appends, so the crop lands after the options' FFmpegThumbnailsConvertor (before_dl).
-    pps = [(_MusicTagsPP(ydl), "pre_process"), (_SquareCoverPP(ydl), "before_dl")]
+    pps = [(_MusicTagsPP(ydl, hints), "pre_process"), (_SquareCoverPP(ydl), "before_dl")]
     if config.SPONSORBLOCK:
         pps.append((_SafeSponsorBlockPP(ydl, categories=SPONSOR_CATEGORIES), "after_filter"))
     return pps
@@ -200,23 +210,24 @@ def _custom_pps(ydl):
 
 def _run_ytdlp(job):
     with yt_dlp.YoutubeDL(_options(job)) as ydl:
-        for pp, when in _custom_pps(ydl):
+        for pp, when in _custom_pps(ydl, job.get("hints")):
             ydl.add_post_processor(pp, when=when)
         info = ydl.extract_info(f"https://www.youtube.com/watch?v={job['video_id']}", download=True)
     requested = (info.get("requested_downloads") or [{}])[0]
     job["file"] = requested.get("filepath")
     job["title"] = info.get("title") or job["title"]
     job["percent"] = 100
+    # What the file was tagged with (_MusicTagsPP is deterministic); the post steps look lyrics up by it.
+    tags = _tags(info, job.get("hints"))
     history.add({
         "id": job["video_id"],
         "title": job["title"],
         "channel": info.get("channel") or info.get("uploader") or "",
         "duration": info.get("duration"),
         "thumb": f"https://i.ytimg.com/vi/{job['video_id']}/mqdefault.jpg",
+        "album": tags.get("meta_album") or "",
         "file": job["file"],
     })
-    # What the file was tagged with (_MusicTagsPP is deterministic); the post steps look lyrics up by it.
-    tags = music_tags(info)
     return {"title": tags.get("meta_title") or job["title"], "artist": tags.get("meta_artist") or "",
             "album": tags.get("meta_album") or "", "duration": _length(job["file"]) or info.get("duration")}
 
@@ -303,7 +314,7 @@ def _cover_bytes(src, native):
         return None, None
 
 
-def _tag(path, title, artist, album, cover, cover_mime, isrc=""):
+def _tag(path, title, artist, album, cover, cover_mime, isrc="", album_artist="", track=None, year=None):
     f = MutagenFile(path)
     if f is None:
         return
@@ -318,6 +329,12 @@ def _tag(path, title, artist, album, cover, cover_mime, isrc=""):
             t.setall("TPE1", [TPE1(encoding=3, text=artist)])
         if album:
             t.setall("TALB", [TALB(encoding=3, text=album)])
+        if album_artist:
+            t.setall("TPE2", [TPE2(encoding=3, text=album_artist)])
+        if track:
+            t.setall("TRCK", [TRCK(encoding=3, text=str(track))])
+        if year:
+            t.setall("TDRC", [TDRC(encoding=3, text=str(year))])
         if cover:
             t.setall("APIC", [APIC(encoding=3, mime=cover_mime, type=3, desc="Cover", data=cover)])
     elif isinstance(f, MP4):
@@ -328,6 +345,12 @@ def _tag(path, title, artist, album, cover, cover_mime, isrc=""):
             f.tags["\xa9ART"] = [artist]
         if album:
             f.tags["\xa9alb"] = [album]
+        if album_artist:
+            f.tags["aART"] = [album_artist]
+        if track:
+            f.tags["trkn"] = [(int(track), 0)]
+        if year:
+            f.tags["\xa9day"] = [str(year)]
         if cover:
             fmt = MP4Cover.FORMAT_PNG if cover_mime == "image/png" else MP4Cover.FORMAT_JPEG
             f.tags["covr"] = [MP4Cover(cover, imageformat=fmt)]
@@ -339,6 +362,12 @@ def _tag(path, title, artist, album, cover, cover_mime, isrc=""):
             f["artist"] = [artist]
         if album:
             f["album"] = [album]
+        if album_artist:
+            f["albumartist"] = [album_artist]
+        if track:
+            f["tracknumber"] = [str(track)]
+        if year:
+            f["date"] = [str(year)]
         if isrc:
             f["isrc"] = [isrc]
         if cover:
@@ -362,7 +391,8 @@ def _run_generic(job):
     info = src.info(native, {"title": job["title"], "artist": job.get("channel") or ""}) or {}
     title = info.get("title") or job["title"] or native
     artist = info.get("artist") or job.get("channel") or ""
-    album = info.get("album") or ""
+    hints = job.get("hints") or {}
+    album = hints.get("album") or info.get("album") or ""
     job["title"] = title
 
     entry = streamer.resolve(job["video_id"])
@@ -375,7 +405,8 @@ def _run_generic(job):
         job["status"] = "converting"
         _convert(raw, entry.get("ext"), out)
         cover, cover_mime = _cover_bytes(src, native)
-        _tag(out, title, artist, album, cover, cover_mime, info.get("isrc") or "")
+        _tag(out, title, artist, album, cover, cover_mime, info.get("isrc") or "",
+             hints.get("album_artist") or "", hints.get("track_number"), hints.get("year"))
         length = _length(out)
         dest = DOWNLOAD_DIR / f"{_filename(title)}.{ext}"
         part = dest.with_name(dest.name + ".part")

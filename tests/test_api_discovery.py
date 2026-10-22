@@ -43,8 +43,8 @@ def offline(monkeypatch):
 
     calls.rec = lambda name, result, mod=ytmusic: monkeypatch.setattr(mod, name, rec(name, result))
     calls.rec("song", lambda: track(RICK, title="Never Gonna Give You Up"))
-    calls.rec("playlist", lambda: ("Mix", [track("aaaaaaaaaaa"), track("bbbbbbbbbbb")]))
-    calls.rec("album", lambda: ("Discovery", [track("ccccccccccc", album="Discovery")]))
+    calls.rec("playlist", lambda: {"title": "Mix", "tracks": [track("aaaaaaaaaaa"), track("bbbbbbbbbbb")]})
+    calls.rec("album", lambda: {"title": "Discovery", "tracks": [track("ccccccccccc", album="Discovery")]})
     calls.rec("suggestions", lambda: ["daft punk", "daft punk one more time"])
     calls.rec("radio", lambda: [track(RICK), track("aaaaaaaaaaa"), track("bbbbbbbbbbb"), track("ccccccccccc")])
     calls.rec("lookup", lambda: track(RICK, title="via yt-dlp"), sources.youtube)
@@ -187,21 +187,21 @@ def test_link_unresolvable_video_404(client, offline):
 
 
 def test_link_playlist_drops_missing_items(client, offline):
-    offline.rec("playlist", lambda: ("Mix", [None, track("aaaaaaaaaaa"), None]))
+    offline.rec("playlist", lambda: {"title": "Mix", "tracks": [None, track("aaaaaaaaaaa"), None]})
     body = link(client, "https://www.youtube.com/playlist?list=PLabcdefghijkl12").get_json()
     assert [t["id"] for t in body["tracks"]] == ["aaaaaaaaaaa"]
-    offline.rec("album", lambda: ("Discovery", [track("ccccccccccc"), None]))
+    offline.rec("album", lambda: {"title": "Discovery", "tracks": [track("ccccccccccc"), None]})
     body = link(client, "https://music.youtube.com/browse/MPREb_7ltM34kr0mH").get_json()
     assert [t["id"] for t in body["tracks"]] == ["ccccccccccc"]
 
 
 @pytest.mark.parametrize("ytm,flat", [([], []), ([], [None]), ([None], [])])
 def test_link_empty_playlist_404(client, offline, ytm, flat):
-    offline.rec("playlist", lambda: ("Mix", ytm))
+    offline.rec("playlist", lambda: {"title": "Mix", "tracks": ytm})
     offline.rec("playlist_flat", lambda: ("Flat", flat), sources.youtube)
     r = link(client, "https://www.youtube.com/playlist?list=PLabcdefghijkl12")
     assert r.status_code == 404 and r.get_json() == {"error": "Playlist is empty or unavailable"}
-    offline.rec("album", lambda: ("Discovery", []))
+    offline.rec("album", lambda: {"title": "Discovery", "tracks": []})
     assert link(client, "https://music.youtube.com/browse/MPREb_7ltM34kr0mH").status_code == 404
     assert offline.prefetched == []
 

@@ -14,6 +14,7 @@ TMP = Path(tempfile.mkdtemp(prefix="reef-test-"))
 os.environ["REEF_HISTORY_FILE"] = str(TMP / "history.json")
 os.environ["REEF_MUSIC_DIR"] = str(TMP / "music")
 os.environ["REEF_TMP_DIR"] = str(TMP / "tmp")
+os.environ["REEF_BROWSE_FILE"] = str(TMP / "browse.json")  # defaults to the repo dir otherwise
 # Empty credentials: navidrome.configured() is False, so nothing talks to a real server.
 os.environ["REEF_NAVIDROME_USER"] = ""
 os.environ["REEF_NAVIDROME_PASS"] = ""

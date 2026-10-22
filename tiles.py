@@ -1,14 +1,18 @@
-"""Home "moods & genres" tiles and a daily cache of a few YouTube results per tile (for artwork)."""
+"""Home "moods & genres" tiles. With YouTube Music on they are YouTube's own moods/genres (`params` opens the
+mood page, `art` is its first playlist's cover); otherwise, or until moods were fetched once, the hard-coded
+search tiles below with a daily cache of a few result ids per tile (for artwork) in `tiles.json`."""
 import json
 import os
 import re
 import threading
 import time
 
+import blocklist
+import ytmusic
 from sources import youtube
 from config import TILES_FILE
 
-# (label, color, search query). The single source of truth; the frontend gets it via /api/tiles.
+# (label, color, search query): the fallback tiles.
 TILES = [
     ("Hits", "#d9a90a", "top hits this week"),
     ("Pop", "#e2577f", "pop hits"),
@@ -21,6 +25,12 @@ TILES = [
     ("Chill", "#2f8f9e", "chill lofi"),
     ("Throwback", "#b8336a", "2000s hits"),
 ]
+HOME_TILES = 10
+HOME_SECTIONS = ("Moods & moments", "Genres")
+# YouTube lists moods/genres alphabetically (African, Arabic, ... Diwali, Halloween); the home row leads with
+# broad ones when YouTube has them, then fills up in YouTube's order.
+PREFERRED = ("Pop", "Hip-hop", "Chill", "Dance & electronic", "Rock", "Feel good", "R&B & soul", "Latin",
+             "Workout", "Focus")
 PER_TILE = 4
 BOOT_DELAY = 5
 REFRESH_EVERY = 24 * 3600
@@ -40,19 +50,39 @@ def _cached_ids():
     }
 
 
-def load():
-    """Tiles with their cached ids (`[]` until the first refresh). Keyed by query, so edits to TILES apply at once."""
+def _search_tiles():
     ids = _cached_ids()
-    return [{"label": l, "color": c, "query": q, "ids": ids.get(q, [])} for l, c, q in TILES]
+    return [{"label": l, "color": c, "query": q, "ids": ids.get(q, []), "params": None, "art": None}
+            for l, c, q in TILES]
 
 
-def refresh():
+def _mood_tiles():
+    """Home tiles from the cached moods (no network call), or [] when YouTube Music is off or never answered.
+    `query` is the title, so a client that doesn't know `params` still gets a sensible search."""
+    if not ytmusic.enabled():
+        return []
+    moods = ytmusic.cached_moods()
+    picked = [m for m in moods if m["section"] in HOME_SECTIONS] or moods
+    rank = {t.casefold(): i for i, t in enumerate(PREFERRED)}
+    picked = sorted(picked, key=lambda m: rank.get(m["title"].casefold(), len(rank)))[:HOME_TILES]  # stable sort
+    return [{"label": m["title"], "color": m["color"], "query": m["title"], "ids": [], "params": m["params"],
+             "art": m["art"]} for m in picked]
+
+
+def load():
+    """[{label, color, query, ids, params, art}]: mood tiles when available, else the search tiles."""
+    return _mood_tiles() or _search_tiles()
+
+
+def _refresh_searches():
     start = time.monotonic()
     prev = _cached_ids()
+    blocked = blocklist.matcher()
     out, ok = [], 0
     for label, color, query in TILES:
         try:
-            ids = [r["id"] for r in youtube.SOURCE.search(query, PER_TILE) if _VIDEO_ID.match(r["id"])][:PER_TILE]
+            found = blocked.tracks(youtube.SOURCE.search(query, PER_TILE + 2))
+            ids = [r["id"] for r in found if _VIDEO_ID.match(r["id"])][:PER_TILE]
             ok += 1
         except Exception as e:
             print(f"tiles: search failed for {query!r}: {str(e)[:200]}", flush=True)
@@ -62,6 +92,20 @@ def refresh():
     tmp.write_text(json.dumps(out, ensure_ascii=False), encoding="utf-8")
     os.replace(tmp, TILES_FILE)
     print(f"tiles refreshed n={ok} ms={int((time.monotonic() - start) * 1000)}", flush=True)
+
+
+def refresh():
+    """Moods + their art when YouTube Music answers (weekly at most; a no-op most days), else the search tiles."""
+    if ytmusic.enabled():
+        start = time.monotonic()
+        try:
+            ytmusic.moods()
+            n = ytmusic.refresh_mood_art(first=[t["params"] for t in _mood_tiles()])
+            print(f"tiles: moods ok, art filled={n} ms={int((time.monotonic() - start) * 1000)}", flush=True)
+            return
+        except Exception as e:
+            print(f"tiles: moods failed, refreshing search tiles: {str(e)[:200]}", flush=True)
+    _refresh_searches()
 
 
 def _loop():

@@ -8,6 +8,7 @@ from urllib.parse import parse_qs, quote, urlsplit
 import yt_dlp
 from flask import Flask, Response, abort, jsonify, redirect, render_template, request
 
+import blocklist
 import config
 import downloader
 import history
@@ -28,6 +29,10 @@ HINT_MAX = 200
 LINK_MAX = 2048
 LIST_ID = re.compile(r"^[A-Za-z0-9_-]{12,80}$")
 ALBUM_ID = re.compile(r"^MPRE[A-Za-z0-9_-]{6,60}$")
+AUDIO_LIST_ID = re.compile(r"^OLAK5uy_[A-Za-z0-9_-]{6,60}$")  # an album's audio playlist, opens the album
+CHANNEL_ID = re.compile(r"^UC[A-Za-z0-9_-]{22}$")
+MOOD_PARAMS = re.compile(r"^[A-Za-z0-9_%=-]{8,300}$")
+BATCH_MAX = 100
 YT_HOSTS = {"youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com"}
 SHORT_HOSTS = {"youtu.be", "www.youtu.be"}
 # A YouTube link inside shared text ("Check this out https://youtu.be/... via app").
@@ -86,10 +91,13 @@ def api_search():
         return jsonify({"error": "unknown source"}), 400
     if not q:
         return jsonify([])
+    blocked = blocklist.matcher() if src.key == "yt" else blocklist.Matcher([])
     try:
-        results = src.search(q, config.SEARCH_LIMIT)
+        # Ask for extra rows while artists are blocked, so a query they dominate still fills the page.
+        results = src.search(q, config.SEARCH_LIMIT * 2 if blocked else config.SEARCH_LIMIT)
     except Exception as e:
         return jsonify({"error": str(e)[:300]}), 502
+    results = blocked.tracks(results)[:config.SEARCH_LIMIT]
     streamer.prefetch([r["id"] for r in results[:3] if _track(r["id"])])
     kept = history.ids()
     for r in results:
@@ -129,7 +137,7 @@ def api_radio(track_id):
     if not ytmusic.enabled():
         return jsonify({"error": "YouTube Music is off (REEF_YTMUSIC=0)"}), 502
     try:
-        tracks = ytmusic.radio(t[2])
+        tracks = blocklist.filter_tracks(ytmusic.radio(t[2]))
     except Exception as e:
         return jsonify({"error": str(e)[:300]}), 502
     streamer.prefetch([r["id"] for r in tracks if r["id"] != t[1]][:2])
@@ -195,9 +203,9 @@ def _link_track(video_id):
 def _link_playlist(list_id):
     if ytmusic.enabled():
         try:
-            title, tracks = ytmusic.playlist(list_id)
-            if tracks:
-                return title, tracks
+            page = ytmusic.playlist(list_id)
+            if page["tracks"]:
+                return page["title"], page["tracks"]
         except Exception as e:
             print(f"link: ytmusic playlist {list_id} failed: {str(e)[:160]!r}", flush=True)
     return sources.youtube.playlist_flat(list_id)
@@ -216,20 +224,153 @@ def api_link():
         elif kind == "album":
             if not ytmusic.enabled():
                 return jsonify({"error": "Album links need YouTube Music (REEF_YTMUSIC=1)"}), 502
-            title, tracks = ytmusic.album(parsed[1])
-            body = {"kind": "playlist", "tracks": tracks, "title": title}
+            page = ytmusic.album(parsed[1])
+            body = {"kind": "playlist", "tracks": page["tracks"], "title": page["title"]}
         else:
             title, tracks = _link_playlist(parsed[1])
             body = {"kind": "playlist", "tracks": tracks, "title": title}
     except Exception as e:
         return jsonify({"error": str(e)[:300]}), 502
     body["tracks"] = [t for t in body["tracks"] or [] if t]
+    if kind != "track":  # a pasted single track is explicit, like opening a blocked artist's page
+        body["tracks"] = blocklist.filter_tracks(body["tracks"])
     if not body["tracks"]:
         msg = "Video not found or unavailable" if kind == "track" else "Playlist is empty or unavailable"
         return jsonify({"error": msg}), 404
     _mark_kept(body["tracks"])
     streamer.prefetch([t["id"] for t in body["tracks"][:1]])
     return jsonify(body)
+
+
+# ---------- YouTube Music browse: moods, album / artist / playlist pages ----------
+
+def _ytm_off():
+    return jsonify({"error": "YouTube Music is off (REEF_YTMUSIC=0)"}), 502
+
+
+def _page(body, tracks_key="tracks"):
+    """Mark kept, warm the first track, send. Blocked tracks were already dropped (or the page is flagged)."""
+    _mark_kept(body[tracks_key])
+    streamer.prefetch([t["id"] for t in body[tracks_key][:1]])
+    return jsonify(body)
+
+
+@app.get("/api/moods")
+def api_moods():
+    """YouTube Music's moods & genres, grouped by section. A failed refetch serves the last list (`stale`)."""
+    stale = False
+    try:
+        if not ytmusic.enabled():
+            raise RuntimeError("YouTube Music is off (REEF_YTMUSIC=0)")
+        items = ytmusic.moods()
+    except Exception as e:
+        items, stale = ytmusic.cached_moods(), True
+        if not items:
+            return jsonify({"error": str(e)[:300]}), 502
+    sections = {}
+    for m in items:
+        sections.setdefault(m["section"], []).append(
+            {"title": m["title"], "params": m["params"], "color": m["color"], "art": m["art"]})
+    body = {"sections": [{"title": k, "items": v} for k, v in sections.items()]}
+    if stale:
+        body["stale"] = True
+    return jsonify(body)
+
+
+@app.get("/api/mood")
+def api_mood():
+    params = request.args.get("params", "")
+    if not MOOD_PARAMS.match(params):
+        return jsonify({"error": "invalid params"}), 400
+    if not ytmusic.enabled():
+        return _ytm_off()
+    try:
+        playlists = ytmusic.mood_playlists(params)
+    except Exception as e:
+        return jsonify({"error": str(e)[:300]}), 502
+    return jsonify({"title": ytmusic.mood_title(params), "playlists": playlists})
+
+
+@app.get("/api/album/<browse_id>")
+def api_album(browse_id):
+    """An album page. A blocked artist's album still opens (explicit navigation), flagged `blocked`;
+    other albums (compilations) drop blocked artists' tracks."""
+    if not (ALBUM_ID.match(browse_id) or AUDIO_LIST_ID.match(browse_id)):
+        abort(404)
+    if not ytmusic.enabled():
+        return _ytm_off()
+    try:
+        page = ytmusic.album(browse_id)
+    except Exception as e:
+        return jsonify({"error": str(e)[:300]}), 502
+    blocked = blocklist.matcher()
+    page["blocked"] = blocked.any_artist(page["artists"])
+    if not page["blocked"]:
+        page["tracks"] = blocked.tracks(page["tracks"])
+    return _page(page)
+
+
+@app.get("/api/artist/<channel_id>")
+def api_artist(channel_id):
+    """An artist page; a blocked artist's still loads, flagged `blocked`. Blocked related artists are hidden."""
+    if not CHANNEL_ID.match(channel_id):
+        abort(404)
+    if not ytmusic.enabled():
+        return _ytm_off()
+    try:
+        page = ytmusic.artist(channel_id)
+    except Exception as e:
+        return jsonify({"error": str(e)[:300]}), 502
+    blocked = blocklist.matcher()
+    page["blocked"] = blocked.artist(page["id"], page["name"]) or blocked.artist(page["channel_id"])
+    if not page["blocked"]:
+        page["songs"] = blocked.tracks(page["songs"])
+    page["related"] = [r for r in page["related"] if not blocked.artist(r["id"], r["name"])]
+    return _page(page, "songs")
+
+
+@app.get("/api/playlist/<list_id>")
+def api_playlist(list_id):
+    if not LIST_ID.match(list_id):
+        abort(404)
+    if not ytmusic.enabled():
+        return _ytm_off()
+    try:
+        page = ytmusic.playlist(list_id)
+    except Exception as e:
+        return jsonify({"error": str(e)[:300]}), 502
+    page["tracks"] = blocklist.filter_tracks(page["tracks"])
+    return _page(page)
+
+
+# ---------- blocked artists ----------
+
+@app.get("/api/blocklist")
+def api_blocklist():
+    return jsonify(blocklist.entries())
+
+
+@app.post("/api/blocklist")
+def api_blocklist_add():
+    """Block an artist by name (required) and channel id (optional, UC...). Re-blocking returns the entry (200)."""
+    body = request.get_json(silent=True) or {}
+    name, artist_id = body.get("name"), body.get("id") or None
+    if not isinstance(name, str) or not name.strip() or len(name) > blocklist.NAME_MAX:
+        return jsonify({"error": "name is required"}), 400
+    if artist_id is not None and not (isinstance(artist_id, str) and CHANNEL_ID.match(artist_id)):
+        return jsonify({"error": "invalid artist id"}), 400
+    entry, created = blocklist.add(artist_id, name)
+    return jsonify({"entry": entry, "created": created}), 201 if created else 200
+
+
+@app.delete("/api/blocklist")
+def api_blocklist_remove():
+    artist_id, name = request.args.get("id", "").strip(), request.args.get("name", "").strip()[:blocklist.NAME_MAX]
+    if not artist_id and not name:
+        return jsonify({"error": "id or name is required"}), 400
+    if not blocklist.remove(artist_id or None, name or None):
+        abort(404)
+    return "", 204
 
 
 @app.get("/share")
@@ -274,23 +415,89 @@ def api_stream(track_id):
         return jsonify({"error": str(e)[:300]}), 502
 
 
-@app.post("/api/download")
-def api_download():
-    body = request.get_json(silent=True) or {}
-    t = _track(str(body.get("id", "")))
+def _keep_hints(item):
+    """Album tags sent with a keep from an album page: {album?, album_artist?, track_number?, year?}.
+    {} when there are none, None when one is malformed."""
+    hints = {}
+    for key in ("album", "album_artist"):
+        v = item.get(key)
+        if v is None or v == "":
+            continue
+        if not isinstance(v, str) or len(v) > HINT_MAX:
+            return None
+        if v.strip():
+            hints[key] = v.strip()
+    n = item.get("track_number")
+    if n is not None and n != "":
+        if isinstance(n, str) and re.fullmatch(r"[0-9]{1,3}", n.strip()):
+            n = int(n)
+        if not isinstance(n, int) or isinstance(n, bool) or not 0 < n < 1000:
+            return None
+        hints["track_number"] = n
+    y = item.get("year")
+    if y is not None and y != "":
+        y = str(y) if isinstance(y, int) and not isinstance(y, bool) else y
+        if not isinstance(y, str) or not re.fullmatch(r"[0-9]{4}", y.strip()):
+            return None
+        hints["year"] = y.strip()
+    return hints
+
+
+def _keep(item, force=False):
+    """Queue one keep through the duplicate guard: (outcome, payload, http status), outcome being
+    "queued" (payload = job), "kept" (history entry), "keeping" (running job) or "invalid" (message)."""
+    t = _track(str(item.get("id", "")))
     if not t:
-        return jsonify({"error": "invalid track id"}), 400
+        return "invalid", "invalid track id", 400
     if not t[0].can_keep:
-        return jsonify({"error": f"{t[0].name} tracks are already in your library"}), 400
+        return "invalid", f"{t[0].name} tracks are already in your library", 400
+    hints = _keep_hints(item)
+    if hints is None:
+        return "invalid", "invalid album hints", 400
     # `force` re-keeps a library track (e.g. to pick up better tags), but never runs alongside a keep
     # of the same track that's still going: both would write the same file.
     entry = history.get(t[1])
-    if entry and not body.get("force") and entry.get("file") and os.path.exists(entry["file"]):
-        return jsonify({"error": "Already in your library", "entry": entry}), 409
-    job, created = downloader.enqueue_unique(t[1], str(body.get("title", ""))[:200], str(body.get("channel", ""))[:200])
-    if not created:
-        return jsonify({"error": "Already keeping", "job": job}), 409
-    return jsonify(job), 202
+    if entry and not force and entry.get("file") and os.path.exists(entry["file"]):
+        return "kept", entry, 409
+    job, created = downloader.enqueue_unique(t[1], str(item.get("title", ""))[:200],
+                                             str(item.get("channel", ""))[:200], hints)
+    return ("queued", job, 202) if created else ("keeping", job, 409)
+
+
+@app.post("/api/download")
+def api_download():
+    body = request.get_json(silent=True) or {}
+    outcome, payload, status = _keep(body, bool(body.get("force")))
+    if outcome == "invalid":
+        return jsonify({"error": payload}), status
+    if outcome == "kept":
+        return jsonify({"error": "Already in your library", "entry": payload}), status
+    if outcome == "keeping":
+        return jsonify({"error": "Already keeping", "job": payload}), status
+    return jsonify(payload), status
+
+
+@app.post("/api/download/batch")
+def api_download_batch():
+    """Keep a whole album (or any selection): each track goes through the same duplicate guard as a single keep."""
+    body = request.get_json(silent=True) or {}
+    items = body.get("tracks")
+    if not isinstance(items, list) or not items:
+        return jsonify({"error": "tracks must be a non-empty list"}), 400
+    if len(items) > BATCH_MAX:
+        return jsonify({"error": f"at most {BATCH_MAX} tracks per batch"}), 400
+    queued, skipped = [], []
+    for item in items:
+        if not isinstance(item, dict):
+            skipped.append({"id": None, "reason": "invalid"})
+            continue
+        outcome, payload, _ = _keep(item)
+        if outcome == "queued":
+            queued.append(payload)
+        else:
+            raw = item.get("id")
+            skipped.append({"id": raw[:128] if isinstance(raw, str) else None, "reason": outcome})
+    return jsonify({"queued": queued, "skipped": skipped}), 202
 
 
 @app.get("/api/jobs")
