@@ -93,6 +93,7 @@ Pass the Navidrome password through the environment. Don't put it in a committed
   (runtime overrides of env defaults) sit on it; their files default next to history.json (Round 10).
 - `scrobble.py` (ListenBrainz queue + worker), `updater.py` (version check, in-app update child), `backup.py`
   (backup / restore / daily snapshots), `health.py` (`/api/health/sources`): Round 12.
+- `matching.py` (same-song scoring + `matches.json`), `segments.py` (SponsorBlock at play time): Round 13.
 - `log.py`: logging setup (stderr + `logs/reef.log` rotated 1 MB × 5 + a 300-line in-memory tail), `redact()` for
   signed-URL params / Subsonic tokens / cookies. Modules log through `logging.getLogger(__name__)`, no print().
 - `termux/reef-run.sh`: restart loop with backoff; `termux/reef-boot.sh` (Termux:Boot) (re)starts it.
@@ -408,6 +409,101 @@ New files `scrobbles.json`, `update.json`, `backups/` (git-ignored; `REEF_SCROBB
 4. Backup: Download on iPhone Safari (saves to Files), then Restore from that file with Merge; check
    `~/reef/backups/` gets `auto-*.json` daily.
 5. Sources: the panel on cellular vs Wi-Fi, and how long the YouTube row takes on the phone.
+
+## Round 13 (2026-10-22): matching, lazy queue + dead-track recovery, SponsorBlock at play time, lossless keep (production plan P1.6-P1.9)
+
+New file `matches.json` (git-ignored; `REEF_MATCHES_FILE`, next to history.json). New settings `keep_lossless`
+(default `REEF_KEEP_LOSSLESS`, off), `sponsorblock_play` (on), `replace_dead_tracks` (on), all three in
+`backup.SETTINGS_KEYS`. `matches.json` (incl. manual fixes) isn't in backups yet.
+
+- **Matching** (`matching.py`). Normalised for comparison only: lowercase, accents folded for mostly-Latin text,
+  no `(feat. X)` / `ft. X` / `[...]` / `(... remaster|remix|<version word> ...)` / ` - Remastered 2011` / video noise
+  (`tagging._strip_noise`), no punctuation; artist = the first of `A, B & C feat. D` (also ` x `, `and`, `with`),
+  no " - Topic"/VEVO, compared without spaces. Raw score = 0.45 Dice(title) + 0.35 Dice(artist) + 0.20 duration
+  (1.0 ≤ 2 s, 0.8 ≤ 5 s, 0.5 ≤ 10 s, 0.2 ≤ 30 s, else 0; unknown 0.5; an unknown artist also counts 0.5). Version
+  words (live, acoustic, remix, sped up, nightcore, slowed, instrumental, karaoke, cover, demo, 8d, music/lyric
+  video) on one side only: −0.15 each, cap −0.30, ranking only. `best()` accepts raw ≥ 0.35 and stops at a
+  *ranked* ≥ 0.95 (so a remix with a perfect raw score never ends the scan before the original). **Title floor** on
+  top of the raw floor (normalised-title Dice): ≥ 0.6 when both artists are known and alike (artist Dice ≥ 0.5),
+  ≥ 0.75 when either is unknown, ≥ 0.9 when they differ; a made-up title no longer matches an unrelated song on
+  artist-name likeness, "Мечтать" no longer matches the same artist's "Мечтой" (0.55), "Hello" (Adele) never
+  "Help!" (Beatles). The lossless scorer applies the same floor unless the ISRC matches. `best(same_artist=True)`
+  (used by `/api/replace`) also rejects a known artist unlike the query's. `query_of(track)`
+  splits "Artist - Song (Official Video)" YouTube titles without an artist list like a keep tags them.
+  Cache: key → `{id, score, manual, at, track}` (the slim track, so a hit answers without a search); automatic
+  entries are re-checked after 30 days, manual ones never expire and are never overwritten; 5000 entries max
+  (oldest automatic first). Lyrics keep their own LRCLIB `_pick` (duration-gated ranking of LRCLIB's own hits;
+  matching.py wouldn't simplify it).
+- **Lazy queue** (P1.8). Queue entries may be placeholders `{id: "pq:…", q: true, title, artist, duration, album?,
+  key?}` (no producer yet: imports / charts later). `match-core` (`M` in app.js) has the pure parts. Within 2 of
+  the current track (and before one plays) the client asks `/api/match` and swaps the song in place (queue + shuffle
+  snapshot; a song already in the queue drops the entry instead, ids stay unique). 404 → dropped, toast "Skipped
+  “…”: not found"; a failed lookup is retried after 30 s, or skipped ("Couldn't look up …") when it's due to play.
+  A restored session that stopped on a placeholder looks it up on play.
+- **Dead-track recovery** (P1.8). When recovery gives up on a YouTube / Monochrome track with block GONE, REGION
+  or MEMBERS_OR_PAID (and the user wanted playback, `replace_dead_tracks` on, the track isn't itself a replacement),
+  the client asks `POST /api/replace`: YouTube Music songs (title + artist, then the title alone), Monochrome too when
+  YouTube had nothing ≥ 0.93; accept ≥ 0.45; the same artist when both are known (same title by someone else is a
+  cover or another song); never the dead id or earlier dead ids (`exclude`). The replacement
+  takes the same queue position (`replaced_from` marks it, saved in the session), toast "Played a replacement for
+  “…”"; none → the old skip path. History, likes and playlists keep the original id (nothing rewritten silently).
+- **SponsorBlock at play time** (P1.9, `segments.py`). `GET https://sponsor.ajay.app/api/skipSegments/<sha256(id)[:4]>
+  ?categories=["music_offtopic"]&actionTypes=["skip"]&service=YouTube`, our `videoID` picked from the bucket,
+  segments < 1 s dropped. Memory LRU (2000): results and "none" (404 / not in the bucket) 7 days, errors 5 min
+  (502 meanwhile). Client: fetched on load for YouTube tracks (`sponsorblock_play`), never when the stream is the
+  library copy (`viaLibrary()`); on `timeupdate` jumps to each segment's end once (not inside its last 0.5 s, not
+  while recovery holds the playhead: `rec.busy/broken/seekTo`, `resume`, and the list is tied to `rec.token`);
+  a user seek (`seekTo`: bar, lyrics, lock screen) into a segment plays it. Toast "Skipped non-music part" once per
+  track.
+- **Lossless upgrade on keep** (P1.7, `keep_lossless`). Before a YouTube keep: Monochrome searches in order ISRC (only
+  when a hint carries one: no YouTube metadata Reef reads has ISRCs), title + artist + album, title + artist, title.
+  Points = 500 × matching's raw score (titles compared without `(Radio Edit)`-style soft groups), so Meld's minimum
+  330 = raw 0.66; ISRC +1000; remix/live/instrumental/karaoke/sped up/slowed on one side → rejected; remaster/edit/
+  acoustic/deluxe on one side (title + album) −45 each; |Δduration| > 25 s → rejected. The FLAC is kept as is (no
+  transcode) through the generic keep path with the job's hints; a download shorter than half the listed length
+  (a preview) or any failure *before the file reaches the music folder* → silently the normal YouTube keep (a
+  half-copied `.part` is deleted first). Once the FLAC is in place the keep counts as done: a failed history write
+  is a `warning` on the job (shown under it in Downloads), and any other error fails the job; never a YouTube keep
+  too (Navidrome would list the song twice). The same `.part` cleanup and history `warning` apply to every generic
+  (Monochrome) keep. History: entry under the `mc:` id with
+  `upgraded_from: <yt id>`; `_mark_kept` and the keep duplicate guard (409) treat the YouTube id as kept too, so
+  P1.5 streams it from Navidrome. Jobs carry `lossless`, `upgraded_to`, `duration` (the client now sends it); the
+  Downloads tab shows a LOSSLESS badge and "Saving FLAC…". Log lines `keep-lossless id=… result=ok|no-match|
+  fallback|search-failed`.
+
+### API shapes
+
+- `POST /api/match {title, artist?, duration?, album?, key?}` → `{track (marked kept/liked), score, key, manual,
+  cached}`; 404 `{error, key}`; 400 bad input; 502 YouTube Music off / failing. `key` defaults to
+  `q:<norm artist>|<norm title>`.
+- `PUT /api/match/<key> {id}`: `id` = a pasted YouTube / YT Music link or video id (`parse_link`), or an `mc:`/`nd:`
+  id → `{track, score: null, key, manual: true, cached: false}`; 400 not a song link, 404 bad key.
+- `POST /api/replace {track, exclude?: [ids], key?}` → `{track, score, source: yt|mc, replaced}`; 404 none, 400 bad
+  track / `nd:` track, 502 when every source asked failed. A valid `key` re-points that match (unless manual).
+- `GET /api/segments/<video id>` → `[{start, end, category}]` (`[]` none or setting off); 404 non-YouTube id, 502
+  SponsorBlock unavailable.
+- `POST /api/download` also takes `duration` (seconds); jobs have `duration`, `lossless`, `upgraded_to`.
+
+### Measured on the Mac (live, port 5308, scratch data)
+
+`/api/match`: Despacito / Luis Fonsi → `FXovf5dsRTw` 1.0 (1.3 s); "Bohemian Rhapsody - Remastered 2011" / Queen →
+1.0; Around the World / "Daft Punk - Topic" (no length) → 0.9; Hello / Adele 1.0; Help! → "Help! (Remastered
+2009)" 0.9; 夜に駆ける / YOASOBI 0.9; a made-up title → 404 (0.41 before the title floor). Мечтать / Земфира: YT Music
+has no Zemfira upload of it; before the floor it matched her "Мечтой" (0.70), now the same title by Владимир Клявин
+(0.59; a plain match allows another artist at title ≥ 0.9), while `/api/replace` gives 404. `/api/replace`: the audio id
+excluded → another upload 1.0 (0.5 s); a fake VEVO-style id → the audio track 0.8; Blinding Lights with the YT
+Music hit excluded → Monochrome 1.0; the made-up title → 404. `/api/segments/kJQP7kiw5Fk` → [0-21.8, 249.4-281.5] (290 ms, cached 1 ms).
+WebKit 390×844: playback jumped 0 → 21.9 s with the toast; a seek back to 5 s kept playing the intro; a fake dead
+id was replaced and played, the next placeholder resolved ahead, an unmatchable one dropped with its toast; a
+current placeholder resolved and played on tap. Lossless keep of FXovf5dsRTw: FLAC 16-bit/44.1 kHz, 229.36 s,
+title/artist/album VIDA/ISRC/ReplayGain/synced lyrics, 15.5 s on cable; "Me at the zoo" → no-match → Opus keep.
+
+### To check on the phone
+
+1. Play a music video with an intro (kJQP7kiw5Fk) and watch it jump; lock the screen mid-song: skips still happen
+   only while the page gets `timeupdate`.
+2. `PATCH /api/settings {"keep_lossless": true}` and keep a popular song; Downloads shows LOSSLESS, Navidrome gets a
+   .flac (bigger files on the phone's storage).
 
 ## Production plan (2026-10-21)
 

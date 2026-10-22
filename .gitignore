@@ -32,4 +32,6 @@ scrobbles.json
 scrobbles.json.tmp
 update.json
 update.json.tmp
+matches.json
+matches.json.tmp
 backups/

@@ -30,6 +30,16 @@ SCHEMA = {
                    "help": "Measure kept songs and write ReplayGain tags so they play at an even volume."},
     "lrc_sidecar": {"type": "bool", "default": lambda: config.LRC_SIDECAR, "label": "Lyrics .lrc files",
                     "help": "Also save synced lyrics as a .lrc file next to each kept song."},
+    "keep_lossless": {"type": "bool", "default": lambda: config.KEEP_LOSSLESS, "label": "Keep lossless when possible",
+                      "help": "Before keeping a YouTube song, look for the same recording on Monochrome and keep it "
+                              "as FLAC; otherwise keep from YouTube as usual. Monochrome is a third-party Tidal "
+                              "proxy: legally grey and only as reliable as it is."},
+    "sponsorblock_play": {"type": "bool", "default": lambda: True, "label": "Skip non-music parts while playing",
+                          "help": "Jump over intros and talking that SponsorBlock users marked as non-music in "
+                                  "YouTube songs (each part once; seek back into it to hear it)."},
+    "replace_dead_tracks": {"type": "bool", "default": lambda: True, "label": "Replace removed songs",
+                            "help": "When a song in the queue was removed or is blocked, play the same song from "
+                                    "another upload instead of skipping it (only the queue changes)."},
     "lyrics_providers": {"type": "list", "choices": ["navidrome", "lrclib"], "default": lambda: ["navidrome", "lrclib"],
                          "label": "Lyrics sources", "help": "Where lyrics come from, in order. (Not used yet.)"},
     "listenbrainz_token": {"type": "secret", "default": lambda: "", "label": "ListenBrainz token",

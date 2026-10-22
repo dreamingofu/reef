@@ -29,10 +29,12 @@ import likes
 import listens
 import log
 import lyrics
+import matching
 import navidrome
 import playlists
 import recommend
 import scrobble
+import segments
 import settings
 import sources
 import store
@@ -173,6 +175,8 @@ def _config_summary():
         "navidrome": {"url": _safe_url(config.NAVIDROME_URL), "configured": navidrome.configured()},
         "sponsorblock": settings.get("sponsorblock_keep"), "replaygain": settings.get("replaygain"),
         "lrc_sidecar": settings.get("lrc_sidecar"), "prefer_library": settings.get("prefer_library"),
+        "keep_lossless": settings.get("keep_lossless"), "sponsorblock_play": settings.get("sponsorblock_play"),
+        "replace_dead_tracks": settings.get("replace_dead_tracks"),
         "settings_overridden": sorted(r["key"] for r in settings.schema() if r["overridden"]),
         "ydl_extra_keys": sorted(config.YDL_EXTRA), "fake_wall": config.FAKE_WALL,
         "log_dir": str(config.LOG_DIR) if config.LOG_DIR else None,
@@ -238,10 +242,30 @@ def api_suggest():
     return resp
 
 
+def _kept_ids():
+    """{track id: Navidrome id or None} for every kept track, not just the newest. A lossless upgrade (P1.7) is
+    kept under its Monochrome id; the YouTube id the user kept counts too, so it shows as kept (and plays from
+    the library) wherever that YouTube track appears."""
+    kept = history.nd_ids()
+    if any(k and k.startswith("mc:") for k in kept):  # only Monochrome entries can be upgrades: skip the 2nd pass
+        for e in history.list_recent(None):
+            if e.get("upgraded_from"):
+                kept.setdefault(e["upgraded_from"], e.get("nd_id"))
+    return kept
+
+
+def _kept_entry(track_id):
+    """The history entry that keeps `track_id`: its own, or the lossless upgrade made from it."""
+    entry = history.get(track_id)
+    if entry is None and sources.parse(track_id)[0] == "yt":
+        entry = next((e for e in history.list_recent(None) if e.get("upgraded_from") == track_id), None)
+    return entry
+
+
 def _mark_kept(tracks):
     """Mark `kept` and `liked` (one file read each, not one per track). A kept track Navidrome has scanned
     also gets `nd_id`: the player streams `nd:<nd_id>` instead (production plan P1.5)."""
-    kept = history.nd_ids()  # every kept track, not just the newest
+    kept = _kept_ids()
     liked = likes.ids()
     for t in tracks:
         tid = t.get("id")
@@ -364,6 +388,163 @@ def api_link():
     _mark_kept(body["tracks"])
     streamer.prefetch([t["id"] for t in body["tracks"][:1]])
     return jsonify(body)
+
+
+# ---------- matching: songs by title + artist (P1.6), dead-track replacement (P1.8), SponsorBlock (P1.9) ----------
+
+MATCH_LIMIT = 10      # search results scored per query
+REPLACE_ACCEPT = 0.45  # a replacement plays in place of what the user picked: stricter than a plain match
+REPLACE_STOP = 0.93
+EXCLUDE_MAX = 20
+
+
+def _match_query(body):
+    """{title, artist, album, duration} from a JSON body, or None without a usable title."""
+    if not isinstance(body, dict) or not isinstance(body.get("title"), str) or not body["title"].strip():
+        return None
+    if any(body.get(k) is not None and not isinstance(body.get(k), str) for k in ("artist", "album")):
+        return None
+    return {"title": _hint(body["title"]), "artist": _hint(body.get("artist")), "album": _hint(body.get("album")),
+            "duration": _seconds(body.get("duration"))}
+
+
+def _find_song(query, accept=matching.ACCEPT, stop=matching.STOP, exclude=(), same_artist=False):
+    """(track, score) of the YouTube Music song that best matches `query`, else None. When title + artist
+    finds nothing acceptable, the title alone gets a second search (the artist may be spelled another way)."""
+    texts = [matching.search_text(query)]
+    if query.get("artist"):
+        texts.append(matching.search_text({"title": query["title"]}))
+    for text in texts:
+        found = matching.best(query, blocklist.filter_tracks(ytmusic.search(text, MATCH_LIMIT)), accept, stop, exclude,
+                              same_artist)
+        if found:
+            return found
+    return None
+
+
+def _match_body(track, score, key, manual, cached):
+    return jsonify({"track": _mark_kept([dict(track)])[0], "score": score, "key": key, "manual": manual,
+                    "cached": cached})
+
+
+@app.post("/api/match")
+def api_match():
+    """{title, artist?, duration?, album?, key?} -> the YouTube Music song it is: {track, score, key, manual,
+    cached}, 404 when nothing scores high enough. `key` (an import's own id for the row) defaults to the
+    normalised artist + title; what it resolved to is remembered in matches.json, a manual fix first."""
+    body = request.get_json(silent=True)
+    query = _match_query(body)
+    if not query:
+        return jsonify({"error": "title is required (artist and album must be text)"}), 400
+    key = body.get("key")
+    if key is not None and not matching.valid_key(key):
+        return jsonify({"error": f"key must be 1-{matching.KEY_MAX} printable characters without /"}), 400
+    key = key or matching.key_for(query["title"], query["artist"])
+    hit = matching.cached(key)
+    if hit and hit.get("track"):
+        return _match_body(hit["track"], hit.get("score"), key, bool(hit.get("manual")), True)
+    if not ytmusic.enabled():
+        return _ytm_off()
+    try:
+        found = _find_song(query)
+    except Exception as e:
+        return jsonify({"error": str(e)[:300]}), 502
+    if not found:
+        return jsonify({"error": "No match found", "key": key}), 404
+    track, score = found
+    entry = matching.remember(key, track, score)
+    if entry and entry.get("manual"):  # someone pasted a fix while we searched: theirs wins
+        return _match_body(entry["track"], entry.get("score"), key, True, True)
+    return _match_body(track, score, key, False, False)
+
+
+@app.put("/api/match/<key>")
+def api_match_fix(key):
+    """"Wrong song? Paste link": {id} (a YouTube / YT Music link or video id, or an mc:/nd: id) becomes what
+    `key` resolves to, for good: the automatic matcher never overwrites it."""
+    if not matching.valid_key(key):
+        abort(404)
+    body = request.get_json(silent=True) or {}
+    raw = body.get("id") if isinstance(body, dict) else None
+    parsed = parse_link(raw)
+    tid = parsed[1] if parsed and parsed[0] == "track" else store.track_id(raw.strip()) if isinstance(raw, str) else None
+    if not tid:
+        return jsonify({"error": "Paste a YouTube or YouTube Music song link"}), 400
+    track = None
+    if sources.parse(tid)[0] == "yt":
+        try:
+            track = _link_track(tid)
+        except Exception as e:
+            logger.warning(f"match: lookup of {tid} failed: {str(e)[:160]!r}")
+    if not track or track.get("id") != tid:
+        track = {"id": tid, "title": _hint(body.get("title")), "channel": _hint(body.get("artist"))}
+    entry = matching.remember(key, track, None, manual=True)
+    if not entry:
+        return jsonify({"error": "invalid track"}), 400
+    return _match_body({**track, **entry["track"]}, None, key, True, False)
+
+
+@app.post("/api/replace")
+def api_replace():
+    """{track, exclude?: [ids], key?} for a track that can't play (GONE / REGION / MEMBERS_OR_PAID) -> the same song
+    from another upload: {track, score, source, replaced}. YouTube Music songs first, then Monochrome (when on and
+    YouTube had nothing near-certain). Never the dead id or one in `exclude` (replacements already tried), and never
+    another artist's song of the same title (matching.best same_artist)."""
+    body = request.get_json(silent=True)
+    dead = store.clean_track(body.get("track")) if isinstance(body, dict) else None
+    if not dead or not dead["title"]:
+        return jsonify({"error": "track with an id and a title is required"}), 400
+    if dead["source"] == "nd":
+        return jsonify({"error": "library tracks aren't replaced"}), 400
+    extra = body.get("exclude") if isinstance(body.get("exclude"), list) else []
+    exclude = {dead["id"], *filter(None, (store.track_id(x) for x in extra[:EXCLUDE_MAX]))}
+    query = matching.query_of(dead)
+    best, failures, tried, t0 = None, [], 0, time.monotonic()
+    if ytmusic.enabled():
+        tried += 1
+        try:
+            found = _find_song(query, REPLACE_ACCEPT, REPLACE_STOP, exclude, same_artist=True)
+            best = (*found, "yt") if found else None
+        except Exception as e:
+            failures.append(f"YouTube Music: {str(e)[:160]}")
+    mc = sources.get("mc")
+    if mc is not None and (best is None or best[1] < REPLACE_STOP):
+        tried += 1
+        try:
+            found = matching.best(query, mc.search(matching.search_text(query), MATCH_LIMIT), REPLACE_ACCEPT,
+                                  REPLACE_STOP, exclude, same_artist=True)
+            if found and (best is None or found[1] > best[1]):
+                best = (*found, "mc")
+        except Exception as e:
+            failures.append(f"Monochrome: {str(e)[:160]}")
+    logger.info(f"replace id={dead['id']} found={best[0]['id'] if best else None} score={best[1] if best else None} "
+                f"source={best[2] if best else None} ms={int((time.monotonic() - t0) * 1000)}")
+    if not best:
+        if failures and len(failures) == tried:  # nothing could be asked: not a "no such song"
+            return jsonify({"error": "; ".join(failures)}), 502
+        return jsonify({"error": "No replacement found"}), 404
+    track, score, source = best
+    key = body.get("key")
+    if matching.valid_key(key):
+        matching.remember(key, track, score)  # an import row that pointed at the dead id; a manual fix stays
+    return jsonify({"track": _mark_kept([dict(track)])[0], "score": score, "source": source, "replaced": dead["id"]})
+
+
+@app.get("/api/segments/<video_id>")
+def api_segments(video_id):
+    """SponsorBlock's non-music parts of a YouTube video: [{start, end, category}] ([] = none, or the setting is
+    off). 502 when SponsorBlock can't be asked; the player then just plays everything."""
+    if not VIDEO_ID.match(video_id):
+        abort(404)
+    if not settings.get("sponsorblock_play"):
+        return jsonify([])
+    try:
+        found = segments.for_video(video_id)
+    except segments.Unavailable as e:
+        return jsonify({"error": str(e)[:200]}), 502
+    resp = jsonify(found)
+    resp.headers["Cache-Control"] = "private, max-age=3600"
+    return resp
 
 
 # ---------- YouTube Music browse: moods, album / artist / playlist pages ----------
@@ -589,11 +770,12 @@ def _keep(item, force=False):
         return "invalid", "invalid album hints", 400
     # `force` re-keeps a library track (e.g. to pick up better tags), but never runs alongside a keep
     # of the same track that's still going: both would write the same file.
-    entry = history.get(t[1])
+    entry = _kept_entry(t[1])
     if entry and not force and entry.get("file") and os.path.exists(entry["file"]):
         return "kept", entry, 409
     job, created = downloader.enqueue_unique(t[1], str(item.get("title", ""))[:200],
-                                             str(item.get("channel", ""))[:200], hints)
+                                             str(item.get("channel", ""))[:200], hints,
+                                             duration=_seconds(item.get("duration")))
     return ("queued", job, 202) if created else ("keeping", job, 409)
 
 

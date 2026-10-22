@@ -79,7 +79,7 @@
   const artSize = (id, kind) => ART[kind][keepState(id) === "kept" ? 1 : 0];
   // Only YouTube has a smaller second-choice thumbnail; other sources fall back to the app icon.
   const artFallback = (id) => (srcKey(id) === "yt" ? artUrl(id, artSize(id, "fallback")) : "/static/icon.svg");
-  const art = (id, big = false) => big
+  const art = (id, big = false) => /^pq:/.test(id || "") ? `<img src="/static/icon.svg" alt="">` : big
     ? `<img src="${artUrl(id, artSize(id, "big"))}" data-fallback="${artFallback(id)}" alt="" loading="lazy">`
     : `<img src="${artUrl(id, artSize(id, "small"))}" alt="" loading="lazy">`;
 
@@ -97,7 +97,7 @@
   const currentSource = () => (state.sources.some((x) => x.key === state.source) ? state.source
     : (state.sources.find((x) => x.default) || state.sources[0] || KNOWN.yt).key);
   // " · Monochrome" after a non-YouTube track's subtitle; YouTube is the default, so it stays unlabeled.
-  const srcBadge = (t) => (srcKey(t.id) === "yt" ? "" : ` · ${esc(srcInfo(srcKey(t.id)).name)}`);
+  const srcBadge = (t) => (srcKey(t.id) === "yt" || t.q ? "" : ` · ${esc(srcInfo(srcKey(t.id)).name)}`);
   const codecLabel = (t) => (t.codec ? String(t.codec).toUpperCase() : srcInfo(srcKey(t.id)).codec_label);
   const xBadge = (t) => (t.explicit ? `<span class="xbadge" role="img" aria-label="Explicit">E</span>` : "");
   // "[E] Artist · Album · 3:45 · Source": the subtitle of search / link / queue rows.
@@ -371,15 +371,87 @@
   })();
   // ==== library-core:end ====
 
+  // ---------- match core ----------
+  // Pure helpers for placeholder queue entries and dead-track replacement (production plan P1.8) and for skipping
+  // SponsorBlock's non-music segments at play time (P1.9). Unit-checked from node by slicing the text between
+  // these two sentinel comments.
+  // ==== match-core:start ====
+  const M = (() => {
+    const WINDOW = 2; // placeholders are looked up only this close to the current track (and before they play)
+    // Blocks a replacement can fix: this upload is gone or walled, the song itself usually isn't.
+    const REPLACE_BLOCKS = ["GONE", "REGION", "MEMBERS_OR_PAID"];
+    const SEG_EARLY = 0.05; // a segment starting at 0 is entered by the first timeupdate
+    const SEG_TAIL = 0.5; // this close to a segment's end, let it play out instead of seeking
+    const isPlaceholder = (t) => !!(t && t.q === true);
+    // A queue entry known only by name ({q: true, title, artist, duration}, from imports / charts). Its id is local
+    // ("pq:…", never a playable id); /api/match swaps it for a real track before it plays.
+    function placeholder({ title = "", artist = "", duration = null, album = "", key = "" } = {}, id) {
+      return {
+        id, q: true, title: String(title), artist: String(artist), channel: String(artist),
+        duration: Number(duration) > 0 ? Number(duration) : null, ...(album ? { album: String(album) } : {}), ...(key ? { key: String(key) } : {}),
+      };
+    }
+    // Queue indexes of placeholders to look up now: the current entry and the next `window` after it.
+    function toResolve(queue, index, window = WINDOW) {
+      const out = [];
+      for (let k = Math.max(0, index); k < queue.length && k <= index + window; k++) if (isPlaceholder(queue[k])) out.push(k);
+      return out;
+    }
+    // The queue with the entry `id` swapped for `track` (an autoplay entry stays one). A track already elsewhere in
+    // the queue isn't added twice (ids are unique in a queue): the entry is dropped instead, the next one taking
+    // its place. -> {queue, index, at (where it was, -1 = not found), dropped}
+    function swap(queue, index, id, track) {
+      const at = queue.findIndex((t) => t && t.id === id);
+      if (at < 0 || !track || !track.id) return { queue: queue.slice(), index, at: -1, dropped: false };
+      const q = queue.slice();
+      if (q.some((t, k) => k !== at && t && t.id === track.id)) {
+        q.splice(at, 1);
+        return { queue: q, index: at < index ? index - 1 : at === index ? Math.min(index, q.length - 1) : index, at, dropped: true };
+      }
+      q[at] = queue[at].auto ? { ...track, auto: true } : track;
+      return { queue: q, index, at, dropped: false };
+    }
+    // Whether a track recovery gave up on gets a replacement lookup: a YouTube / Monochrome track that failed for a
+    // block another upload can fix, and isn't itself a replacement (one swap per song, never a chain).
+    function canReplace(t, block, { enabled = true } = {}) {
+      if (!enabled || !t || isPlaceholder(t) || t.replaced_from || !REPLACE_BLOCKS.includes(block)) return false;
+      return /^mc:./.test(t.id || "") || /^[A-Za-z0-9_-]{11}$/.test(t.id || "");
+    }
+    // SponsorBlock segments [{start, end}] -> the index of the one to jump out of at playhead `t`, or -1. Each segment
+    // is skipped once; `done` holds the ones already skipped or entered on purpose (a seek into one plays it).
+    function segmentAt(segs, done, t) {
+      for (let i = 0; i < (segs || []).length; i++) {
+        const s = segs[i];
+        if (!done.has(i) && t >= s.start - SEG_EARLY && t < s.end - SEG_TAIL) return i;
+      }
+      return -1;
+    }
+    // Where to land after segment `seg`: its end, kept inside the track when the length is known.
+    const segmentTarget = (seg, duration) => (duration > 0 ? Math.min(seg.end, Math.max(0, duration - 0.25)) : seg.end);
+    // Segments a seek to `t` lands in (the user wants to hear them: mark them done).
+    function entered(segs, t) {
+      const out = [];
+      (segs || []).forEach((s, i) => { if (t >= s.start && t < s.end) out.push(i); });
+      return out;
+    }
+    // Valid segments from /api/segments, sorted by start.
+    const cleanSegments = (list) => (Array.isArray(list) ? list : [])
+      .filter((s) => s && Number.isFinite(s.start) && Number.isFinite(s.end) && s.end > s.start && s.start >= 0)
+      .map((s) => ({ start: s.start, end: s.end })).sort((a, b) => a.start - b.start);
+    return { WINDOW, REPLACE_BLOCKS, isPlaceholder, placeholder, toResolve, swap, canReplace, segmentAt, segmentTarget, entered, cleanSegments };
+  })();
+  // ==== match-core:end ====
+
   const navidromeUrl = (path) => `${location.protocol}//${location.hostname}:4533${path}`;
   const cur = () => state.queue[state.index];
   // What a queued / remembered track keeps (queue, session, "plays"). `auto` (an autoplay item) is dropped
   // here; only the live queue and its saved session keep it, via qslim.
-  const slim = (t) => ({
+  const slim = (t) => (M.isPlaceholder(t) ? M.placeholder(t, t.id) : {
     id: t.id, title: t.title, channel: t.channel, duration: t.duration, source: t.source || srcKey(t.id),
     ...(t.codec ? { codec: t.codec } : {}), ...(t.album ? { album: t.album } : {}), ...(t.album_id ? { album_id: t.album_id } : {}),
     ...(Array.isArray(t.artists) && t.artists.length ? { artists: t.artists.map((a) => ({ name: a?.name, id: a?.id ?? null })) } : {}),
     ...(t.explicit ? { explicit: true } : {}), ...(t.nd_id ? { nd_id: t.nd_id } : {}),
+    ...(t.replaced_from ? { replaced_from: t.replaced_from } : {}),
   });
   const qslim = (t) => (t.auto ? { ...slim(t), auto: true } : slim(t));
 
@@ -411,7 +483,7 @@
   function keepState(id) {
     if (!id) return "none";
     if (srcKey(id) === "nd") return "kept"; // Navidrome results are the library itself
-    if (state.history.some((h) => h.id === id) || keptIds.has(id)) return "kept";
+    if (state.history.some((h) => h.id === id || h.upgraded_from === id) || keptIds.has(id)) return "kept";
     if (state.jobs.some((j) => j.video_id === id && ACTIVE.includes(j.status))) return "pending";
     return "none";
   }
@@ -746,7 +818,7 @@
     switch (j.status) {
       case "queued": return "Waiting…";
       case "downloading": return `Downloading · ${j.percent}%`;
-      case "converting": return "Converting to Opus…";
+      case "converting": return j.lossless ? "Saving FLAC…" : "Converting to Opus…";
       case "done": return j.rescanned ? "Saved · Navidrome is rescanning" : "Saved to library";
       case "error": return j.hint || j.error || "Failed";
       default: return j.status;
@@ -766,9 +838,10 @@
           <span class="row-main" style="cursor:default">
             <span class="row-art">${art(j.video_id)}</span>
             <span class="row-text">
-              <span class="row-t">${esc(j.title || j.video_id)}</span>
+              <span class="row-t">${esc(j.title || j.video_id)}${j.lossless ? ` <span class="lbadge">Lossless</span>` : ""}</span>
               <span class="row-s"${j.status === "error" && j.error ? ` title="${esc(j.error)}"` : ""}>${esc(jobLabel(j))}</span>
               ${j.status === "error" && j.hint && j.error && j.error !== j.hint ? `<span class="row-e">${esc(j.error)}</span>` : ""}
+              ${j.status === "done" && j.warning ? `<span class="row-e">${esc(j.warning)}</span>` : ""}
               ${j.status === "downloading" ? `<span class="bar"><i style="width:${j.percent}%"></i></span>` : ""}
             </span>
           </span>
@@ -1577,9 +1650,12 @@
   function load() {
     const t = cur();
     if (!t) return;
+    if (M.isPlaceholder(t)) { loadPlaceholder(t); return; }
+    pendingPh = null;
     closeListen();
     resume = null;
     newTrack(""); // first: it clears the last track's library fallback, which streamUrl reads
+    loadSegments(t);
     rec.src = streamUrl(t);
     audio.src = rec.src;
     audio.play().catch(() => {});
@@ -1595,6 +1671,7 @@
     saveSession(0);
     renderQueue();
     autoFill();
+    resolveAhead();
   }
 
   // Play (or resume) whatever is current. A restored session has no src yet: set it on this first
@@ -1602,6 +1679,8 @@
   function playAudio() {
     const t = cur();
     if (!t) return;
+    // A placeholder (e.g. a restored queue stopped on one): look it up first; a tap during the lookup waits for it.
+    if (M.isPlaceholder(t)) { if (pendingPh !== t.id) loadPlaceholder(t); return; }
     if (!resume) {
       // A src that failed and wasn't reloaded (Reef stopped on it, or it's mid-recovery): retry it now.
       if (rec.broken && !rec.busy) { retryNow(true); return; }
@@ -1611,6 +1690,7 @@
     }
     const pos = resume.position;
     resume = null;
+    loadSegments(t);
     rec.pos = pos;
     rec.seekTo = pos > 0 ? pos : null; // applied once metadata is in (applySeek)
     rec.src = streamUrl(t);
@@ -1669,6 +1749,121 @@
     planPrefetch();
     renderQueue();
     autoFill();
+    resolveAhead();
+  }
+
+  // ---------- placeholders (P1.8) ----------
+  // Placeholder entries ({q: true, title, artist}) are looked up with /api/match only once they come within
+  // M.WINDOW of the current track, and swapped for the song in place (queue and shuffle snapshot). Not found ->
+  // dropped with a toast; a failed lookup (server / network) is retried after 30 s, or skipped when it's due to play.
+  const resolving = new Map(); // placeholder id -> Promise of the track (null when not found / failed)
+  const resolveFailedAt = new Map(); // placeholder id -> when its lookup last failed (not a 404)
+  let pendingPh = null; // the placeholder load() is waiting on; any other load() cancels the wait
+
+  function swapEverywhere(id, track) {
+    const r = M.swap(state.queue, state.index, id, track);
+    state.queue = r.queue; state.index = r.index;
+    if (state.original) state.original = M.swap(state.original, -1, id, track).queue;
+    return r;
+  }
+  function dropEverywhere(id) {
+    const i = state.queue.findIndex((x) => x.id === id);
+    if (i >= 0) { const r = Q.removeAt(state.queue, state.index, i); state.queue = r.queue; state.index = r.index; }
+    if (state.original) state.original = state.original.filter((x) => x.id !== id);
+  }
+
+  function resolvePlaceholder(t) {
+    if (resolving.has(t.id)) return resolving.get(t.id);
+    const body = { title: t.title, artist: t.artist || t.channel || "", duration: t.duration || null,
+      ...(t.album ? { album: t.album } : {}), ...(t.key ? { key: t.key } : {}) };
+    const p = api("/api/match", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) })
+      .then((r) => {
+        if (!r?.track?.id) throw Object.assign(new Error("No match found"), { status: 404 });
+        noteKept([r.track]);
+        const track = slim(r.track);
+        if (state.queue.some((x) => x.id === t.id)) { swapEverywhere(t.id, track); queueChanged(); }
+        return track;
+      })
+      .catch((e) => {
+        if (e.status === 404) {
+          if (state.queue.some((x) => x.id === t.id)) {
+            const wasCurrent = cur()?.id === t.id;
+            dropEverywhere(t.id);
+            if (!wasCurrent) queueChanged(); // loadPlaceholder moves on from the current one
+            toast(`Skipped “${t.title}”: not found`);
+          }
+        } else {
+          resolveFailedAt.set(t.id, Date.now());
+          console.warn("match: lookup failed for", t.title, e.message);
+        }
+        return null;
+      })
+      .finally(() => resolving.delete(t.id));
+    resolving.set(t.id, p);
+    return p;
+  }
+
+  function resolveAhead() {
+    for (const i of M.toResolve(state.queue, state.index)) {
+      const t = state.queue[i];
+      if (pendingPh === t.id || resolving.has(t.id) || Date.now() - (resolveFailedAt.get(t.id) || 0) < 30000) continue;
+      resolvePlaceholder(t);
+    }
+  }
+
+  // The current entry is a placeholder: stop what was playing, look it up, then play the song (or move on).
+  function loadPlaceholder(t) {
+    closeListen();
+    resume = null;
+    newTrack("");
+    loadSegments(t); // clears the last track's segments
+    audio.pause();
+    pendingPh = t.id;
+    const wasLast = state.index === state.queue.length - 1;
+    updatePlayer();
+    markPlaying();
+    setProgress(0, t.duration || 0);
+    setLoading(true);
+    renderQueue();
+    resolvePlaceholder(t).then((track) => {
+      if (pendingPh !== t.id) return; // the user moved on meanwhile
+      pendingPh = null;
+      setLoading(false);
+      if (track && cur()?.id === track.id) { load(); return; }
+      if (state.queue.some((x) => x.id === t.id)) { // the lookup failed (not "not found"): skip it for now
+        toast(`Couldn't look up “${t.title}”`);
+        rec.skipping = true; next(); rec.skipping = false;
+        return;
+      }
+      // Not found: dropEverywhere made the following entry current (or the previous one, if this was the last).
+      if (wasLast || !cur()) { updatePlayer(); markPlaying(); saveSession(0); renderQueue(); return; }
+      rec.skipping = true; load(); rec.skipping = false;
+    });
+  }
+
+  // ---------- SponsorBlock at play time (P1.9) ----------
+  // Segments of the current YouTube track (not its library copy: a keep may have cut them already). Each one is
+  // jumped over once on timeupdate, never while recovery holds the playhead (a pending seek, a reload); a seek
+  // into one (seekTo) plays it. `token` ties the list to the play token, so a late answer for an old track is dropped.
+  const seg = { token: -1, list: [], done: new Set(), toasted: false };
+  function loadSegments(t) {
+    Object.assign(seg, { token: rec.token, list: [], done: new Set(), toasted: false });
+    if (!t || M.isPlaceholder(t) || srcKey(t.id) !== "yt" || state.settings.sponsorblock_play === false) return;
+    const token = rec.token;
+    api(`/api/segments/${encodeURIComponent(t.id)}`).then((list) => {
+      if (token !== rec.token || seg.token !== token) return;
+      seg.list = M.cleanSegments(list);
+      skipSegment();
+    }).catch(() => { /* SponsorBlock down: play everything */ });
+  }
+  function skipSegment() {
+    if (!seg.list.length || seg.token !== rec.token || !cur() || resume || rec.busy || rec.broken || rec.seekTo != null) return;
+    if (audio.paused || audio.readyState < 1 || viaLibrary()) return;
+    const i = M.segmentAt(seg.list, seg.done, audio.currentTime);
+    if (i < 0) return;
+    seg.done.add(i);
+    audio.currentTime = M.segmentTarget(seg.list[i], isFinite(audio.duration) ? audio.duration : 0);
+    if (!seg.toasted) { seg.toasted = true; toast("Skipped non-music part"); }
   }
 
   // ---------- autoplay ----------
@@ -1868,7 +2063,7 @@
   let prefetchNext = null, prefetched = null;
   function upcomingId() {
     const i = Q.nextIndex(state.queue.length, state.index, state.repeat);
-    return i >= 0 && i !== state.index ? playId(state.queue[i]) : null;
+    return i >= 0 && i !== state.index && !M.isPlaceholder(state.queue[i]) ? playId(state.queue[i]) : null;
   }
   function planPrefetch() {
     const id = upcomingId();
@@ -2103,6 +2298,7 @@
   }
 
   function seekTo(t) {
+    if (seg.token === rec.token) for (const i of M.entered(seg.list, t)) seg.done.add(i); // a seek into a segment plays it
     if (resume) { resume.position = t; setProgress(t, duration()); saveSession(); return; }
     if (rec.busy || rec.broken || rec.seekTo != null) {
       rec.pos = t;
@@ -2197,6 +2393,37 @@
       toast(v.hint || R.FALLBACK);
       return;
     }
+    if (M.canReplace(cur(), v.block, { enabled: state.settings.replace_dead_tracks !== false })) { replaceDead(cur(), v); return; }
+    moveOn(v);
+  }
+
+  // P1.8: the same song from another upload (POST /api/replace), swapped in at the same place in the queue (and the
+  // session); history, likes and playlists keep the original. `replaced_from` marks it, so it's never replaced in turn.
+  const deadIds = []; // ids already replaced this page load: never offered back as a replacement
+  async function replaceDead(t, v) {
+    const token = rec.token;
+    rec.busy = true; // holds off the stall watchdog and a play tap (which only sets rec.want) while we look
+    setLoading(true);
+    let r = null;
+    try {
+      r = await api("/api/replace", { method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ track: slim(t), exclude: deadIds.slice(-20) }) });
+    } catch (e) {
+      console.info("recovery:", t.id, "no replacement", e.status || e.message);
+    }
+    if (token !== rec.token || cur()?.id !== t.id) return; // the user moved on meanwhile
+    rec.busy = false;
+    setLoading(false);
+    if (!deadIds.includes(t.id)) deadIds.push(t.id);
+    if (!r?.track?.id) { moveOn(v); return; }
+    noteKept([r.track]);
+    swapEverywhere(t.id, { ...slim(r.track), replaced_from: t.id });
+    console.info("recovery:", t.id, "replaced by", r.track.id, r.source, r.score);
+    toast(`Played a replacement for “${t.title}”`);
+    rec.skipping = true; load(); rec.skipping = false;
+  }
+
+  function moveOn(v) {
     rec.dead++;
     if (R.isFinal(v.block)) rec.content++;
     const d = R.afterGiveUp({ dead: rec.dead, content: rec.content, queueLength: state.queue.length, block: v.block, hint: v.hint });
@@ -2268,6 +2495,7 @@
       if (rec.tries) rec.tries = R.settledTries({ tries: rec.tries, from: rec.from, at: rec.pos });
       setProgress(audio.currentTime, duration());
       if (lyr.times.length) syncLyrics();
+      skipSegment();
     }
     if (sleep.mode === "time") checkSleep();
     if (!audio.paused && Date.now() - posSavedAt >= 5000) saveSession();
@@ -2540,7 +2768,7 @@
       const job = await api("/api/download", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ id, title: t.title, channel: t.channel || "", ...hints }),
+        body: JSON.stringify({ id, title: t.title, channel: t.channel || "", duration: t.duration || null, ...hints }),
       });
       state.jobs.unshift(job);
       refreshKeepButtons();

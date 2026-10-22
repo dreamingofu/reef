@@ -46,7 +46,8 @@ KEEP_PRE_RESTORE = 10
 AUTO_EVERY = 24 * 3600
 # Settings that travel with a backup: preferences, not secrets, URLs or per-device state.
 SETTINGS_KEYS = ("default_source", "ytmusic", "prefer_library", "autoplay_radio", "sponsorblock_keep", "replaygain",
-                 "lrc_sidecar", "lyrics_providers", "scrobble_enabled")
+                 "lrc_sidecar", "lyrics_providers", "scrobble_enabled", "keep_lossless", "sponsorblock_play",
+                 "replace_dead_tracks")
 _NAME = re.compile(r"^(auto|pre-restore)-(\d{8}-\d{6})(?:-(\d+))?\.json$")
 
 

@@ -2,6 +2,7 @@ import base64
 import logging
 import os
 import queue
+import re
 import shutil
 import subprocess
 import threading
@@ -27,10 +28,12 @@ import errors
 import history
 import loudness
 import lyrics
+import matching
 import navidrome
 import settings
 import sources
 import streamer
+import ytmusic
 from config import AUDIO_FORMAT, DOWNLOAD_DIR, TMP_DIR
 from tagging import music_tags, with_hints
 
@@ -43,7 +46,7 @@ _queue = queue.Queue()
 _lock = threading.Lock()
 
 
-def _new_job(track_id, title, channel, hints=None):
+def _new_job(track_id, title, channel, hints=None, duration=None):
     return {
         "id": uuid.uuid4().hex[:8],
         "video_id": track_id,  # the full track id ("mc:..." for non-YouTube sources); name kept for the client
@@ -52,6 +55,8 @@ def _new_job(track_id, title, channel, hints=None):
         "channel": channel,
         # Album-page tags ({album, album_artist, track_number, year}, all optional) that override yt-dlp's.
         "hints": dict(hints or {}),
+        "duration": duration,  # what the client showed (seconds), for the lossless match; None = unknown
+        "lossless": False,  # kept from Monochrome as FLAC instead (keep_lossless); the Downloads tab badges it
         "status": "queued",
         "percent": 0,
         "file": None,
@@ -59,26 +64,27 @@ def _new_job(track_id, title, channel, hints=None):
         "block": None,  # errors.py block + hint for a failed keep, shown in the Downloads tab
         "hint": None,
         "rescanned": False,
+        "warning": None,  # the file was saved, but something after that failed (e.g. the history write)
         "created": time.time(),
     }
 
 
-def enqueue(track_id, title="", channel="", hints=None):
-    job = _new_job(track_id, title, channel, hints)
+def enqueue(track_id, title="", channel="", hints=None, duration=None):
+    job = _new_job(track_id, title, channel, hints, duration)
     with _lock:
         _jobs[job["id"]] = job
     _queue.put(job["id"])
     return job
 
 
-def enqueue_unique(track_id, title="", channel="", hints=None):
+def enqueue_unique(track_id, title="", channel="", hints=None, duration=None):
     """(job, created): the track's keep that is still running, else a new queued one. Check and insert
     happen under one lock, so two quick taps can't start two keeps writing the same file."""
     with _lock:
         job = next((j for j in _jobs.values() if j["video_id"] == track_id and j["status"] in ACTIVE), None)
         if job:
             return job, False
-        job = _new_job(track_id, title, channel, hints)
+        job = _new_job(track_id, title, channel, hints, duration)
         _jobs[job["id"]] = job
     _queue.put(job["id"])
     return job, True
@@ -295,8 +301,9 @@ def _fetch_once(job, entry, dest):
         r.close()
 
 
-def _convert(src_path, src_ext, dest):
-    ext, codec = _FORMATS.get(AUDIO_FORMAT, (AUDIO_FORMAT, []))
+def _convert(src_path, src_ext, dest, fmt=None):
+    fmt = fmt or AUDIO_FORMAT
+    ext, codec = _FORMATS.get(fmt, (fmt, []))
     if (src_ext or "").lower() == ext:
         codec = ["-c", "copy"]
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(src_path),
@@ -390,8 +397,16 @@ def _tag(path, title, artist, album, cover, cover_mime, isrc="", album_artist=""
     f.save()
 
 
-def _run_generic(job):
-    key, native = sources.parse(job["video_id"])
+class NotLossless(Exception):
+    """The lossless candidate turned out unusable (a preview clip, no length): keep from YouTube instead."""
+
+
+def _run_generic(job, track_id=None, fmt=None, expect=None, extra=None):
+    """Keep `track_id` (default: the job's own track). `fmt` overrides AUDIO_FORMAT (the lossless upgrade keeps
+    FLAC as is); `expect` (seconds) rejects a download shorter than half of it, the 30-second preview a proxy
+    serves for a track it can't stream in full; `extra` goes into the history entry."""
+    tid = track_id or job["video_id"]
+    key, native = sources.parse(tid)
     src = sources.get(key)
     if src is None or not src.can_keep:
         raise RuntimeError(f"can't keep tracks from source {key!r}")
@@ -402,42 +417,191 @@ def _run_generic(job):
     album = hints.get("album") or info.get("album") or ""
     job["title"] = title
 
-    entry = streamer.resolve(job["video_id"])
+    entry = streamer.resolve(tid)
     raw = TMP_DIR / f"{job['id']}.{entry.get('ext') or 'bin'}"
-    ext = _FORMATS.get(AUDIO_FORMAT, (AUDIO_FORMAT,))[0]
+    ext = _FORMATS.get(fmt or AUDIO_FORMAT, (fmt or AUDIO_FORMAT,))[0]
     out = TMP_DIR / f"{job['id']}.out.{ext}"
     try:
         _fetch(job, entry, raw)
+        if expect:
+            got = _length(raw)
+            if not got or got < expect * PREVIEW_SHARE:
+                raise NotLossless(f"the file is {got and round(got)} s of {round(expect)} s (a preview?)")
         job["percent"] = 100
         job["status"] = "converting"
-        _convert(raw, entry.get("ext"), out)
+        _convert(raw, entry.get("ext"), out, fmt)
         cover, cover_mime = _cover_bytes(src, native)
         _tag(out, title, artist, album, cover, cover_mime, info.get("isrc") or "",
              hints.get("album_artist") or "", hints.get("track_number"), hints.get("year"))
         length = _length(out)
         dest = DOWNLOAD_DIR / f"{_filename(title)}.{ext}"
         part = dest.with_name(dest.name + ".part")
-        shutil.move(str(out), str(part))  # may cross filesystems (tmp -> shared storage)
-        os.replace(part, dest)
+        try:
+            shutil.move(str(out), str(part))  # may cross filesystems (tmp -> shared storage)
+            os.replace(part, dest)
+        except BaseException:
+            _unlink(part)  # half a copy on shared storage must never reach Navidrome (nor stay next to a fallback)
+            raise
     finally:
-        for p in (raw, out):
-            try:
-                p.unlink()
-            except OSError:
-                pass
+        _unlink(raw, out)
+    # From here the file is in the library: the keep happened. What's left is bookkeeping, and a failure there is
+    # reported on the job (`warning`) instead of failing it; a lossless keep must not fall back to YouTube now, or
+    # Navidrome would list the song twice (.flac and .opus).
     job["file"] = str(dest)
-    history.add({
-        "id": job["video_id"],
-        "title": title,
-        "channel": artist,
-        "duration": info.get("duration") or (round(length) if length else None),
-        "thumb": info.get("art") or "",
-        "art": info.get("art") or "",
-        "album": album,
-        "file": job["file"],
-        "source": key,
-    })
+    job["kept_id"] = tid  # the history entry's id (a lossless upgrade is kept under its Monochrome id)
+    try:
+        history.add({
+            "id": tid,
+            "title": title,
+            "channel": artist,
+            "duration": info.get("duration") or (round(length) if length else None),
+            "thumb": info.get("art") or "",
+            "art": info.get("art") or "",
+            "album": album,
+            "file": job["file"],
+            "source": key,
+            **(extra or {}),
+        })
+    except Exception as e:
+        logger.warning(f"keep id={tid} file={dest.name} saved, but the history write failed: {type(e).__name__}: {e}")
+        job["warning"] = f"Saved, but Reef couldn't record it as kept: {str(e)[:200]}"
     return {"title": title, "artist": artist, "album": album, "duration": info.get("duration") or length}
+
+
+def _unlink(*paths):
+    for p in paths:
+        try:
+            p.unlink()
+        except OSError:
+            pass
+
+
+# ---------- lossless upgrade on keep (production plan P1.7; numbers from Meld's QobuzAudioProvider) ----------
+# Points = 500 x matching's raw score (title 0.45 + artist 0.35 + duration 0.20), so Meld's minimum of 330 is a raw
+# 0.66: the title and the artist both right, or one of them close plus a matching length. An ISRC match adds 1000.
+# Version words that change the recording (remix, live, ...) reject a candidate outright; ones that usually don't
+# (remaster, edit, acoustic, deluxe) cost 45 each when only one side has them. A length gap over 25 s rejects too,
+# and so does a title below matching's title floor (unless the ISRC says it's the same recording).
+
+LOSSLESS_SCALE = 500
+LOSSLESS_MIN = 330
+LOSSLESS_ISRC = 1000
+LOSSLESS_SOFT = 45
+LOSSLESS_MAX_GAP = 25
+LOSSLESS_LIMIT = 10
+PREVIEW_SHARE = 0.5
+_HARD = {"remix", "live", "instrumental", "karaoke", "sped up", "slowed"}
+_SOFT = re.compile(r"\b(remaster|edit|acoustic|deluxe)(?:ed)?\b", re.I)  # not "edition"
+# "(Radio Edit)", " - Acoustic Version": the soft word is charged once (-45), not again as a title difference.
+_SOFT_GROUP = re.compile(r"\s*\([^()]*\b(?:remaster|edit|acoustic|deluxe)(?:ed)?\b[^()]*\)"
+                         r"|\s+[-–]\s+[^-–]*\b(?:remaster|edit|acoustic|deluxe)(?:ed)?\b[^-–]*$", re.I)
+
+
+def _soft_words(*texts):
+    return {m.lower() for t in texts for m in _SOFT.findall(str(t or ""))}
+
+
+def lossless_points(query, candidate, isrc=""):
+    """Points for keeping `candidate` (a Monochrome search result) instead of the YouTube `query`; None = rejected."""
+    q, c = matching.fields(query), matching.fields(candidate)
+    if (matching.versions(q["title"]) ^ matching.versions(c["title"])) & _HARD:
+        return None
+    if q["duration"] and c["duration"] and abs(q["duration"] - c["duration"]) > LOSSLESS_MAX_GAP:
+        return None
+    bare_q = {**q, "title": _SOFT_GROUP.sub("", q["title"]) or q["title"]}
+    bare_c = {**c, "title": _SOFT_GROUP.sub("", c["title"]) or c["title"]}
+    same_isrc = bool(isrc) and str(candidate.get("isrc") or "").upper() == isrc.upper()
+    if not same_isrc and not matching.plausible(bare_q, bare_c):  # same title floor as every other match
+        return None
+    raw, _ = matching.score(bare_q, bare_c)
+    soft = _soft_words(q["title"], q["album"]) ^ _soft_words(c["title"], c["album"])
+    points = round(raw * LOSSLESS_SCALE) - LOSSLESS_SOFT * len(soft)
+    if same_isrc:
+        points += LOSSLESS_ISRC
+    return points
+
+
+def pick_lossless(query, candidates, isrc=""):
+    """(candidate, points) of the best candidate reaching LOSSLESS_MIN, else None."""
+    top = None
+    for c in candidates or []:
+        points = lossless_points(query, c, isrc) if isinstance(c, dict) else None
+        if points is not None and points >= LOSSLESS_MIN and (top is None or points > top[1]):
+            top = (c, points)
+    return top
+
+
+def _lossless_query(job):
+    """(query, isrc) for the YouTube track a job keeps. The client sends what it showed; YouTube Music fills in
+    a missing length. No YouTube metadata Reef reads carries an ISRC today, so that pass runs only with a hint."""
+    q = matching.query_of({"id": job["video_id"], "title": job.get("title") or "", "channel": job.get("channel") or ""})
+    q["duration"] = matching.fields({"duration": job.get("duration")})["duration"]
+    q["album"] = (job.get("hints") or {}).get("album") or ""
+    if (not q["duration"] or not q["title"]) and ytmusic.enabled():
+        try:
+            song = ytmusic.song(job["video_id"]) or {}
+        except Exception:
+            song = {}
+        if not q["title"]:
+            q = {**matching.query_of(song), "album": q["album"]}
+        q["duration"] = q["duration"] or song.get("duration")
+    return q, str((job.get("hints") or {}).get("isrc") or "").strip()
+
+
+def _lossless_searches(q, isrc):
+    """(search text, ISRC-only) in order: the ISRC, then title + artist + album, title + artist, the title."""
+    base = matching.search_text(q)
+    title = matching.search_text({"title": q["title"]})
+    out = [(isrc, True)] if isrc else []
+    for text in (f"{base} {q['album']}" if q["album"] else "", base, title):
+        if text.strip() and all(text != t for t, _ in out):
+            out.append((text, False))
+    return out
+
+
+def _run_lossless(job):
+    """Keep the Monochrome FLAC of a YouTube job: the keep's meta, or None to keep from YouTube (silently)."""
+    src = sources.get("mc")
+    if src is None or not src.can_keep or sources.parse(job["video_id"])[0] != "yt":
+        return None
+    vid, started = job["video_id"], time.monotonic()
+    q, isrc = _lossless_query(job)
+    if not q["title"]:
+        return None
+    found = None
+    for text, only_isrc in _lossless_searches(q, isrc):
+        try:
+            cands = src.search(text, LOSSLESS_LIMIT)
+        except Exception as e:
+            logger.info(f"keep-lossless id={vid} result=search-failed error={type(e).__name__}: {str(e)[:160]}")
+            return None
+        if only_isrc:
+            cands = [c for c in cands if str(c.get("isrc") or "").upper() == isrc.upper()]
+        found = pick_lossless(q, cands, isrc)
+        if found:
+            break
+    if not found:
+        logger.info(f"keep-lossless id={vid} result=no-match ms={int((time.monotonic() - started) * 1000)}")
+        return None
+    cand, points = found
+    title = job["title"]
+    job["lossless"], job["upgraded_to"] = True, cand["id"]
+    try:
+        meta = _run_generic(job, cand["id"], fmt="flac", expect=cand.get("duration") or q["duration"],
+                            extra={"upgraded_from": vid})
+    except Exception as e:
+        if job.get("file") and os.path.exists(job["file"]):
+            # The FLAC is already in the library: a YouTube keep now would add a second copy. Fail the job instead.
+            logger.warning(f"keep-lossless id={vid} mc={cand['id']} result=error-after-save file={job['file']} "
+                           f"error={type(e).__name__}: {str(e)[:160]}")
+            raise
+        logger.info(f"keep-lossless id={vid} mc={cand['id']} result=fallback error={type(e).__name__}: {str(e)[:160]}")
+        job.update(lossless=False, upgraded_to=None, title=title, percent=0, status="downloading", file=None)
+        job.pop("kept_id", None)
+        return None
+    logger.info(f"keep-lossless id={vid} mc={cand['id']} points={points} result=ok "
+                f"ms={int((time.monotonic() - started) * 1000)}")
+    return meta
 
 
 def _length(path):
@@ -451,7 +615,7 @@ def _length(path):
 
 def _post_steps(job, meta):
     """Gain tags, then lyrics, on the final file. Each step only warns on failure: the track is already kept."""
-    path, tid = job["file"], job["video_id"]
+    path, tid = job["file"], job.get("kept_id") or job["video_id"]
     gain_db = found = None
     t0 = time.monotonic()
     if settings.get("replaygain") and path:
@@ -484,7 +648,11 @@ def _run(job):
     try:
         DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
         TMP_DIR.mkdir(parents=True, exist_ok=True)
-        meta = _run_ytdlp(job) if job["source"] == "yt" else _run_generic(job)
+        meta = None
+        if job["source"] == "yt" and settings.get("keep_lossless"):
+            meta = _run_lossless(job)
+        if meta is None:
+            meta = _run_ytdlp(job) if job["source"] == "yt" else _run_generic(job)
         job["status"] = "converting"  # still busy: the post steps below rewrite the file's tags
         _post_steps(job, meta)
         job["status"] = "done"
@@ -498,7 +666,7 @@ def _run(job):
     try:
         song = navidrome.find_song(job["title"], os.path.basename(job["file"] or ""))
         if song and song.get("coverArt"):
-            history.update(job["video_id"], nd_cover=song["coverArt"], nd_id=song.get("id"))
+            history.update(job.get("kept_id") or job["video_id"], nd_cover=song["coverArt"], nd_id=song.get("id"))
     except Exception:
         pass
 

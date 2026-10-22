@@ -205,3 +205,17 @@ def test_daily_snapshots_keep_seven(files, monkeypatch):
     doc = json.loads((config.BACKUP_DIR / kept[0]).read_text())
     backup.validate(doc)
     assert TOKEN not in json.dumps(doc)
+
+
+def test_round13_settings_are_backed_up_and_restored(files, client):
+    """keep_lossless, sponsorblock_play and replace_dead_tracks are preferences: they travel with a backup."""
+    assert {"keep_lossless", "sponsorblock_play", "replace_dead_tracks"} <= set(backup.SETTINGS_KEYS)
+    assert set(backup.SETTINGS_KEYS) <= set(settings.SCHEMA)
+    settings.update({"keep_lossless": True, "sponsorblock_play": False, "replace_dead_tracks": False})
+    doc = backup.build(now=T0)
+    assert doc["sections"]["settings"] == {"keep_lossless": True, "sponsorblock_play": False,
+                                           "replace_dead_tracks": False}
+    settings.update({"keep_lossless": None, "sponsorblock_play": None, "replace_dead_tracks": None})
+    assert client.post("/api/restore?mode=replace", json=doc).status_code == 200
+    assert (settings.get("keep_lossless"), settings.get("sponsorblock_play"), settings.get("replace_dead_tracks")) == \
+        (True, False, False)
