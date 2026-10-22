@@ -28,6 +28,7 @@
     index: -1,
     from: "",
     shuffle: false,
+    original: null, // play order before shuffling (snapshot restored when shuffle goes off)
     repeat: "off",
     health: null,
     // Search sources from /api/sources; `source` is the chip picked for searching.
@@ -122,6 +123,89 @@
     } catch {}
   }
 
+  // ---------- queue core ----------
+  // Pure functions over [track] arrays: no DOM, no state, inputs never mutated. Tracks are matched by id.
+  // Unit-checked from node by slicing the text between these two sentinel comments.
+  // ==== queue-core:start ====
+  const Q = (() => {
+    function shuffled(list, rand = Math.random) {
+      const a = list.slice();
+      for (let i = a.length - 1; i > 0; i--) {
+        const j = Math.floor(rand() * (i + 1));
+        [a[i], a[j]] = [a[j], a[i]];
+      }
+      return a;
+    }
+    // Shuffle only what comes after the current track; `original` is the snapshot unshuffle() restores.
+    function shuffleUpcoming(queue, index, rand) {
+      const head = queue.slice(0, index + 1);
+      return { queue: head.concat(shuffled(queue.slice(index + 1), rand)), original: queue.slice() };
+    }
+    // Start a fresh shuffled queue at list[index]: it plays first, everything else follows in random order.
+    function shuffleFrom(list, index, rand) {
+      const others = list.filter((_, k) => k !== index);
+      return { queue: [list[index], ...shuffled(others, rand)], index: 0, original: list.slice() };
+    }
+    // Back to the snapshot order, keeping the current track current. Tracks removed while shuffled stay
+    // removed; tracks added while shuffled are appended in their queue order.
+    function unshuffle(queue, index, original) {
+      const current = queue[index];
+      const inQueue = new Set(queue.map((t) => t.id));
+      const base = (original || []).filter((t) => inQueue.has(t.id));
+      const inBase = new Set(base.map((t) => t.id));
+      const out = base.concat(queue.filter((t) => !inBase.has(t.id)));
+      const i = current ? out.findIndex((t) => t.id === current.id) : -1;
+      return { queue: out, index: i >= 0 ? i : Math.min(index, out.length - 1) };
+    }
+    // Upcoming copy of `id` (after the current track), or -1.
+    const upcomingAt = (queue, index, id) => queue.findIndex((t, k) => k > index && t.id === id);
+    // Right after the current track; a copy already upcoming is moved rather than duplicated.
+    function insertNext(queue, index, track) {
+      const q = queue.slice();
+      const at = upcomingAt(q, index, track.id);
+      if (at >= 0) q.splice(at, 1);
+      q.splice(index + 1, 0, track);
+      return q;
+    }
+    // Play next while shuffled: insert into the queue and into the snapshot too, right after the current
+    // track in each, so it stays next when shuffle goes off (Apple Music behaviour). "Add to queue" leaves
+    // the snapshot alone, so those tracks end up at the end. If the current track isn't in the snapshot
+    // (it was itself added while shuffled), the snapshot is left alone: unshuffle() then appends the
+    // current track and this one together, in queue order, so it still follows directly.
+    function playNext(queue, index, track, original) {
+      const q = insertNext(queue, index, track);
+      if (!original) return { queue: q, original };
+      const p = queue[index] ? original.findIndex((t) => t.id === queue[index].id) : -1;
+      return { queue: q, original: p >= 0 ? insertNext(original, p, track) : original.slice() };
+    }
+    // At the end; a copy already upcoming is moved to the end.
+    function append(queue, index, track) {
+      const q = queue.slice();
+      const at = upcomingAt(q, index, track.id);
+      if (at >= 0) q.splice(at, 1);
+      q.push(track);
+      return q;
+    }
+    function removeAt(queue, index, i) {
+      if (!(i >= 0 && i < queue.length)) return { queue: queue.slice(), index };
+      const q = queue.slice();
+      q.splice(i, 1);
+      // Removing the current track makes the one after it current (or the new last one).
+      return { queue: q, index: i < index ? index - 1 : i === index ? Math.min(index, q.length - 1) : index };
+    }
+    const clearUpcoming = (queue, index) => queue.slice(0, index + 1);
+    // -1 = nothing to advance to (stop). Repeat-one loops in the <audio> element; a manual skip still moves on.
+    function nextIndex(len, index, repeat) {
+      if (!len) return -1;
+      if (index + 1 < len) return index + 1;
+      return repeat === "all" ? 0 : -1;
+    }
+    // -1 = restart the current track.
+    const prevIndex = (len, index) => (len && index > 0 ? Math.min(index, len) - 1 : -1);
+    return { shuffled, shuffleUpcoming, shuffleFrom, unshuffle, insertNext, playNext, append, removeAt, clearUpcoming, nextIndex, prevIndex };
+  })();
+  // ==== queue-core:end ====
+
   const navidromeUrl = (path) => `${location.protocol}//${location.hostname}:4533${path}`;
   const cur = () => state.queue[state.index];
   const slim = (t) => ({ id: t.id, title: t.title, channel: t.channel, duration: t.duration, source: t.source || srcKey(t.id), ...(t.codec ? { codec: t.codec } : {}), ...(t.album ? { album: t.album } : {}) });
@@ -151,6 +235,8 @@
     return `<button class="keep ${s}" data-keep="${esc(id)}" data-list="${list}" aria-label="${s === "kept" ? "In your library" : "Keep in library"}">${icon(s === "kept" ? "check" : "plus")}</button>`;
   }
 
+  const moreBtn = (t, i, list) => `<button class="icon-btn sm more-btn" data-more="${esc(t.id)}" data-i="${i}" data-list="${list}" aria-label="More for ${esc(t.title)}">${icon("more")}</button>`;
+
   function refreshKeepButtons() {
     $$("[data-keep]").forEach((b) => {
       const s = keepState(b.dataset.keep);
@@ -159,7 +245,7 @@
       b.setAttribute("aria-label", s === "kept" ? "In your library" : "Keep in library");
       const use = b.querySelector("use");
       if (use) use.setAttribute("href", `#i-${s === "kept" ? "check" : "plus"}`);
-    });
+    });    if (!$("#act-sheet").hidden) renderActions();
   }
 
   function markPlaying() {
@@ -235,6 +321,7 @@
         <span class="row-text"><span class="row-t">${esc(t.title)}</span><span class="row-s">${subtitle}</span></span>
       </button>
       ${keepBtn(t.id, list)}
+      ${moreBtn(t, i, list)}
     </li>`;
   }
 
@@ -324,6 +411,7 @@
             <div class="top-actions">
               <button class="play-round" data-play="0" data-list="results" aria-label="Play">${icon("play", "fill")}</button>
               ${keepBtn(t.id, "results")}
+              ${moreBtn(t, 0, "results")}
             </div>
           </div>
         </div>`;
@@ -508,13 +596,19 @@
   function play(listName, i, { shuffle = false } = {}) {
     const list = lists[listName]?.();
     if (!list || !list.length) return;
-    state.queue = list.map(slim);
-    state.from = FROM[listName] || "";
+    const tracks = list.map(slim);
+    i = Math.min(Math.max(i, 0), tracks.length - 1);
     if (shuffle) {
       state.shuffle = true;
-      i = Math.floor(Math.random() * list.length);
+      i = Math.floor(Math.random() * tracks.length);
     }
-    state.index = Math.min(Math.max(i, 0), list.length - 1);
+    if (state.shuffle) {
+      const r = Q.shuffleFrom(tracks, i);
+      state.queue = r.queue; state.index = r.index; state.original = r.original;
+    } else {
+      state.queue = tracks; state.index = i; state.original = null;
+    }
+    state.from = FROM[listName] || "";
     prefetch([cur()?.id]);
     load();
   }
@@ -523,55 +617,152 @@
     store.set("plays", [slim(t), ...store.get("plays", []).filter((p) => p.id !== t.id)].slice(0, 12));
   }
 
+  function setMediaMeta(t) {
+    if (!("mediaSession" in navigator) || !t) return;
+    const abs = (u) => new URL(u, location.href).href;
+    navigator.mediaSession.metadata = new MediaMetadata({
+      title: t.title, artist: t.channel, album: "Reef",
+      artwork: srcKey(t.id) === "yt"
+        ? [{ src: thumb(t.id), sizes: "320x180", type: "image/jpeg" }, { src: bigThumb(t.id), sizes: "1280x720", type: "image/jpeg" }]
+        : [{ src: abs(artUrl(t.id, 600)), sizes: "600x600", type: "image/jpeg" }],
+    });
+  }
+
+  const streamUrl = (t) => `/api/stream/${encodeURIComponent(t.id)}`;
+
   function load() {
     const t = cur();
     if (!t) return;
-    audio.src = `/api/stream/${encodeURIComponent(t.id)}`;
+    resume = null;
+    audio.src = streamUrl(t);
     audio.play().catch(() => {});
     // Resolve the next track once this one is playing, so it doesn't compete for the extractor.
-    prefetchNext = state.queue[state.index + 1]?.id || null;
+    prefetched = null;
+    prefetchNext = upcomingId();
     rememberPlay(t);
     updatePlayer();
     markPlaying();
     setProgress(0, t.duration || 0);
     resetLyrics();
-    if ("mediaSession" in navigator) {
-      const abs = (u) => new URL(u, location.href).href;
-      navigator.mediaSession.metadata = new MediaMetadata({
-        title: t.title, artist: t.channel, album: "Reef",
-        artwork: srcKey(t.id) === "yt"
-          ? [{ src: thumb(t.id), sizes: "320x180", type: "image/jpeg" }, { src: bigThumb(t.id), sizes: "1280x720", type: "image/jpeg" }]
-          : [{ src: abs(artUrl(t.id, 600)), sizes: "600x600", type: "image/jpeg" }],
-      });
+    setMediaMeta(t);
+    saveSession(0);
+    renderQueue();
+  }
+
+  // Play (or resume) whatever is current. A restored session has no src yet: set it on this first
+  // play (inside the user's gesture, which iOS needs) and seek once metadata is in.
+  function playAudio() {
+    const t = cur();
+    if (!t) return;
+    if (!resume) { audio.play().catch(() => {}); return; }
+    const pos = resume.position;
+    resume = null;
+    audio.src = streamUrl(t);
+    if (pos > 0) {
+      audio.addEventListener("loadedmetadata", () => {
+        if (cur()?.id !== t.id || audio.getAttribute("src") !== streamUrl(t)) return;
+        const d = audio.duration;
+        if (!isFinite(d) || pos < d - 1) audio.currentTime = pos;
+      }, { once: true });
     }
+    prefetched = null;
+    prefetchNext = upcomingId();
+    audio.play().catch(() => {});
   }
 
   function next() {
     const n = state.queue.length;
     if (!n) return;
-    let i;
-    if (state.shuffle && n > 1) {
-      do { i = Math.floor(Math.random() * n); } while (i === state.index);
-    } else {
-      i = state.index + 1;
-    }
-    if (i >= n) {
-      if (state.repeat === "all") i = 0;
-      else { audio.pause(); audio.currentTime = 0; return; }
+    const i = Q.nextIndex(n, state.index, state.repeat);
+    if (i < 0) {
+      audio.pause();
+      if (resume) { resume.position = 0; setProgress(0, duration()); saveSession(); } else audio.currentTime = 0;
+      return;
     }
     state.index = i;
     load();
   }
 
   function prev() {
-    if (audio.currentTime > 3 || state.index <= 0) { audio.currentTime = 0; return; }
-    state.index -= 1;
+    const pos = resume ? resume.position : audio.currentTime;
+    const i = Q.prevIndex(state.queue.length, state.index);
+    if (pos > 3 || i < 0) {
+      if (resume) { resume.position = 0; setProgress(0, duration()); saveSession(); } else audio.currentTime = 0;
+      return;
+    }
+    state.index = i;
     load();
   }
 
   function togglePlay() {
     if (!cur()) return;
-    if (audio.paused) audio.play().catch(() => {}); else audio.pause();
+    if (audio.paused) playAudio(); else audio.pause();
+  }
+
+  // ---------- queue actions ----------
+  // A queue change: persist it, re-plan the next-track prefetch, refresh the open queue sheet.
+  function queueChanged() {
+    saveSession();
+    planPrefetch();
+    renderQueue();
+  }
+
+  function addToQueue(t, listName, mode) {
+    if (!t) return;
+    t = slim(t);
+    if (!cur()) {
+      // Nothing loaded: either action just starts playing it.
+      state.queue = [t]; state.index = 0; state.original = state.shuffle ? [t] : null;
+      state.from = FROM[listName] || "";
+      load();
+      return;
+    }
+    if (cur().id === t.id) { toast("Already playing"); return; }
+    if (mode === "next") {
+      const r = Q.playNext(state.queue, state.index, t, state.shuffle ? state.original : null);
+      state.queue = r.queue;
+      if (state.shuffle) state.original = r.original;
+    } else {
+      state.queue = Q.append(state.queue, state.index, t);
+    }
+    queueChanged();
+    toast(mode === "next" ? `Playing next: “${t.title}”` : `Added to queue: “${t.title}”`);
+  }
+
+  function jumpTo(i) {
+    if (!(i >= 0 && i < state.queue.length) || i === state.index) return;
+    state.index = i;
+    load();
+  }
+
+  function removeFromQueue(i) {
+    if (i === state.index) return; // the sheet only offers upcoming tracks
+    const r = Q.removeAt(state.queue, state.index, i);
+    state.queue = r.queue; state.index = r.index;
+    queueChanged();
+  }
+
+  function clearUpcoming() {
+    state.queue = Q.clearUpcoming(state.queue, state.index);
+    queueChanged();
+  }
+
+  function toggleShuffle() {
+    if (!state.shuffle) {
+      const r = Q.shuffleUpcoming(state.queue, state.index);
+      state.queue = r.queue; state.original = r.original; state.shuffle = true;
+    } else {
+      const r = Q.unshuffle(state.queue, state.index, state.original);
+      state.queue = r.queue; state.index = r.index; state.original = null; state.shuffle = false;
+    }
+    updateModes();
+    queueChanged();
+  }
+
+  function cycleRepeat() {
+    state.repeat = { off: "all", all: "one", one: "off" }[state.repeat] || "off";
+    updateModes();
+    queueChanged();
   }
 
   function updatePlayer() {
@@ -627,10 +818,26 @@
     const r = $("#np-repeat");
     r.classList.toggle("on", state.repeat !== "off");
     r.classList.toggle("one", state.repeat === "one");
-    audio.loop = state.repeat === "one";
+    // "End of track" sleep needs `ended` to fire, which a looping element never does.
+    audio.loop = state.repeat === "one" && sleep.mode !== "end";
+    renderQueueModes();
   }
 
-  let prefetchNext = null;
+  // ---------- prefetch ----------
+  // prefetchNext waits for the current track's `playing`; `prefetched` stops re-warming the same id.
+  let prefetchNext = null, prefetched = null;
+  function upcomingId() {
+    const i = Q.nextIndex(state.queue.length, state.index, state.repeat);
+    return i >= 0 && i !== state.index ? state.queue[i].id : null;
+  }
+  function planPrefetch() {
+    const id = upcomingId();
+    prefetchNext = null;
+    if (!id || id === prefetched) return;
+    if (!resume && !audio.paused && audio.readyState >= 3) { prefetch([id]); prefetched = id; }
+    else prefetchNext = id;
+  }
+
   function setLoading(on) {
     document.body.classList.toggle("is-loading", on);
     for (const id of ["#mini-play", "#np-play"]) $(id).setAttribute("aria-busy", on ? "true" : "false");
@@ -652,22 +859,161 @@
     }
   }
 
-  audio.addEventListener("timeupdate", () => { setProgress(audio.currentTime, duration()); if (lyr.times.length) syncLyrics(); });
+  // ---------- session (queue persistence + resume) ----------
+  // store "session": the queue, where we are in it and the modes, so a reload or a killed Home Screen
+  // app comes back paused where it was. `resume` is set while a restored track has no src yet.
+  let resume = null;
+  let sessionRev = Number(store.get("session", null)?.rev) || 0;
+  let posSavedAt = 0;
+  function saveSession(position) {
+    const t = cur();
+    if (position == null) position = resume ? resume.position : (t && audio.getAttribute("src") ? audio.currentTime || 0 : 0);
+    posSavedAt = Date.now();
+    store.set("session", {
+      v: 1, rev: ++sessionRev,
+      queue: state.queue.map(slim), index: state.index, from: state.from,
+      shuffle: state.shuffle, original: state.shuffle && state.original ? state.original.map(slim) : null,
+      repeat: state.repeat, position: Math.round(position * 10) / 10, savedAt: Date.now(),
+    });
+  }
+
+  const validTrack = (t) => t && typeof t === "object" && typeof t.id === "string" && t.id !== "";
+  function restoreSession() {
+    if (state.queue.length) return; // something already started; never clobber it
+    const s = store.get("session", null);
+    if (!s || s.v !== 1 || !Array.isArray(s.queue) || !s.queue.length || !s.queue.every(validTrack)) return;
+    const index = Number(s.index);
+    if (!Number.isInteger(index) || index < 0 || index >= s.queue.length) return;
+    state.queue = s.queue.map(slim);
+    state.index = index;
+    state.from = typeof s.from === "string" ? s.from : "";
+    state.repeat = ["off", "all", "one"].includes(s.repeat) ? s.repeat : "off";
+    state.shuffle = !!s.shuffle;
+    state.original = state.shuffle && Array.isArray(s.original) ? s.original.filter(validTrack).map(slim) : null;
+    const t = cur();
+    let pos = Number(s.position);
+    if (!isFinite(pos) || pos < 0 || (t.duration && pos >= t.duration - 1)) pos = 0;
+    resume = { position: pos };
+    updatePlayer();
+    markPlaying();
+    setProgress(pos, t.duration || 0);
+    setMediaMeta(t);
+    updatePlayState();
+  }
+
+  // ---------- sleep timer ----------
+  // A wall-clock deadline checked every few seconds and on timeupdate/visibilitychange: Safari throttles
+  // (or freezes) timers in the background, so one long setTimeout could fire far too late.
+  const sleep = { mode: "off", minutes: 0, deadline: 0, timer: 0, fade: 0, fadeFrom: 1 };
+  const SLEEP_OPTS = [["off", "Off"], ["15", "15 minutes"], ["30", "30 minutes"], ["45", "45 minutes"], ["60", "1 hour"], ["end", "End of track"]];
+  const sleepLeft = () => Math.max(1, Math.ceil((sleep.deadline - Date.now()) / 60000));
+
+  function setSleep(choice, { quiet = false } = {}) {
+    clearInterval(sleep.timer);
+    sleep.timer = 0;
+    stopFade();
+    if (choice === "end") {
+      Object.assign(sleep, { mode: "end", minutes: 0, deadline: 0 });
+      if (!quiet) toast("Pausing after this track");
+    } else if (Number(choice) > 0) {
+      Object.assign(sleep, { mode: "time", minutes: Number(choice), deadline: Date.now() + Number(choice) * 60000 });
+      sleep.timer = setInterval(checkSleep, 5000);
+      if (!quiet) toast(`Sleep timer: ${choice} min`);
+    } else {
+      Object.assign(sleep, { mode: "off", minutes: 0, deadline: 0 });
+      if (!quiet) toast("Sleep timer off");
+    }
+    updateModes();
+    renderSleepBadge();
+  }
+
+  function checkSleep() {
+    if (sleep.mode !== "time") return;
+    if (Date.now() < sleep.deadline) { renderSleepBadge(); return; }
+    setSleep("off", { quiet: true });
+    if (audio.paused) return;
+    // iOS ignores audio.volume (reads back 1), so fade only where the element really takes it; and not
+    // in the background, where the fade's timer could stall.
+    if (!document.hidden && volumeWritable()) fadeOutAndPause(); else audio.pause();
+  }
+
+  function volumeWritable() {
+    const v = audio.volume, probe = v > 0.5 ? 0.25 : 0.75;
+    try { audio.volume = probe; } catch { return false; }
+    const ok = Math.abs(audio.volume - probe) < 0.01;
+    audio.volume = v;
+    return ok;
+  }
+
+  function fadeOutAndPause() {
+    const v0 = audio.volume, steps = 30;
+    let k = 0;
+    sleep.fade = setInterval(() => {
+      k += 1;
+      audio.volume = Math.max(0, v0 * (1 - k / steps));
+      if (k >= steps) { clearInterval(sleep.fade); sleep.fade = 0; audio.pause(); audio.volume = v0; }
+    }, 100);
+    sleep.fadeFrom = v0;
+  }
+  function stopFade() {
+    if (!sleep.fade) return;
+    clearInterval(sleep.fade);
+    sleep.fade = 0;
+    audio.volume = sleep.fadeFrom;
+  }
+
+  function renderSleepBadge() {
+    const b = $("#np-sleep"), badge = $("#np-sleep-badge");
+    b.classList.toggle("on", sleep.mode !== "off");
+    const txt = sleep.mode === "time" ? String(sleepLeft()) : "";
+    if (badge.textContent !== txt) badge.textContent = txt;
+    badge.hidden = !txt;
+    b.setAttribute("aria-label", sleep.mode === "time" ? `Sleep timer: ${txt} min left`
+      : sleep.mode === "end" ? "Sleep timer: end of track" : "Sleep timer");
+    if (!$("#sleep-sheet").hidden) renderSleep();
+  }
+
+  function renderSleep() {
+    $("#sleep-menu").innerHTML = SLEEP_OPTS.map(([v, label]) => {
+      const on = v === "off" ? sleep.mode === "off" : v === "end" ? sleep.mode === "end" : sleep.mode === "time" && sleep.minutes === Number(v);
+      const aside = on && sleep.mode === "time" ? `${sleepLeft()} min left` : "";
+      return `<button class="menu-item${on ? " on" : ""}" data-sleep="${v}" aria-pressed="${on}">
+        <span class="menu-l">${esc(label)}</span>${aside ? `<span class="aside">${aside}</span>` : ""}${on ? icon("check") : ""}</button>`;
+    }).join("");
+  }
+
+  // ---------- audio events ----------
+  audio.addEventListener("timeupdate", () => {
+    setProgress(audio.currentTime, duration());
+    if (lyr.times.length) syncLyrics();
+    if (sleep.mode === "time") checkSleep();
+    if (!audio.paused && Date.now() - posSavedAt >= 5000) saveSession();
+  });
   audio.addEventListener("loadedmetadata", () => setProgress(audio.currentTime, duration()));
   audio.addEventListener("play", updatePlayState);
-  audio.addEventListener("pause", updatePlayState);
-  audio.addEventListener("ended", () => { updatePlayState(); next(); });
+  audio.addEventListener("pause", () => { updatePlayState(); if (cur()) saveSession(); });
+  audio.addEventListener("ended", () => {
+    updatePlayState();
+    if (sleep.mode === "end") { setSleep("off", { quiet: true }); saveSession(); return; } // pause instead of advancing
+    next();
+  });
   audio.addEventListener("error", () => { setLoading(false); if (audio.getAttribute("src")) toast("Couldn't play this one"); updatePlayState(); });
   audio.addEventListener("loadstart", () => { if (audio.getAttribute("src")) setLoading(true); });
   audio.addEventListener("waiting", () => setLoading(true));
   audio.addEventListener("playing", () => {
     setLoading(false);
-    if (prefetchNext) { prefetch([prefetchNext]); prefetchNext = null; }
+    if (prefetchNext) { prefetch([prefetchNext]); prefetched = prefetchNext; prefetchNext = null; }
     if (lyr.on && cur()) fetchLyrics(cur()); // warm, so opening the player shows them at once
   });
   audio.addEventListener("pause", () => setLoading(false));
   audio.addEventListener("ended", () => setLoading(false));
   audio.addEventListener("emptied", () => { if (!audio.getAttribute("src")) setLoading(false); });
+
+  document.addEventListener("visibilitychange", () => {
+    checkSleep();
+    if (document.visibilityState === "hidden" && cur()) saveSession();
+  });
+  window.addEventListener("pagehide", () => { if (cur()) saveSession(); });
 
   const seek = $("#np-seek");
   seek.addEventListener("input", () => {
@@ -680,18 +1026,23 @@
   });
   seek.addEventListener("change", () => {
     const d = duration();
-    if (d) audio.currentTime = (seek.value / 1000) * d;
     seeking = false;
+    if (!d) return;
+    const t = (seek.value / 1000) * d;
+    if (resume) { resume.position = t; setProgress(t, d); saveSession(); } else audio.currentTime = t;
   });
 
   if ("mediaSession" in navigator) {
     const ms = navigator.mediaSession;
     const set = (a, f) => { try { ms.setActionHandler(a, f); } catch { /* unsupported action */ } };
-    set("play", () => audio.play());
+    set("play", playAudio);
     set("pause", () => audio.pause());
     set("previoustrack", prev);
     set("nexttrack", next);
-    set("seekto", (e) => { if (e.seekTime != null) audio.currentTime = e.seekTime; });
+    set("seekto", (e) => {
+      if (e.seekTime == null) return;
+      if (resume) { resume.position = e.seekTime; setProgress(e.seekTime, duration()); } else audio.currentTime = e.seekTime;
+    });
   }
 
   // ---------- now playing sheet ----------
@@ -700,7 +1051,7 @@
     const np = $("#np");
     np.classList.add("open");
     np.setAttribute("aria-hidden", "false");
-    document.documentElement.classList.add("lock");
+    syncLock();
     if (lyr.on) showLyrics();
   }
   function closeNP() {
@@ -708,8 +1059,10 @@
     np.classList.remove("open");
     np.style.transform = "";
     np.setAttribute("aria-hidden", "true");
-    document.documentElement.classList.remove("lock");
+    syncLock();
   }
+  // Page scroll stays locked while the player or any sheet is up.
+  const syncLock = () => document.documentElement.classList.toggle("lock", npOpen() || $$(".sheet-wrap.open").length > 0);
 
   (function swipeToClose() {
     const np = $("#np");
@@ -869,8 +1222,9 @@
     if (!line || !lyr.lines[line.dataset.i]) return;
     clearTimeout(lyr.holdTimer);
     lyr.held = false;
-    audio.currentTime = lyr.lines[line.dataset.i].t;
-    if (audio.paused) audio.play().catch(() => {});
+    const at = lyr.lines[line.dataset.i].t;
+    if (resume) resume.position = at; else audio.currentTime = at;
+    if (audio.paused) playAudio();
     syncLyrics(true, true);
   });
 
@@ -904,8 +1258,7 @@
   }
 
   // ---------- share ----------
-  async function share() {
-    const t = cur();
+  async function share(t = cur()) {
     if (!t) return;
     // Only YouTube tracks have a public page; others share "Title – Artist" as text.
     const url = srcKey(t.id) === "yt" ? `https://www.youtube.com/watch?v=${t.id}` : `${t.title}${t.channel ? ` – ${t.channel}` : ""}`;
@@ -942,17 +1295,108 @@
     $("#status-list").innerHTML = rows.map(([k, v, c]) => `<li><span class="k">${esc(k)}</span><span class="v ${c}">${esc(v)}</span></li>`).join("");
   }
   async function openStatus() {
-    const w = $("#status-sheet");
     renderStatus();
-    w.hidden = false;
-    requestAnimationFrame(() => requestAnimationFrame(() => w.classList.add("open")));
+    openSheet("#status-sheet");
     await loadHealth();
     renderStatus();
   }
-  function closeStatus() {
-    const w = $("#status-sheet");
+
+  // ---------- sheets ----------
+  function openSheet(sel) {
+    const w = $(sel);
+    w.hidden = false;
+    $(".sheet", w).style.transform = "";
+    requestAnimationFrame(() => requestAnimationFrame(() => { w.classList.add("open"); syncLock(); }));
+  }
+  function closeSheet(w) {
+    if (typeof w === "string") w = $(w);
+    if (!w || w.hidden) return;
     w.classList.remove("open");
-    setTimeout(() => { w.hidden = true; }, 380);
+    $(".sheet", w).style.transform = "";
+    syncLock();
+    setTimeout(() => { if (!w.classList.contains("open")) w.hidden = true; }, 380);
+  }
+  const topSheet = () => $$(".sheet-wrap.open").pop();
+
+  // Drag a sheet down by its top (grabber + heading) to dismiss it, like the player.
+  for (const w of $$(".sheet-wrap")) {
+    const sheet = $(".sheet", w), zone = $(".sheet-top", w);
+    let y0 = null, dy = 0;
+    zone.addEventListener("touchstart", (e) => { y0 = e.touches[0].clientY; dy = 0; sheet.style.transition = "none"; }, { passive: true });
+    zone.addEventListener("touchmove", (e) => {
+      if (y0 == null) return;
+      dy = Math.max(0, e.touches[0].clientY - y0);
+      sheet.style.transform = `translateY(${dy}px)`;
+    }, { passive: true });
+    zone.addEventListener("touchend", () => {
+      sheet.style.transition = "";
+      if (dy > 80) closeSheet(w); else sheet.style.transform = "";
+      y0 = null;
+    });
+  }
+
+  // ---------- track actions sheet ----------
+  let actTarget = null; // { t, list }
+  function openActions(id, listName, i) {
+    const list = lists[listName]?.() || [];
+    const t = (list[i]?.id === id ? list[i] : list.find((x) => x.id === id)) || state.queue.find((x) => x.id === id);
+    if (!t) return;
+    actTarget = { t: slim(t), list: listName };
+    renderActions();
+    openSheet("#act-sheet");
+  }
+  function renderActions() {
+    if (!actTarget) return;
+    const { t } = actTarget;
+    const ks = keepState(t.id);
+    $("#act-head").innerHTML = `<span class="row-art">${art(t.id)}</span>
+      <span class="row-text"><span class="row-t">${esc(t.title)}</span><span class="row-s">${esc(t.channel)}${srcBadge(t)}</span></span>`;
+    const item = (act, ic, label, extra = "") => `<button class="menu-item" data-act="${act}"${extra}>${icon(ic)}<span class="menu-l">${label}</span></button>`;
+    const keepItem = ks === "kept" ? item("keep", "check", "In your library", " disabled")
+      : ks === "pending" ? item("keep", "download", "Keeping…")
+      : canKeep(t.id) ? item("keep", "plus", "Keep in library") : "";
+    $("#act-menu").innerHTML = item("next", "play-next", "Play next") + item("queue", "queue-add", "Add to queue") + keepItem + item("share", "share", "Share");
+  }
+  function runAction(act) {
+    const a = actTarget;
+    closeSheet("#act-sheet");
+    if (!a) return;
+    if (act === "next" || act === "queue") addToQueue(a.t, a.list, act);
+    else if (act === "keep") keep(a.t.id, a.list);
+    else if (act === "share") share(a.t);
+  }
+
+  // ---------- queue sheet ----------
+  function openQueue() {
+    openSheet("#queue-sheet");
+    renderQueue();
+    renderQueueModes();
+    $("#q-body").scrollTop = 0;
+  }
+  function renderQueueModes() {
+    const el = $("#q-modes");
+    if (!el || $("#queue-sheet").hidden) return;
+    const rep = { off: "Repeat", all: "Repeat all", one: "Repeat one" }[state.repeat];
+    el.innerHTML = `<button class="chip sm${state.shuffle ? " on" : ""}" data-q-mode="shuffle" aria-pressed="${state.shuffle}">${icon("shuffle")}Shuffle</button>
+      <button class="chip sm${state.repeat !== "off" ? " on" : ""}" data-q-mode="repeat" aria-pressed="${state.repeat !== "off"}">${icon("repeat")}${rep}</button>`;
+  }
+  function qRow(t, i, now) {
+    const body = `<span class="row-art">${art(t.id)}${now ? eqIfPlaying(t.id) : ""}</span>
+      <span class="row-text"><span class="row-t">${esc(t.title)}</span><span class="row-s">${esc(t.channel)}${t.duration ? ` · ${fmt(t.duration)}` : ""}</span></span>`;
+    return now
+      ? `<li class="row playing" data-track="${esc(t.id)}"><span class="row-main">${body}</span></li>`
+      : `<li class="row q-row"><button class="row-main" data-q-jump="${i}" aria-label="Play ${esc(t.title)}">${body}</button>
+          <button class="icon-btn sm" data-q-remove="${i}" aria-label="Remove ${esc(t.title)} from queue">${icon("x")}</button></li>`;
+  }
+  function renderQueue() {
+    if ($("#queue-sheet").hidden) return;
+    const t = cur();
+    if (!t) { $("#q-body").innerHTML = emptyState("note", "Nothing playing", "Play a song to start a queue."); return; }
+    const up = state.queue.slice(state.index + 1);
+    $("#q-body").innerHTML = `<h4 class="q-label">Now playing</h4><ul class="rows">${qRow(t, state.index, true)}</ul>
+      <div class="head-row q-up"><h4 class="q-label">Up next${up.length ? ` · ${up.length}` : ""}</h4>${up.length ? `<button class="link-btn" data-q-clear>Clear</button>` : ""}</div>
+      ${up.length ? `<ul class="rows">${up.map((x, k) => qRow(x, state.index + 1 + k)).join("")}</ul>`
+        : `<p class="q-empty">${state.repeat === "all" && state.queue.length > 1 ? "Repeat is on: the queue starts over after this." : "Nothing queued. Use ⋯ on a song to add it."}</p>`}`;
   }
 
   // ---------- toast ----------
@@ -967,10 +1411,17 @@
 
   // ---------- events ----------
   document.addEventListener("click", (e) => {
-    const t = e.target.closest("[data-keep],[data-play],[data-search],[data-source],[data-home-tab],[data-filter],[data-dismiss],[data-play-all],[data-shuffle-all],[data-close],[data-clear-finished],[data-clear-searches]");
+    const t = e.target.closest("[data-keep],[data-play],[data-search],[data-source],[data-home-tab],[data-filter],[data-dismiss],[data-play-all],[data-shuffle-all],[data-close],[data-clear-finished],[data-clear-searches],[data-more],[data-act],[data-q-jump],[data-q-remove],[data-q-clear],[data-q-mode],[data-sleep]");
     if (!t) return;
     const d = t.dataset;
     if ("keep" in d) { e.preventDefault(); if (d.keep) keep(d.keep, d.list); return; }
+    if ("more" in d) { openActions(d.more, d.list, Number(d.i)); return; }
+    if ("act" in d) { if (!t.disabled) runAction(d.act); return; }
+    if ("qJump" in d) { jumpTo(Number(d.qJump)); return; }
+    if ("qRemove" in d) { removeFromQueue(Number(d.qRemove)); return; }
+    if ("qClear" in d) { clearUpcoming(); return; }
+    if ("qMode" in d) { if (d.qMode === "shuffle") toggleShuffle(); else cycleRepeat(); return; }
+    if ("sleep" in d) { setSleep(d.sleep); closeSheet("#sleep-sheet"); return; }
     if ("play" in d) { play(d.list, Number(d.play)); return; }
     if ("search" in d) { runSearch(d.search); return; }
     if ("source" in d) {
@@ -1002,7 +1453,7 @@
     if ("clearSearches" in d) { store.set("searches", []); renderSearch(); return; }
     if ("playAll" in d) { state.shuffle = false; play(d.playAll, 0); return; }
     if ("shuffleAll" in d) { play(d.shuffleAll, 0, { shuffle: true }); return; }
-    if ("close" in d) { closeStatus(); }
+    if ("close" in d) { closeSheet(t.closest(".sheet-wrap")); }
   });
 
   $("#search-bar").addEventListener("submit", (e) => { e.preventDefault(); runSearch($("#q").value); });
@@ -1024,19 +1475,17 @@
   $("#np-play").addEventListener("click", togglePlay);
   $("#np-next").addEventListener("click", next);
   $("#np-prev").addEventListener("click", prev);
-  $("#np-share").addEventListener("click", share);
-  $("#np-share2").addEventListener("click", share);
+  $("#np-share").addEventListener("click", () => share());
+  $("#np-queue").addEventListener("click", openQueue);
+  $("#np-sleep").addEventListener("click", () => { renderSleep(); openSheet("#sleep-sheet"); });
   $("#np-dl").addEventListener("click", closeNP);
   $("#np-lyr").addEventListener("click", () => setLyricsOn(!lyr.on));
-  $("#np-shuffle").addEventListener("click", () => { state.shuffle = !state.shuffle; updateModes(); });
-  $("#np-repeat").addEventListener("click", () => {
-    state.repeat = { off: "all", all: "one", one: "off" }[state.repeat];
-    updateModes();
-  });
+  $("#np-shuffle").addEventListener("click", toggleShuffle);
+  $("#np-repeat").addEventListener("click", cycleRepeat);
   $("#status-btn").addEventListener("click", openStatus);
   document.addEventListener("keydown", (e) => {
     if (e.key !== "Escape") return;
-    if (!$("#status-sheet").hidden) closeStatus();
+    if (topSheet()) closeSheet(topSheet());
     else if ($("#np").classList.contains("open")) closeNP();
   });
 
@@ -1046,6 +1495,7 @@
 
   // ---------- boot ----------
   state.view = "";
+  restoreSession();
   route();
   setLyricsOn(lyr.on);
   loadSources();

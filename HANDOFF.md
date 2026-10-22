@@ -114,7 +114,16 @@ result card, Songs rows with **+**, and filter chips. Design tokens are at the t
   `REEF_REPLAYGAIN=0` / `REEF_LRC_SIDECAR=1` toggle them. Title/artist cleanup lives in `tagging.py`.
 - `/api/lyrics/<id>`: Navidrome `getLyricsBySongId` for library tracks, else LRCLIB. Now Playing has a Lyrics button
   (bottom row): synced highlight, tap a line to seek, auto-scroll pauses 4 s after you scroll.
-- Next per the plan: Phase 3 player (queue persistence, sleep timer, play next), then YT Music via `ytmusicapi`.
+
+## Round 5 (2026-10-21): player (Phase 3)
+
+- Queue logic is pure functions between `// ==== queue-core:start/end ====` in `static/app.js` (shuffle only
+  upcoming + restore original order, Play next stays next on unshuffle, dedupe-move, remove/jump/clear).
+- ⋯ on every row → Play next / Add to queue / Keep / Share. Now Playing bottom row: Lyrics, Keep, Up next, Sleep, Downloads.
+- Sleep timer (15/30/45/60 min, end of track) runs off a deadline checked every 5 s + on timeupdate/visibilitychange.
+- `reef.session` in localStorage restores the queue paused at the saved position after a reload.
+- Not yet confirmed on a real iPhone: sleep timer firing while locked, sheet drag-to-close.
+- Next per the plan: Phase 4, YouTube Music via `ytmusicapi` (search with artist/album, suggestions, radio/autoplay).
 
 ## Ideas / next steps
 
