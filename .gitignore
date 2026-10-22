@@ -16,3 +16,11 @@ blocklist.json
 blocklist.json.tmp
 logs/
 reef-run.pid
+listens.json
+listens.json.tmp
+likes.json
+likes.json.tmp
+playlists.json
+playlists.json.tmp
+settings.json
+settings.json.tmp

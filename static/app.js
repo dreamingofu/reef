@@ -38,6 +38,7 @@
     original: null, // play order before shuffling (snapshot restored when shuffle goes off)
     repeat: "off",
     health: null,
+    settings: {}, // server-side settings (/api/settings `values`); missing keys mean the defaults
     blocked: null, // hidden artists from /api/blocklist (null until loaded)
     // Search sources from /api/sources; `source` is the chip picked for searching.
     sources: [{ key: "yt", name: "YouTube", can_keep: true, codec_label: "AAC" }],
@@ -317,6 +318,52 @@
   })();
   // ==== recovery-core:end ====
 
+  // ---------- library + listen core ----------
+  // Pure helpers for playing kept tracks from Navidrome (production plan P1.5) and for the listen log
+  // (POST /api/listens). Unit-checked from node by slicing the text between these two sentinel comments.
+  // ==== library-core:start ====
+  const L = (() => {
+    const COUNT_S = 30; // the server's counting rule, mirrored for display; the server decides what's stored
+    const COUNT_SHARE = 0.5;
+    const MIN_REPORT_S = 1; // shorter plays aren't reported at all
+    const ND_ID = /^[\w.-]{1,128}$/;
+    // The id the player streams for track `t`: the Navidrome copy (`nd:<ndId>`) of a kept track when the
+    // library is on, the setting allows it and that copy hasn't failed for this play; else the track's own id.
+    function streamId(t, { ndId = null, ndOn = false, prefer = true, failed = false } = {}) {
+      if (!t || typeof t.id !== "string" || !t.id) return null;
+      if (!ndOn || !prefer || failed || /^nd:/.test(t.id) || typeof ndId !== "string" || !ND_ID.test(ndId)) return t.id;
+      return `nd:${ndId}`;
+    }
+    const counts = (played, duration) => played >= COUNT_S || (duration > 0 && played >= duration * COUNT_SHARE);
+    // Seconds actually played between two timeupdates: the playhead's advance, as long as the wall clock allows
+    // it (a seek jumps further than that and counts nothing; going back counts nothing either).
+    function playedDelta(prevT, prevWall, t, wall, rate = 1) {
+      if (prevT == null || prevWall == null) return 0;
+      const d = t - prevT;
+      if (!(d > 0)) return 0;
+      const allowed = (Math.max(0, wall - prevWall) / 1000) * Math.max(1, Number(rate) || 1) + 1.5;
+      return d <= allowed ? d : 0;
+    }
+    // The POST /api/listens body for listen `l` ({track, startedAt (epoch s), played (s), via, sent}), or null when
+    // there's nothing new to say: under MIN_REPORT_S, or already reported with the same time and skip flag.
+    // `l.sent` is what went out last ({played, skipped}); a later, longer report of the same play updates it
+    // server-side (entries are keyed by id + started_at).
+    function listenReport(l, { skipped = false, now = Date.now() } = {}) {
+      if (!l || !l.track || !(l.played >= MIN_REPORT_S)) return null;
+      const played = Math.round(l.played * 10) / 10;
+      if (l.sent && l.sent.played >= played - 0.5 && l.sent.skipped === skipped) return null;
+      const t = l.track;
+      return {
+        id: t.id, title: t.title || "", channel: t.channel || "", duration: t.duration || null,
+        ...(t.artists ? { artists: t.artists } : {}), ...(t.album ? { album: t.album } : {}), ...(t.album_id ? { album_id: t.album_id } : {}),
+        played_s: played, started_at: Math.floor(l.startedAt), ended_at: Math.floor(now / 1000),
+        skipped: !!skipped, source: t.source || "", ...(l.via ? { via: l.via } : {}),
+      };
+    }
+    return { COUNT_S, COUNT_SHARE, MIN_REPORT_S, streamId, counts, playedDelta, listenReport };
+  })();
+  // ==== library-core:end ====
+
   const navidromeUrl = (path) => `${location.protocol}//${location.hostname}:4533${path}`;
   const cur = () => state.queue[state.index];
   // What a queued / remembered track keeps (queue, session, "plays"). `auto` (an autoplay item) is dropped
@@ -325,7 +372,7 @@
     id: t.id, title: t.title, channel: t.channel, duration: t.duration, source: t.source || srcKey(t.id),
     ...(t.codec ? { codec: t.codec } : {}), ...(t.album ? { album: t.album } : {}), ...(t.album_id ? { album_id: t.album_id } : {}),
     ...(Array.isArray(t.artists) && t.artists.length ? { artists: t.artists.map((a) => ({ name: a?.name, id: a?.id ?? null })) } : {}),
-    ...(t.explicit ? { explicit: true } : {}),
+    ...(t.explicit ? { explicit: true } : {}), ...(t.nd_id ? { nd_id: t.nd_id } : {}),
   });
   const qslim = (t) => (t.auto ? { ...slim(t), auto: true } : slim(t));
 
@@ -345,10 +392,13 @@
   // ---------- keep state ----------
   // /api/history is only the latest 50 keeps; lists from the server also mark `kept`, so older keeps count too.
   const keptIds = new Set();
+  // Kept tracks Navidrome has scanned: track id -> Navidrome song id, from server lists (`nd_id`) and history.
+  const ndIds = new Map();
   function noteKept(tracks) {
     for (const t of tracks || []) {
       if (!t || !t.id || typeof t.kept !== "boolean") continue;
       if (t.kept) keptIds.add(t.id); else keptIds.delete(t.id);
+      if (t.kept && t.nd_id) ndIds.set(t.id, t.nd_id); else if (!t.kept) ndIds.delete(t.id);
     }
   }
   function keepState(id) {
@@ -1174,6 +1224,7 @@
   // ---------- data ----------
   async function loadHistory() {
     try { state.history = await api("/api/history"); } catch { /* keep previous */ }
+    for (const h of state.history) if (h && h.id && h.nd_id) ndIds.set(h.id, h.nd_id);
     // Search and browse pages only need their + buttons updated (a re-render would reset their scrollers).
     if (state.view !== "search" && state.view !== "detail") RENDER[state.view]();
     refreshKeepButtons();
@@ -1201,6 +1252,10 @@
     state.sources = list;
     if (state.view === "search") renderSearch();
     refreshKeepButtons();
+  }
+
+  async function loadSettings() {
+    try { state.settings = (await api("/api/settings")).values || {}; } catch { /* keep the defaults */ }
   }
 
   async function loadHealth() {
@@ -1365,7 +1420,7 @@
     }
     queueGen++;
     state.from = fromLabel(listName);
-    prefetch([cur()?.id]);
+    prefetch([cur() && playId(cur())]);
     load();
   }
 
@@ -1388,14 +1443,23 @@
     });
   }
 
-  const streamUrl = (t) => `/api/stream/${encodeURIComponent(t.id)}`;
+  // P1.5: a kept track Navidrome has scanned streams from the library (faster, and it works while YouTube
+  // walls us); the UI keeps showing the original track. If that stream fails, recovery plays the original once.
+  const libraryOn = () => state.sources.some((x) => x.key === "nd") && state.settings.prefer_library !== false;
+  const ndIdOf = (t) => t?.nd_id || ndIds.get(t?.id) || null;
+  const playId = (t) => L.streamId(t, { ndId: ndIdOf(t), ndOn: libraryOn(), failed: t === cur() && rec.ndFailed });
+  const streamUrl = (t) => `/api/stream/${encodeURIComponent(playId(t))}`;
+  // The current src is the Navidrome copy of a non-library track.
+  const viaLibrary = () => srcKey(cur()?.id) !== "nd" && /^\/api\/stream\/nd%3A/.test(audio.getAttribute("src") || "");
 
   function load() {
     const t = cur();
     if (!t) return;
+    closeListen();
     resume = null;
-    newTrack(streamUrl(t));
-    audio.src = streamUrl(t);
+    newTrack(""); // first: it clears the last track's library fallback, which streamUrl reads
+    rec.src = streamUrl(t);
+    audio.src = rec.src;
     audio.play().catch(() => {});
     // Resolve the next track once this one is playing, so it doesn't compete for the extractor.
     prefetched = null;
@@ -1428,7 +1492,7 @@
     rec.pos = pos;
     rec.seekTo = pos > 0 ? pos : null; // applied once metadata is in (applySeek)
     rec.src = streamUrl(t);
-    audio.src = streamUrl(t);
+    audio.src = rec.src;
     prefetched = null;
     prefetchNext = upcomingId();
     audio.play().catch(() => {});
@@ -1682,7 +1746,7 @@
   let prefetchNext = null, prefetched = null;
   function upcomingId() {
     const i = Q.nextIndex(state.queue.length, state.index, state.repeat);
-    return i >= 0 && i !== state.index ? state.queue[i].id : null;
+    return i >= 0 && i !== state.index ? playId(state.queue[i]) : null;
   }
   function planPrefetch() {
     const id = upcomingId();
@@ -1711,6 +1775,49 @@
       $("#np-cur").textContent = fmt(t);
       $("#np-rem").textContent = "-" + fmt(Math.max(0, d - t));
     }
+  }
+
+  // ---------- listen log ----------
+  // Each play is reported to /api/listens when it ends or is left (another track, the page hidden or closed):
+  // the seconds actually played, added up from timeupdate deltas while playing (seeks don't count, see
+  // L.playedDelta), and whether it was skipped. Reporting the same play again (hidden, then skipped) updates the
+  // server's entry: it's keyed by id + started_at. The "plays" list in localStorage (Recently played) is separate.
+  let lis = null; // the current play: {track, startedAt (epoch s), played (s), lastT, lastWall, via, sent}
+  function sendListen(body) {
+    const json = JSON.stringify(body);
+    try {
+      if (navigator.sendBeacon && navigator.sendBeacon("/api/listens", new Blob([json], { type: "application/json" }))) return;
+    } catch { /* a browser that refuses JSON beacons: fall back */ }
+    try {
+      fetch("/api/listens", { method: "POST", keepalive: true, headers: { "Content-Type": "application/json" }, body: json }).catch(() => {});
+    } catch { /* best effort */ }
+  }
+  function reportListen(skipped) {
+    const body = L.listenReport(lis, { skipped });
+    if (!body) return;
+    lis.sent = { played: body.played_s, skipped };
+    sendListen(body);
+  }
+  // The current play is over: report it and forget it. Leaving a track early is a skip, unless recovery moved
+  // past it (rec.skipping: the track couldn't play).
+  function closeListen(skipped = !rec.skipping) {
+    if (!lis) return;
+    reportListen(skipped);
+    lis = null;
+  }
+  // On timeupdate: add what was played since the last one (only while really playing the current src).
+  function trackListen() {
+    const t = cur();
+    if (!t || resume || audio.paused || rec.seekTo != null || rec.busy || rec.broken) { if (lis) lis.lastT = null; return; }
+    if (!lis || lis.track.id !== t.id) {
+      closeListen();
+      lis = { track: slim(t), startedAt: Date.now() / 1000, played: 0, lastT: null, lastWall: null, via: "", sent: null };
+    }
+    const now = Date.now();
+    lis.played += L.playedDelta(lis.lastT, lis.lastWall, audio.currentTime, now, audio.playbackRate);
+    lis.lastT = audio.currentTime;
+    lis.lastWall = now;
+    if (viaLibrary()) lis.via = "nd";
   }
 
   // ---------- session (queue persistence + resume) ----------
@@ -1862,6 +1969,7 @@
     lastT: 0, movedAt: 0, // the stall watchdog: the playhead seen last, and when it last moved
     skipping: false, // the next load() is a recovery skip: keep the dead-track count
     fromEnd: false, // the failure was an early `ended`: if the reloaded src really ends there, move on
+    ndFailed: false, // P1.5: the library copy failed for this play; the original id streams from now on
   };
 
   // Where playback is (or will resume from): a restored session, a pending seek, a broken src, the element.
@@ -1888,7 +1996,7 @@
   function newTrack(src) {
     rec.token++;
     clearTimeout(rec.timer);
-    Object.assign(rec, { tries: 0, from: 0, reloads: 0, busy: false, broken: false, outage: false, pos: 0, seekTo: null, src, timer: 0, movedAt: Date.now(), fromEnd: false });
+    Object.assign(rec, { tries: 0, from: 0, reloads: 0, busy: false, broken: false, outage: false, pos: 0, seekTo: null, src, timer: 0, movedAt: Date.now(), fromEnd: false, ndFailed: false });
     if (!rec.skipping) { rec.dead = 0; rec.content = 0; } // the user picked it: a fresh run
     rec.skipping = false;
   }
@@ -1927,6 +2035,14 @@
     if (why === "ended") { rec.want = true; rec.fromEnd = true; } // it was playing: `pause` fired just before `ended`
     // Some engines reset currentTime on an error: fall back to the last position seen.
     if (rec.seekTo != null) rec.pos = rec.seekTo; else if (audio.currentTime > 0) rec.pos = audio.currentTime;
+    if (viaLibrary() && !rec.ndFailed) {
+      // The library copy failed (Navidrome down, file moved): play the original instead, once, from here.
+      console.info("recovery:", why, t.id, "library stream failed, trying the original");
+      rec.ndFailed = true;
+      rec.seekTo = null;
+      reload(token);
+      return;
+    }
     rec.busy = true;
     rec.broken = true;
     rec.seekTo = null;
@@ -2024,6 +2140,7 @@
 
   // ---------- audio events ----------
   audio.addEventListener("timeupdate", () => {
+    trackListen();
     if (rec.seekTo == null && !rec.busy && !rec.broken) {
       rec.pos = audio.currentTime;
       if (rec.tries) rec.tries = R.settledTries({ tries: rec.tries, from: rec.from, at: rec.pos });
@@ -2034,6 +2151,7 @@
     if (!audio.paused && Date.now() - posSavedAt >= 5000) saveSession();
   });
   audio.addEventListener("seeking", () => {
+    if (lis) lis.lastT = null; // a jump isn't listening time
     if (rec.seekTo != null || rec.busy || rec.broken) return;
     rec.pos = audio.currentTime;
     if (rec.tries) rec.from = rec.pos; // a jump isn't progress: count it from where the playhead landed
@@ -2044,6 +2162,7 @@
   audio.addEventListener("pause", () => { rec.want = false; updatePlayState(); if (cur()) saveSession(); });
   audio.addEventListener("ended", () => {
     updatePlayState();
+    if (!endedEarly()) closeListen(false); // played to the end (an early end is a failure: recovery below)
     if (sleep.mode === "end") { setSleep("off", { quiet: true }); saveSession(); return; } // pause instead of advancing
     // WebKit can end a track early when its stream dies mid-song (it gives up after the 403s): recover instead.
     if (endedEarly()) { fail("ended"); return; }
@@ -2068,8 +2187,13 @@
   document.addEventListener("visibilitychange", () => {
     checkSleep();
     if (document.visibilityState === "hidden" && cur()) saveSession();
+    // iOS may kill a hidden Home Screen app without a pagehide: report the play so far (updated later if it goes on).
+    if (document.visibilityState === "hidden" && lis) reportListen(false);
   });
-  window.addEventListener("pagehide", () => { if (cur()) saveSession(); });
+  window.addEventListener("pagehide", () => {
+    if (cur()) saveSession();
+    if (lis) reportListen(false);
+  });
 
   const seek = $("#np-seek");
   seek.addEventListener("input", () => {
@@ -2698,6 +2822,7 @@
   else if (bootQ) runSearch(bootQ);
   setLyricsOn(lyr.on);
   loadSources();
+  loadSettings();
   loadHealth();
   loadHistory();
   loadTiles();

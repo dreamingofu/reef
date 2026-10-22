@@ -7,7 +7,10 @@ import re
 import subprocess
 import threading
 import time
+from datetime import timedelta
+from datetime import timezone as dt_timezone
 from urllib.parse import parse_qs, parse_qsl, quote, urlsplit, urlunsplit
+from zoneinfo import ZoneInfo
 
 import yt_dlp
 from flask import Flask, Response, abort, jsonify, redirect, render_template, request
@@ -17,10 +20,15 @@ import config
 import downloader
 import errors
 import history
+import likes
+import listens
 import log
 import lyrics
 import navidrome
+import playlists
+import settings
 import sources
+import store
 import streamer
 import tagging
 import tiles
@@ -52,6 +60,8 @@ OFF_TAILNET = "Reef is only open on Tailscale. Set REEF_PASSWORD in reef.env to 
 STARTED = time.time()
 
 app = Flask(__name__)
+# The biggest legitimate body is a few thousand tracks added to a playlist; refuse anything far beyond that.
+app.config["MAX_CONTENT_LENGTH"] = 4 * 1024 * 1024
 
 
 def _track(track_id):
@@ -147,13 +157,15 @@ def _config_summary():
     return {
         "host": config.HOST, "port": config.PORT, "server": "flask-dev" if config.DEV else "waitress",
         "open": config.OPEN, "password_set": bool(config.PASSWORD),
-        "download_dir": str(config.DOWNLOAD_DIR), "default_source": config.DEFAULT_SOURCE,
-        "yt_client": config.YT_CLIENT, "ytmusic": config.YTMUSIC,
+        "download_dir": str(config.DOWNLOAD_DIR), "default_source": settings.get("default_source"),
+        "yt_client": config.YT_CLIENT, "ytmusic": settings.get("ytmusic"),
         "tracks_api": [_safe_url(u) for u in config.TRACKS_API],
         "piped": [_safe_url(u) for u in config.PIPED_INSTANCES],
         "invidious": [_safe_url(u) for u in config.INVIDIOUS_INSTANCES],
         "navidrome": {"url": _safe_url(config.NAVIDROME_URL), "configured": navidrome.configured()},
-        "sponsorblock": config.SPONSORBLOCK, "replaygain": config.REPLAYGAIN, "lrc_sidecar": config.LRC_SIDECAR,
+        "sponsorblock": settings.get("sponsorblock_keep"), "replaygain": settings.get("replaygain"),
+        "lrc_sidecar": settings.get("lrc_sidecar"), "prefer_library": settings.get("prefer_library"),
+        "settings_overridden": sorted(r["key"] for r in settings.schema() if r["overridden"]),
         "ydl_extra_keys": sorted(config.YDL_EXTRA), "fake_wall": config.FAKE_WALL,
         "log_dir": str(config.LOG_DIR) if config.LOG_DIR else None,
     }
@@ -193,11 +205,9 @@ def api_search():
         return jsonify({"error": str(e)[:300]}), 502
     results = blocked.tracks(results)[:config.SEARCH_LIMIT]
     streamer.prefetch([r["id"] for r in results[:3] if _track(r["id"])])
-    kept = history.ids()
     for r in results:
         r.setdefault("source", src.key)
-        r["kept"] = r.get("kept") or r["id"] in kept
-    return jsonify(results)
+    return jsonify(_mark_kept(results))
 
 
 @app.get("/api/suggest")
@@ -216,9 +226,16 @@ def api_suggest():
 
 
 def _mark_kept(tracks):
-    kept = history.ids()
+    """Mark `kept` and `liked` (one file read each, not one per track). A kept track Navidrome has scanned
+    also gets `nd_id`: the player streams `nd:<nd_id>` instead (production plan P1.5)."""
+    kept = history.nd_ids()  # every kept track, not just the newest
+    liked = likes.ids()
     for t in tracks:
-        t["kept"] = t["id"] in kept
+        tid = t.get("id")
+        t["kept"] = tid in kept or str(tid).startswith("nd:")  # library tracks are the library itself
+        t["liked"] = tid in liked
+        if kept.get(tid):
+            t["nd_id"] = kept[tid]
     return tracks
 
 
@@ -618,6 +635,248 @@ def api_job_delete(job_id):
 @app.get("/api/history")
 def api_history():
     return jsonify(history.list_recent())
+
+
+# ---------- listen log, stats, recap ----------
+
+def _int_arg(name, default, lo, hi):
+    v = request.args.get(name, default, type=int)
+    return default if v is None else min(max(v, lo), hi)
+
+
+def _tz():
+    """The listener's time zone for hours / weekdays / days: `tz` (IANA name, from the browser's
+    Intl API), else `utc_offset` (minutes east of UTC), else the server's own (Termux may not know it)."""
+    name = request.args.get("tz", "").strip()
+    if name and len(name) <= 64:
+        try:
+            return ZoneInfo(name)
+        except Exception:  # unknown name, or no tz database on this device
+            pass
+    offset = request.args.get("utc_offset", type=int)
+    if offset is not None and -16 * 60 <= offset <= 16 * 60:
+        return dt_timezone(timedelta(minutes=offset))
+    return None
+
+
+@app.post("/api/listens")
+def api_listens_add():
+    """A play the player finished or left. Sent with navigator.sendBeacon, whose Content-Type may not be JSON."""
+    body = request.get_json(force=True, silent=True)
+    try:
+        entry, created = listens.record(body)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    return jsonify({"entry": entry, "created": created}), 201 if created else 200
+
+
+@app.get("/api/listens")
+def api_listens():
+    before = request.args.get("before", type=float)
+    counted = {"1": True, "0": False}.get(request.args.get("counted", ""))
+    return jsonify(listens.recent(_int_arg("limit", 50, 1, 500), before, counted))
+
+
+@app.delete("/api/listens")
+def api_listens_clear():
+    listens.clear()
+    return "", 204
+
+
+@app.get("/api/stats")
+def api_stats():
+    period = request.args.get("period", "week")
+    if period not in listens.PERIODS:
+        return jsonify({"error": "period must be week, month, year or all"}), 400
+    return jsonify(listens.stats(listens.entries(), period, tz=_tz(), limit=_int_arg("limit", 10, 1, 50)))
+
+
+@app.get("/api/recap")
+def api_recap():
+    period = request.args.get("period", "month")
+    if period not in ("month", "year"):
+        return jsonify({"error": "period must be month or year"}), 400
+    offset = _int_arg("offset", 0, -1, 1200)
+    return jsonify(listens.recap(listens.entries(), period, offset, tz=_tz(), limit=_int_arg("limit", 10, 1, 50)))
+
+
+# ---------- likes ----------
+
+def _id_or_404(raw):
+    tid = store.track_id(raw)
+    if not tid:
+        abort(404)
+    return tid
+
+
+@app.get("/api/likes")
+def api_likes():
+    return jsonify(_mark_kept(likes.entries()))
+
+
+@app.put("/api/likes/<track_id>")
+def api_like(track_id):
+    """Like a track; the body is the track as the client shows it (title, channel, ...). Idempotent."""
+    tid = _id_or_404(track_id)
+    body = request.get_json(silent=True) or {}
+    if not isinstance(body, dict) or store.track_id(body.get("id", tid)) != tid:
+        return jsonify({"error": "body id doesn't match the URL"}), 400
+    entry, created = likes.add(store.clean_track({**body, "id": tid}))
+    return jsonify({"entry": entry, "created": created}), 201 if created else 200
+
+
+@app.delete("/api/likes/<track_id>")
+def api_unlike(track_id):
+    if not likes.remove(_id_or_404(track_id)):
+        abort(404)
+    return "", 204
+
+
+# ---------- playlists ----------
+
+def _pid_or_404(pid):
+    if not playlists.valid_id(pid):
+        abort(404)
+    return pid
+
+
+def _playlist_body(p):
+    return jsonify({**p, "tracks": _mark_kept(p["tracks"])})
+
+
+@app.get("/api/playlists")
+def api_playlists():
+    return jsonify(playlists.all_playlists())
+
+
+@app.post("/api/playlists")
+def api_playlist_create():
+    body = request.get_json(silent=True) or {}
+    try:
+        p = playlists.create(body.get("name"), body.get("tracks"), body.get("description") or "")
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    return _playlist_body(p), 201
+
+
+@app.get("/api/playlists/<pid>.m3u")
+def api_playlist_m3u(pid):
+    p = playlists.get(_pid_or_404(pid))
+    if not p:
+        abort(404)
+    text, _, _ = playlists.m3u(p)
+    name = playlists.export_name(p["name"]) + ".m3u"
+    ascii_name = re.sub(r"[^A-Za-z0-9 ._-]", "_", name)
+    return Response(text, content_type="audio/x-mpegurl; charset=utf-8", headers={
+        "Content-Disposition": f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{quote(name, safe='')}"})
+
+
+@app.get("/api/playlists/<pid>")
+def api_playlist_get(pid):
+    p = playlists.get(_pid_or_404(pid))
+    if not p:
+        abort(404)
+    return _playlist_body(p)
+
+
+@app.patch("/api/playlists/<pid>")
+def api_playlist_patch(pid):
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        return jsonify({"error": "send a JSON object"}), 400
+    try:
+        p = playlists.update(_pid_or_404(pid), body)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    if not p:
+        abort(404)
+    return _playlist_body(p)
+
+
+@app.delete("/api/playlists/<pid>")
+def api_playlist_delete(pid):
+    if not playlists.delete(_pid_or_404(pid)):
+        abort(404)
+    return "", 204
+
+
+@app.post("/api/playlists/<pid>/tracks")
+def api_playlist_add(pid):
+    """Add {tracks: [...], position?: int, dedupe?: bool}. Invalid track ids are skipped, not an error."""
+    body = request.get_json(silent=True) or {}
+    try:
+        found = playlists.add_tracks(_pid_or_404(pid), body.get("tracks"), body.get("position"),
+                                     body.get("dedupe") is True)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    if not found:
+        abort(404)
+    p, added, skipped = found
+    return jsonify({**p, "tracks": _mark_kept(p["tracks"]), "added": added, "skipped": skipped})
+
+
+@app.delete("/api/playlists/<pid>/tracks/<int:index>")
+def api_playlist_remove(pid, index):
+    """Remove the track at `index`; `?id=<track id>` makes it a 409 when another track is there now."""
+    try:
+        p = playlists.remove_track(_pid_or_404(pid), index, request.args.get("id") or None)
+    except IndexError:
+        abort(404)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 409
+    if not p:
+        abort(404)
+    return _playlist_body(p)
+
+
+@app.post("/api/playlists/<pid>/move")
+def api_playlist_move(pid):
+    body = request.get_json(silent=True) or {}
+    src, dst = body.get("from"), body.get("to")
+    if not all(isinstance(v, int) and not isinstance(v, bool) for v in (src, dst)):
+        return jsonify({"error": "from and to must be track indexes"}), 400
+    try:
+        p = playlists.move(_pid_or_404(pid), src, dst)
+    except IndexError:
+        return jsonify({"error": "index out of range"}), 400
+    if not p:
+        abort(404)
+    return _playlist_body(p)
+
+
+@app.post("/api/playlists/<pid>/export")
+def api_playlist_export(pid):
+    """Write the kept tracks to <music>/Reef/Playlists/<name>.m3u and rescan, so Navidrome imports it."""
+    try:
+        out = playlists.export(_pid_or_404(pid))
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 409
+    except OSError as e:
+        logger.warning(f"playlist export {pid} failed: {e}")
+        return jsonify({"error": f"couldn't write the playlist file: {e.strerror or e}"}), 500
+    if out is None:
+        abort(404)
+    return jsonify({**out, "rescanned": navidrome.rescan()})
+
+
+# ---------- settings ----------
+
+def _settings_body():
+    return jsonify({"values": settings.public(), "schema": settings.schema()})
+
+
+@app.get("/api/settings")
+def api_settings():
+    return _settings_body()
+
+
+@app.patch("/api/settings")
+def api_settings_patch():
+    try:
+        settings.update(request.get_json(silent=True))
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    return _settings_body()
 
 
 @app.get("/api/library/recent")

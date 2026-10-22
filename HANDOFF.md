@@ -21,9 +21,11 @@ Last updated: 2026-10-22.
 ## Updating the phone after changing code
 
 1. Commit and push to `main`.
-2. In Termux on the phone, run `cd ~/reef && git pull --ff-only && pip install -r requirements.txt && ~/.termux/boot/reef.sh`
-   (or re-run `termux/install.sh`, which also pulls, installs and restarts). After Round 9 also re-copy the boot
-   script once (see "Deploy Round 9").
+2. In Termux on the phone, run `bash ~/reef/termux/update.sh` (since Round 10; the first time, `cd ~/reef && git pull
+   --ff-only` first so the script exists). It pulls, installs requirements, re-copies the boot script, restarts, waits
+   up to 30 s for `/api/health` with the new commit in `/api/diagnostics`, and prints `UPDATE_OK <sha>`; otherwise it
+   rolls back to the previous commit, restarts that and prints `UPDATE_FAILED <reason>`. `--log FILE` keeps a copy
+   (e.g. `--log /sdcard/navidrome_setup/update.log` to read it over adb), `--dry-run` only prints the steps.
 
 ### Driving the phone from a Mac (no typing on the phone)
 
@@ -78,8 +80,14 @@ Pass the Navidrome password through the environment. Don't put it in a committed
 - `downloader.py`: in-memory job queue + worker. YouTube: yt-dlp → Opus, tags, cover, blank description. Other sources:
   fetch → ffmpeg → mutagen tags + cover. Both → `history.add` → Navidrome rescan → try to record the Navidrome cover id.
 - `history.py`: `history.json` (git-ignored); entries gain `nd_cover`/`nd_id` once Navidrome has scanned the file.
+  Entries with a `file` are never dropped (before Round 10 the file was cut to 500, so older keeps lost their kept
+  state); reads use `store.JsonFile`'s cached copy.
   `navidrome.py`: Subsonic token auth, ping, startScan, newest albums, cover art, `find_song`.
 - `tiles.py`: the home mood/genre tiles + a daily background search that caches 4 video ids per tile in `tiles.json`.
+- `store.py`: `JsonFile` (in-memory copy re-read when the file changes, atomic `.tmp` + `os.replace` writes, a lock
+  for read-modify-write) and `clean_track` (the only place client track dicts are trimmed before storing).
+  `listens.py` (play log + pure stats/recap aggregates), `likes.py`, `playlists.py` (+ `.m3u`), `settings.py`
+  (runtime overrides of env defaults) sit on it; their files default next to history.json (Round 10).
 - `log.py`: logging setup (stderr + `logs/reef.log` rotated 1 MB × 5 + a 300-line in-memory tail), `redact()` for
   signed-URL params / Subsonic tokens / cookies. Modules log through `logging.getLogger(__name__)`, no print().
 - `termux/reef-run.sh`: restart loop with backoff; `termux/reef-boot.sh` (Termux:Boot) (re)starts it.
@@ -207,6 +215,61 @@ result card, Songs rows with **+**, and filter chips. Design tokens are at the t
 4. Open Reef on the iPhone over Tailscale as before (no password prompt). From home Wi-Fi by LAN IP it now answers
    403; to allow that, put `REEF_PASSWORD=…` in `~/reef/reef.env` and run `~/.termux/boot/reef.sh` again.
 5. Optional: `rm ~/reef/reef.log` (the old nohup log); try Status → Copy diagnostics; `python -m pytest -m live`.
+
+## Round 10 (2026-10-22): data foundation (listens, likes, playlists, settings, P1.5, update.sh)
+
+Backend for the UI remake's Library / Stats / Recap / Settings screens (docs/UI_REMAKE_PLAN.md §6, §11, §12); the
+screens themselves are a later batch. New files `listens.json`, `likes.json`, `playlists.json`, `settings.json`
+(git-ignored; `REEF_LISTENS_FILE` / `REEF_LIKES_FILE` / `REEF_PLAYLISTS_FILE` / `REEF_SETTINGS_FILE`).
+
+- **Listen log**: the player reports every play to `POST /api/listens` (`navigator.sendBeacon`, `fetch keepalive`
+  fallback) on track change, natural end, page hidden and pagehide. Played seconds add up timeupdate deltas while
+  playing (a seek counts nothing, `L.playedDelta` in the `library-core` section of app.js). The server counts a play
+  at >= 30 s or >= 50 %, keeps short skips (`skipped`), keys entries by id + `started_at` (a second report of the same
+  play updates it) and keeps 20 000 entries. `/api/stats` (rolling week/month/year/all) and `/api/recap` (closed
+  calendar month/year) are pure functions over the log; hours/weekdays/days use the browser's `tz`.
+- **Likes** and **local playlists** (CRUD, pin, insert at position, dedupe, move, `.m3u` download, export to
+  `<music>/Reef/Playlists/<name>.m3u` + Navidrome rescan so Navidrome imports it). Lists from search, radio, link,
+  album, artist, playlist pages carry `liked` next to `kept`.
+- **Settings**: `settings.json` overrides a whitelist of env defaults at runtime (`REEF_*` stays the default; PATCH
+  null resets). Keeps (SponsorBlock, ReplayGain), the lyrics sidecar, YouTube Music and the default source read
+  through it. `listenbrainz_token` is write-only. Diagnostics shows the effective values.
+- **P1.5**: lists and `/api/history` expose `nd_id` for kept tracks Navidrome has scanned (filled by the keep or
+  lazily by `/api/art`); with `nd` in `/api/sources` and `prefer_library` on (default), the player streams
+  `nd:<nd_id>` and the UI keeps the original track. A failing library stream falls back to the original id once.
+- **`termux/update.sh`**: see "Updating the phone". Tested in `tests/test_update_sh.py` against throwaway repos.
+
+### API shapes (for the UI batch)
+
+All JSON. Track dicts are `{id, title, channel, duration, source, album?, album_id?, artists?[{name, id}],
+explicit?}`; lists from the server add `kept`, `liked`, and `nd_id` when kept + scanned.
+
+- `POST /api/listens` `{id, title, channel, artists?, album?, album_id?, duration, played_s, started_at (epoch s),
+  ended_at?, skipped, source, via?: "nd"}` → 201 new / 200 updated `{entry, created}`; entry = track +
+  `{played_s, started_at, ended_at, counted, skipped (only when not counted), via?}`. 400 `{error}`.
+- `GET /api/listens?limit=50 (1-500)&before=<epoch>&counted=1|0` → entries newest first. `DELETE /api/listens` → 204.
+- `GET /api/stats?period=week|month|year|all&tz=<IANA>&utc_offset=<min east>&limit=10` → `{period, from, to,
+  listens, minutes, skips, tracks_count, artists_count, days_count, top_tracks[{id, title, channel, duration, source,
+  album?, artists?, count, minutes}], top_artists[{name, id, count, minutes}], top_albums[{name, artist, album_id,
+  cover_id, count, minutes}], by_hour[24], by_weekday[7] (Mon = 0), streak_days, longest_streak_days,
+  first_listen_at, most_skipped[{id, title, channel, count}]}`. Counts are counted plays; minutes include skips.
+- `GET /api/recap?period=month|year&offset=0 (last closed; 1 = the one before; -1 = current so far)&tz=` → the
+  same aggregates (no `streak_days`) + `{offset, period_label ("September 2026" / "2025"), partial, new_artists_count,
+  new_artists[{name, id, count}] (top 5), top_track_play_time (min), longest_session_min (time played in the longest
+  run of plays without a 30-min gap)}`.
+- `GET /api/likes` → `[track + {liked_at, kept, liked, nd_id?}]` newest first; `PUT /api/likes/<id>` (body: the
+  track, optional) → 201/200 `{entry, created}`; `DELETE /api/likes/<id>` → 204 / 404.
+- `GET /api/playlists` → `[{id, name, description, pinned, created_at, updated_at, cover_id, count, duration,
+  exported?{path, at}}]` pinned first, then most recently changed. `POST /api/playlists {name, description?, tracks?}`
+  → 201 playlist. `GET /api/playlists/<id>` → playlist with `tracks` (marked). `PATCH {name?, description?, pinned?}`,
+  `DELETE` → 204. `POST /<id>/tracks {tracks, position?, dedupe?}` → playlist + `{added, skipped}`.
+  `DELETE /<id>/tracks/<index>?id=<track id>` (409 if another track is there now). `POST /<id>/move {from, to}`.
+  `GET /<id>.m3u` (download). `POST /<id>/export` → `{path (relative to the music folder), tracks, skipped,
+  rescanned}`, 409 when nothing is kept.
+- `GET /api/settings` → `{values: {key: value, listenbrainz_token: {set}}, schema: [{key, type: bool|choice|list|secret,
+  default, label, help, choices?, overridden}]}`; `PATCH {key: value|null}` → same, 400 `{error}` (nothing written).
+  Keys: default_source, ytmusic, prefer_library, autoplay_radio (default for new devices; not wired in the client
+  yet), sponsorblock_keep, replaygain, lrc_sidecar, lyrics_providers (placeholder, not read yet), listenbrainz_token.
 
 ## Production plan (2026-10-21)
 

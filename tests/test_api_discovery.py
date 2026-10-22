@@ -147,7 +147,8 @@ def test_link_watch_with_list_is_track(client, offline):
 def test_link_playlist(client, offline, url, list_id):
     body = link(client, url).get_json()
     assert body == {"kind": "playlist", "title": "Mix",
-                    "tracks": [{**track("aaaaaaaaaaa"), "kept": False}, {**track("bbbbbbbbbbb"), "kept": False}]}
+                    "tracks": [{**track("aaaaaaaaaaa"), "kept": False, "liked": False},
+                               {**track("bbbbbbbbbbb"), "kept": False, "liked": False}]}
     assert ("playlist", (list_id,)) in offline
 
 

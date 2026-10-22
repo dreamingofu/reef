@@ -18,6 +18,7 @@ from functools import partial
 import requests
 
 import config
+import settings
 
 logger = logging.getLogger(__name__)
 
@@ -55,7 +56,7 @@ _lock = threading.Lock()
 
 
 def enabled():
-    return config.YTMUSIC and YTMusic is not None
+    return settings.get("ytmusic") and YTMusic is not None
 
 
 def _client():

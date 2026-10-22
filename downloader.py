@@ -28,6 +28,7 @@ import history
 import loudness
 import lyrics
 import navidrome
+import settings
 import sources
 import streamer
 from config import AUDIO_FORMAT, DOWNLOAD_DIR, TMP_DIR
@@ -172,7 +173,7 @@ def _options(job):
         {"key": "FFmpegThumbnailsConvertor", "format": "jpg", "when": "before_dl"},
         {"key": "FFmpegExtractAudio", "preferredcodec": AUDIO_FORMAT, "preferredquality": "0"},
     ]
-    if config.SPONSORBLOCK:
+    if settings.get("sponsorblock_keep"):
         # The segments themselves are fetched by _SafeSponsorBlockPP (after_filter), added in _run_ytdlp.
         pps.append({"key": "ModifyChapters", "remove_sponsor_segments": SPONSOR_CATEGORIES})
     pps += [
@@ -209,7 +210,7 @@ def _custom_pps(ydl, hints=None):
     """(postprocessor, when) pairs that need our own classes, so they can't go in the options dict."""
     # add_post_processor appends, so the crop lands after the options' FFmpegThumbnailsConvertor (before_dl).
     pps = [(_MusicTagsPP(ydl, hints), "pre_process"), (_SquareCoverPP(ydl), "before_dl")]
-    if config.SPONSORBLOCK:
+    if settings.get("sponsorblock_keep"):
         pps.append((_SafeSponsorBlockPP(ydl, categories=SPONSOR_CATEGORIES), "after_filter"))
     return pps
 
@@ -453,7 +454,7 @@ def _post_steps(job, meta):
     path, tid = job["file"], job["video_id"]
     gain_db = found = None
     t0 = time.monotonic()
-    if config.REPLAYGAIN and path:
+    if settings.get("replaygain") and path:
         try:
             m = loudness.measure(path)
             if m and loudness.tag(path, m):

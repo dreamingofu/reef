@@ -21,6 +21,7 @@ from mutagen.mp4 import MP4
 from mutagen.ogg import OggFileType
 
 import config
+import settings
 
 logger = logging.getLogger(__name__)
 
@@ -225,7 +226,7 @@ def embed(path, found):
     except (MutagenError, OSError, ValueError) as e:
         logger.warning(f"reef: couldn't embed lyrics in {os.path.basename(str(path))}: {e}")
         return False
-    if config.LRC_SIDECAR and found.get("synced"):
+    if settings.get("lrc_sidecar") and found.get("synced"):
         try:
             Path(path).with_suffix(".lrc").write_text(found["synced"], encoding="utf-8")
         except OSError as e:

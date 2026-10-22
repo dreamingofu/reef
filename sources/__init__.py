@@ -2,6 +2,7 @@
 import re
 
 import config
+import settings
 
 from . import invidious, monochrome, navidrome_src, piped, youtube
 
@@ -34,7 +35,8 @@ def track_id(key, native_id):
 
 
 def default_key():
-    return config.DEFAULT_SOURCE if config.DEFAULT_SOURCE in SOURCES else "yt"
+    key = settings.get("default_source")  # REEF_DEFAULT_SOURCE unless changed in Settings
+    return key if key in SOURCES else "yt"
 
 
 def enabled():

@@ -68,6 +68,12 @@ LYRICS_FILE = Path(os.environ.get("REEF_LYRICS_FILE") or HISTORY_FILE.with_name(
 LRC_SIDECAR = os.environ.get("REEF_LRC_SIDECAR", "0").strip() == "1"
 # Blocked artists, hidden from search, radio, playlists and album pages. Defaults next to history.json.
 BLOCKLIST_FILE = Path(os.environ.get("REEF_BLOCKLIST_FILE") or HISTORY_FILE.with_name("blocklist.json"))
+# Listen log (every play reported by the player: counted listens and skips), liked tracks, local playlists
+# and runtime settings (overrides of the env defaults, changed from the UI). All default next to history.json.
+LISTENS_FILE = Path(os.environ.get("REEF_LISTENS_FILE") or HISTORY_FILE.with_name("listens.json"))
+LIKES_FILE = Path(os.environ.get("REEF_LIKES_FILE") or HISTORY_FILE.with_name("likes.json"))
+PLAYLISTS_FILE = Path(os.environ.get("REEF_PLAYLISTS_FILE") or HISTORY_FILE.with_name("playlists.json"))
+SETTINGS_FILE = Path(os.environ.get("REEF_SETTINGS_FILE") or HISTORY_FILE.with_name("settings.json"))
 # Search, suggestions, radio and link metadata via YouTube Music (ytmusicapi, anonymous).
 # 0 = yt-dlp search only (no suggestions or radio).
 YTMUSIC = os.environ.get("REEF_YTMUSIC", "1").strip() != "0"
