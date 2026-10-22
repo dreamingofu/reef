@@ -266,6 +266,8 @@ def test_post_listen_accepts_a_beacon(client, lfile):
     assert r.status_code == 200 and r.get_json()["created"] is False
     assert client.post("/api/listens", data="nope", content_type="application/json").status_code == 400
     assert client.post("/api/listens", json={"id": "bad id", "played_s": 3}).status_code == 400
+    huge = f'{{"id": "{YT}", "played_s": 1{"0" * 400}}}'  # an int no float can hold: a 400, not a 500
+    assert client.post("/api/listens", data=huge, content_type="application/json").status_code == 400
     got = client.get("/api/listens?limit=5").get_json()
     assert len(got) == 1 and got[0]["id"] == YT
 

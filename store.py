@@ -91,12 +91,12 @@ def text(value, limit=TEXT_MAX):
 
 
 def seconds(value, limit=86400):
-    """A finite number of seconds in [0, limit), else None (bools and nan/inf too)."""
+    """A finite number of seconds in [0, limit), else None (bools, nan/inf and ints too big for a float too)."""
     if isinstance(value, bool) or not isinstance(value, (int, float, str)):
         return None
     try:
         v = float(value)
-    except ValueError:
+    except (ValueError, OverflowError):
         return None
     return v if math.isfinite(v) and 0 <= v < limit else None
 

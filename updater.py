@@ -158,7 +158,9 @@ def _due(part, now):
 
 
 def check(force=False, now=None):
-    """Refresh what's due (everything with `force`; ETags still apply) and return the /api/version body."""
+    """Refresh what's due (everything with `force`; ETags still apply) and return the /api/version body.
+    The HTTP happens outside the file lock; the result is merged into update.json as it is *then*, so an update
+    run recorded meanwhile (start / status write `run` under the lock) is never overwritten by a stale copy."""
     now = time.time() if now is None else now
     with _check_lock:
         data = dict(_file.load())
@@ -175,8 +177,10 @@ def check(force=False, now=None):
             if behind is not None:  # an unknown answer is asked again next time
                 cmp_, changed = {"base": mine, "head": latest, "behind": behind, "count": count}, True
         if changed:
-            data.update(github=gh, pypi=py, compare=cmp_)
-            _file.save(data)
+            with _file.lock:
+                data = dict(_file.load())  # only the check's own keys change
+                data.update(github=gh, pypi=py, compare=cmp_)
+                _file.save(data)
     return body(data)
 
 

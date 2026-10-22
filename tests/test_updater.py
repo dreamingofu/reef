@@ -223,6 +223,25 @@ def test_one_update_at_a_time_and_status(client, spawned, termux, monkeypatch):
     assert r.status_code == 202 and spawned[-1] == [sys.executable, str(config.BASE_DIR / "updater.py"), "ytdlp"]
 
 
+def test_a_check_keeps_an_update_started_while_it_asked_github(client, hub, spawned, termux, monkeypatch):
+    """The check talks to GitHub outside the file lock; an update recorded meanwhile must survive its save, so the
+    one-update-at-a-time guard still sees it."""
+    ask = hub.get
+
+    def get(url, headers=None, timeout=None):
+        if "/commits/main" in url and not spawned:
+            assert client.post("/api/update", json={"what": "reef", "confirm": True}).status_code == 202
+        return ask(url, headers, timeout)
+
+    monkeypatch.setattr(hub, "get", get)
+    v = updater.check(force=True, now=T0)
+    assert v["latest_reef"]["sha"] == LATEST and v["latest_ytdlp"] == "2099.1.2"
+    saved = updater._file.load()
+    assert saved["run"]["pid"] == 4242 and saved["run"]["what"] == "reef" and saved["github"]["sha"] == LATEST
+    assert client.post("/api/update", json={"what": "ytdlp", "confirm": True}).status_code == 409
+    assert client.get("/api/update/status").get_json()["running"] is True and len(spawned) == 1
+
+
 def test_failed_or_vanished_run_is_reported_failed(client, spawned, termux, monkeypatch):
     client.post("/api/update", json={"what": "both", "confirm": True})
     monkeypatch.setattr(updater, "_alive", lambda pid: False)

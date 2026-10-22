@@ -12,8 +12,13 @@ an import's placeholders. A Reef before aliases / matches ignores those sections
 only then renamed (snapshots) or served (downloads).
 
 Restore refuses another format or a newer schemaVersion, validates every section (a section of the wrong type
-refuses the whole file; bad items inside one are skipped and counted), saves the current state to
-`backups/pre-restore-<ts>.json`, then rewrites each store through its own atomic write (`.tmp` + os.replace).
+refuses the whole file; bad items inside one are skipped and counted; a bad field inside an item is dropped:
+timestamps must be finite epoch seconds, lengths finite seconds, ids / urls / paths their usual shapes, and
+fields Reef doesn't know only travel as plain scalars), merges every section into a copy of what's here (one that
+can't be applied refuses the restore before anything is written), saves the current state to
+`backups/pre-restore-<ts>.json`, then rewrites each store through its own atomic write (`.tmp` + os.replace),
+merging again against that store as it is then. The stores are separate files: a write that fails midway raises
+RestoreIncomplete naming the sections already restored and the snapshot holding the state before.
 "replace" swaps each section present in the file; "merge" unions by id and the newer copy wins, so merging the
 same file twice changes nothing the second time. Sections missing from the file are left alone. Kept-track
 `file` paths survive only when the file exists on this device.
@@ -23,6 +28,7 @@ A daily snapshot (`backups/auto-<ts>.json`, newest 7 kept) runs from the app's c
 import copy
 import json
 import logging
+import math
 import os
 import re
 import time
@@ -61,8 +67,35 @@ class BackupError(ValueError):
     pass
 
 
+class RestoreIncomplete(BackupError):
+    """Writing a section failed after others were written. `snapshot` holds everything as it was before."""
+
+    def __init__(self, message, snapshot):
+        super().__init__(message)
+        self.snapshot = snapshot
+
+
+TS_MAX = 1e11  # epoch seconds (beyond year 5000): a later "timestamp" is junk, not a date
+TEXT_MAX = 1000  # an unknown text field travels when it's at most this long
+
+
 def _num(v):
-    return isinstance(v, (int, float)) and not isinstance(v, bool)
+    """A finite int/float (not a bool). JSON gives inf for 1e400, nan for NaN, and ints too big for a float."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return False
+    try:
+        return math.isfinite(v)
+    except OverflowError:
+        return False
+
+
+def _ts(v):
+    return _num(v) and 0 <= v < TS_MAX
+
+
+def _sort_num(v):
+    """A sort key that never raises: the number, or 0 for anything else (old data a restore merges with)."""
+    return v if _num(v) else 0
 
 
 # ---------- stores: read a copy / read-modify-write under the store's own lock ----------
@@ -167,44 +200,163 @@ SECTION_TYPES = {"lyrics": dict, "settings": dict, "matches": dict}  # the rest 
 
 # ---------- item validation: a clean copy, or None to skip ----------
 
-def _tid(e):
-    return store.track_id(e.get("id")) if isinstance(e, dict) else None
+# Field checks: each returns the value to keep, or _DROP (the field goes; the item stays unless it was required).
+_DROP = object()
+_STORE_ID = re.compile(r"^[\w.-]{1,128}$")  # a Navidrome song / cover id (app.COVER_ID)
+_CHANNEL = re.compile(r"^UC[A-Za-z0-9_-]{22}$")
+_URL = re.compile(r"^https?://\S{1,2040}$")
+
+
+def _scalar(v):
+    """An unknown field's value when it's plain: null, a bool, a finite number or short text (nothing nested)."""
+    if v is None or isinstance(v, bool) or (isinstance(v, str) and len(v) <= TEXT_MAX) or (_num(v) and abs(v) < 2 ** 53):
+        return v
+    return _DROP
+
+
+def _nullable(check):
+    return lambda v: None if v is None else check(v)
+
+
+def _c_ts(v):
+    return v if _ts(v) else _DROP
+
+
+def _c_bool(v):
+    return v if isinstance(v, bool) else _DROP
+
+
+def _c_text(limit):
+    return lambda v: v[:limit] if isinstance(v, str) else _DROP
+
+
+def _c_match(rx):
+    return lambda v: v if isinstance(v, str) and rx.match(v) else _DROP
+
+
+def _c_range(lo, hi):
+    return lambda v: v if _num(v) and lo <= v <= hi else _DROP
+
+
+def _c_choice(values):
+    return lambda v: v if v in values else _DROP
+
+
+def _c_url(v):
+    return v if isinstance(v, str) and (v == "" or _URL.match(v)) else _DROP
+
+
+def _c_tid(v):
+    return store.track_id(v) or _DROP
+
+
+def _c_file(v):
+    return v if isinstance(v, str) and os.path.isfile(v) else _DROP  # another device's path (or gone): no file
+
+
+def _c_seconds(v):
+    return v if _num(v) and 0 <= v < 86400 else _DROP
+
+
+def _c_blocked(v):
+    """The artist block a "Not interested" mark caused: {id: UC… | null, name}."""
+    if not isinstance(v, dict) or not isinstance(v.get("name"), str) or not v["name"].strip():
+        return _DROP
+    aid = v.get("id")
+    return {"id": aid if isinstance(aid, str) and _CHANNEL.match(aid) else None, "name": v["name"].strip()[:blocklist.NAME_MAX]}
+
+
+def _c_exported(v):
+    """A playlist's last .m3u export {path relative to the music folder, at}; playlists.export deletes that file when
+    the name changes, so only a plain relative .m3u path travels."""
+    path = v.get("path") if isinstance(v, dict) else None
+    if not isinstance(path, str) or not path.endswith(".m3u") or len(path) > 500 or path.startswith(("/", "\\")) \
+            or ".." in path.replace("\\", "/").split("/") or not path.isprintable():
+        return _DROP
+    return {"path": path, **({"at": v["at"]} if _ts(v.get("at")) else {})}
+
+
+def _c_import(v):
+    """An import's {kind, rows, skipped, total, at} (importer.status reads `total`); bad parts are left out."""
+    if not isinstance(v, dict):
+        return _DROP
+    out = {}
+    if v.get("kind") in ("csv", "takeout"):
+        out["kind"] = v["kind"]
+    for k in ("rows", "skipped", "total"):
+        n = v.get(k)
+        if isinstance(n, int) and not isinstance(n, bool) and 0 <= n <= 10 ** 7:
+            out[k] = n
+    if _ts(v.get("at")):
+        out["at"] = v["at"]
+    return out
+
+
+TRACK_KEYS = ("id", "title", "channel", "duration", "source", "album", "album_id", "artists", "explicit")
+HISTORY_FIELDS = {"file": _c_file, "kept_at": _c_ts, "nd_id": _nullable(_c_match(_STORE_ID)),
+                  "nd_cover": _nullable(_c_match(_STORE_ID)), "thumb": _c_url, "art": _c_url, "upgraded_from": _c_tid,
+                  "lyrics": _c_choice(("synced", "plain", "instrumental", None)),
+                  "gain_db": _nullable(_c_range(-100, 100))}
+LISTEN_FIELDS = {"played_s": _c_seconds, "started_at": _c_ts, "ended_at": _c_ts, "counted": _c_bool,
+                 "skipped": _c_bool, "scrobbled": _c_bool, "via": _c_choice(("nd",))}
+LIKE_FIELDS = {"liked_at": _c_ts}
+DISLIKE_FIELDS = {"at": _c_ts, "until": _c_ts, "artist_key": _c_text(blocklist.NAME_MAX),
+                  "artist_id": _nullable(_c_match(_CHANNEL)), "blocked": _c_blocked}
+PLAYLIST_FIELDS = {"description": _c_text(playlists.DESC_MAX), "pinned": _c_bool, "created_at": _c_ts,
+                   "updated_at": _c_ts, "exported": _c_exported, "import": _c_import}
+
+
+def _fields(e, spec, skip=()):
+    """`e`'s fields through their checks in `spec` (a failed check drops the field); fields the spec doesn't know
+    travel only as plain scalars, so a newer Reef's extras survive but nothing nested or non-finite does."""
+    out = {}
+    for k, v in e.items():
+        if k in skip:
+            continue
+        v = spec.get(k, _scalar)(v)
+        if v is not _DROP:
+            out[k] = v
+    return out
+
+
+def _track_item(e, spec, required=()):
+    """A stored track entry: store.clean_track's fields (id, title, artists, duration, ...), then the section's own
+    (`spec`). None when the id isn't valid or a `required` field is missing or bad."""
+    core = store.clean_track(e)
+    if not core:
+        return None
+    if e.get("album") == "":
+        core["album"] = ""  # likes store "" for no album
+    out = {**_fields(e, spec, TRACK_KEYS), **core}
+    return out if all(k in out for k in required) else None
 
 
 def _history_item(e):
-    tid = _tid(e)
-    if not tid:
-        return None
-    e = {**e, "id": tid}
-    f = e.get("file")
-    if f is not None and not (isinstance(f, str) and os.path.isfile(f)):
-        e.pop("file")  # another device's path (or gone): the entry stays, without a file to point at
-    return e
+    return _track_item(e, HISTORY_FIELDS)
 
 
 def _listen_item(e):
-    tid = _tid(e)
-    if not tid or not _num(e.get("started_at")) or not _num(e.get("played_s")):
-        return None
-    return {**e, "id": tid}
+    return _track_item(e, LISTEN_FIELDS, required=("started_at", "played_s"))
 
 
 def _like_item(e):
-    tid = _tid(e)
-    return {**e, "id": tid} if tid else None
-
-
-def _playlist_item(p):
-    if not isinstance(p, dict) or not playlists.valid_id(p.get("id")) or not isinstance(p.get("name"), str):
-        return None
-    raw = p.get("tracks") if isinstance(p.get("tracks"), list) else []
-    tracks = [t for t in (playlists.clean_entry(t) for t in raw) if t]  # an import's placeholders too
-    return {**p, "tracks": tracks[:playlists.TRACKS_MAX]}
+    return _track_item(e, LIKE_FIELDS)
 
 
 def _dislike_item(e):
-    tid = _tid(e)
-    return {**e, "id": tid} if tid and _num(e.get("at")) else None
+    return _track_item(e, DISLIKE_FIELDS, required=("at",))
+
+
+def _playlist_item(p):
+    if not isinstance(p, dict) or not playlists.valid_id(p.get("id")) or not isinstance(p.get("name"), str) \
+            or not p["name"].strip():
+        return None
+    raw = p.get("tracks") if isinstance(p.get("tracks"), list) else []
+    tracks = [t for t in (playlists.clean_entry(t) for t in raw) if t][:playlists.TRACKS_MAX]  # placeholders too
+    out = _fields(p, PLAYLIST_FIELDS, ("id", "name", "tracks", "cover_id"))
+    out.setdefault("pinned", False)
+    return {**out, "id": p["id"], "name": p["name"].strip()[:playlists.NAME_MAX], "tracks": tracks,
+            "cover_id": next((t["id"] for t in tracks if not t.get("q")), None)}  # as playlists._touch sets it
 
 
 def _block_item(e):
@@ -212,7 +364,7 @@ def _block_item(e):
         return None
     aid = e.get("id")
     return {"id": aid if isinstance(aid, str) and aid else None, "name": e["name"].strip()[:blocklist.NAME_MAX],
-            "at": e.get("at") if _num(e.get("at")) else time.time()}
+            "at": e.get("at") if _ts(e.get("at")) else time.time()}
 
 
 def _offset(v):
@@ -220,10 +372,23 @@ def _offset(v):
     return int(o) if _num(o) and o and abs(o) <= lyrics.OFFSET_MAX else None
 
 
+def _words(rows):
+    """Packed word timing (lyrics._pack: [[[t ms, d ms | null, text], ...] per line]) when it's all well formed."""
+    def ms(n):
+        return isinstance(n, int) and not isinstance(n, bool) and 0 <= n < 10 ** 8
+
+    if not isinstance(rows, list) or not all(
+            isinstance(line, list) and all(isinstance(w, list) and len(w) == 3 and ms(w[0])
+                                           and (w[1] is None or ms(w[1])) and isinstance(w[2], str) for w in line)
+            for line in rows):
+        return None
+    return rows
+
+
 def _lyrics_item(v):
     """A clean lyrics entry: a hit (with its source, word timing, pin, offset), an offset-only entry, or None (a
     miss without an offset, or junk). Reef 1 hits (no "v") stay Reef 1 entries."""
-    at = v.get("at") if _num(v.get("at")) else 0
+    at = v.get("at") if _ts(v.get("at")) else 0
     off = _offset(v)
     has_text = any(isinstance(v.get(f), str) and v.get(f) for f in ("synced", "plain")) or v.get("instrumental") is True
     if v.get("miss") or not has_text:
@@ -235,14 +400,17 @@ def _lyrics_item(v):
         e["v"] = lyrics.VERSION
         if isinstance(v.get("provider"), str) and len(v["provider"]) <= 40:
             e["provider"] = v["provider"]
-        if isinstance(v.get("words"), list):
+        if _words(v.get("words")) is not None:
             e["words"] = v["words"]
         lrc = v.get("lrclib")
         if isinstance(lrc, dict):
-            e["lrclib"] = {k: lrc.get(k) for k in ("synced", "plain", "instrumental")}
+            e["lrclib"] = {"synced": lrc.get("synced") if isinstance(lrc.get("synced"), str) else None,
+                           "plain": lrc.get("plain") if isinstance(lrc.get("plain"), str) else None,
+                           "instrumental": lrc.get("instrumental") is True}
         if v.get("retry") is True:
             e["retry"] = True
-        if v.get("pinned") is True and isinstance(v.get("lrclib_id"), int) and not isinstance(v["lrclib_id"], bool):
+        lid = v.get("lrclib_id")
+        if v.get("pinned") is True and isinstance(lid, int) and not isinstance(lid, bool) and 0 < lid < 2 ** 53:
             e.update(pinned=True, lrclib_id=v["lrclib_id"], provider=lyrics.PINNED)
     if off:
         e["offset_ms"] = off
@@ -298,7 +466,7 @@ def _alias_item(e):
     if not aid and not match:
         return None
     return {"id": aid, "match": match, "name": e["name"].strip()[:aliases.NAME_MAX],
-            "at": e.get("at") if _num(e.get("at")) else 0}
+            "at": e.get("at") if _ts(e.get("at")) else 0}
 
 
 def _alias_key(e):
@@ -314,7 +482,7 @@ def _matches_items(d):
             bad += 1
             continue
         out[k] = {"id": clean["id"], "score": v.get("score") if _num(v.get("score")) else None, "manual": True,
-                  "at": v.get("at") if _num(v.get("at")) else 0, "track": clean}
+                  "at": v.get("at") if _ts(v.get("at")) else 0, "track": clean}
     return out, bad
 
 
@@ -331,6 +499,7 @@ def _settings_items(d):
     return out, bad
 
 
+UNIQUE_IDS = ("history", "likes", "dislikes", "playlists")
 ITEM = {"history": _history_item, "listens": _listen_item, "likes": _like_item, "playlists": _playlist_item,
         "dislikes": _dislike_item, "blocklist": _block_item, "aliases": _alias_item}
 
@@ -347,6 +516,11 @@ def _clean_section(name, raw):
     if name == "matches":
         return _matches_items(raw)
     out = [c for c in (ITEM[name](e) for e in raw) if c is not None]
+    if name in UNIQUE_IDS:  # one entry per id (the first), as the stores keep them
+        seen = set()
+        out = [c for c in out if not (c["id"] in seen or seen.add(c["id"]))]
+    if name == "playlists":
+        out = out[:playlists.PLAYLISTS_MAX]
     return out, len(raw) - len(out)
 
 
@@ -511,7 +685,7 @@ def _merge_listens(cur, incoming):
     for e in incoming:
         k = (e.get("id"), e.get("started_at"))
         have = out.get(k)
-        if have is None or (e.get("played_s") or 0) > (have.get("played_s") or 0):
+        if have is None or _sort_num(e.get("played_s")) > _sort_num(have.get("played_s")):
             if have is not None and have.get("scrobbled"):
                 e = {**e, "scrobbled": True}
             out[k] = e
@@ -538,16 +712,16 @@ def _apply(name, mode, cur, new):
         return out
     if name == "listens":
         rows = list(_merge_listens([] if mode == "replace" else cur, new).values())
-        rows.sort(key=lambda e: e.get("started_at") or 0)
+        rows.sort(key=lambda e: _sort_num(e.get("started_at")))
         return rows[-listens.MAX:]
     if mode == "replace":
         rows = list(new)
     elif name == "history":
-        rows = _merge_by(cur, new, lambda e: e.get("id"), "kept_at", order=lambda e: -(e.get("kept_at") or 0))
+        rows = _merge_by(cur, new, lambda e: e.get("id"), "kept_at", order=lambda e: -_sort_num(e.get("kept_at")))
     elif name == "likes":
-        rows = _merge_by(cur, new, lambda e: e.get("id"), "liked_at", order=lambda e: -(e.get("liked_at") or 0))
+        rows = _merge_by(cur, new, lambda e: e.get("id"), "liked_at", order=lambda e: -_sort_num(e.get("liked_at")))
     elif name == "dislikes":
-        rows = _merge_by(cur, new, lambda e: e.get("id"), "at", order=lambda e: -(e.get("at") or 0))
+        rows = _merge_by(cur, new, lambda e: e.get("id"), "at", order=lambda e: -_sort_num(e.get("at")))
     elif name == "playlists":
         rows = _merge_by(cur, new, lambda e: e.get("id"), "updated_at")
     elif name == "blocklist":
@@ -557,7 +731,7 @@ def _apply(name, mode, cur, new):
     else:
         raise BackupError(f"unknown section {name}")
     if name == "history" and mode == "replace":
-        rows.sort(key=lambda e: -(e.get("kept_at") or 0))
+        rows.sort(key=lambda e: -_sort_num(e.get("kept_at")))
     return rows
 
 
@@ -568,6 +742,15 @@ def restore(doc, mode="merge", now=None):
     clean = validate(doc)
     if not clean:
         raise BackupError("the backup has none of Reef's sections")
+    # Every section is merged into a copy of what's here first: one that can't be applied refuses the whole restore
+    # before anything is written. The writes below merge again, each against its store as it is then (under its lock),
+    # so a change made meanwhile isn't lost.
+    for name, (new, _) in clean.items():
+        try:
+            _apply(name, mode, STORES[name].read(), new)
+        except Exception as e:
+            logger.warning(f"backup restore refused: section {name} can't be applied: {type(e).__name__}: {str(e)[:160]}")
+            raise BackupError(f"section {name} can't be restored ({type(e).__name__}); nothing was changed") from None
     snap = snapshot("pre-restore", now)
     counts = {}
     for name, (new, skipped) in clean.items():
@@ -577,7 +760,16 @@ def restore(doc, mode="merge", now=None):
             before["n"] = len(cur)
             return _apply(name, mode, cur, new)
 
-        after = STORES[name].transact(change)
+        try:
+            after = STORES[name].transact(change)
+        except Exception as e:
+            # Per-store files are atomic, the restore as a whole isn't: say what was written and where the old state is.
+            why = (e.strerror if isinstance(e, OSError) else None) or type(e).__name__
+            done = ", ".join(counts) or "nothing"
+            logger.warning(f"backup restore stopped at {name}: {type(e).__name__}: {str(e)[:160]} written={done} "
+                           f"snapshot={snap}")
+            raise RestoreIncomplete(f"the restore stopped at {name} ({why}) after restoring {done}; everything as it "
+                                    f"was before is in backups/{snap}", snap) from None
         counts[name] = {"before": before["n"], "in_backup": len(new), "skipped": skipped, "after": len(after)}
     logger.info(f"backup restore mode={mode} snapshot={snap} " + " ".join(f"{k}={v['after']}" for k, v in counts.items()))
     return {"mode": mode, "snapshot": snap, "sections": counts}

@@ -65,6 +65,22 @@ def test_clean_track_keeps_known_fields_only():
                  "artists": [{"name": "N", "id": None}], "explicit": True}
 
 
+@pytest.mark.parametrize("raw,want", [
+    (10 ** 400, None), (-(10 ** 400), None), (float("nan"), None), (float("inf"), None), ("1e400", None),
+    (True, None), (None, None), ("x", None), (-1, None), (86400, None), (0, 0.0), ("12.5", 12.5), (86399.5, 86399.5),
+])
+def test_seconds_rejects_what_isnt_a_finite_length(raw, want):
+    assert store.seconds(raw) == want
+
+
+def test_a_huge_json_integer_is_an_unknown_length_not_a_500(client):
+    body = f'{{"id": "{A}", "title": "Big", "duration": 1{"0" * 400}}}'
+    r = client.put(f"/api/likes/{A}", data=body, content_type="application/json")
+    assert r.status_code == 201 and r.get_json()["entry"]["duration"] is None
+    r = client.post("/api/playlists", data=f'{{"name": "P", "tracks": [{body}]}}', content_type="application/json")
+    assert r.status_code == 201 and r.get_json()["tracks"][0]["duration"] is None
+
+
 # ---------- likes ----------
 
 def test_like_unlike(client, files):

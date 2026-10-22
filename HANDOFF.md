@@ -1,6 +1,43 @@
 # Reef — handoff notes (resume on another machine)
 
-Last updated: 2026-10-22 (Round 16, UI remake step 5).
+Last updated: 2026-10-22 (Round 16, UI remake step 5, audit batch 1 accepted and committed, batch 2 in progress).
+
+## CURRENT supervision (read first; 2026-10-22)
+
+- **Owner's goal**: finish the current task, then the necessary whole-codebase refactors, implemented by Claude and
+  verified and accepted independently by Codex (root). Root acceptance allows a local commit only: no push, deploy or
+  U6 is authorized (not even after acceptance) unless the owner says so; no real secrets, permissions, model or
+  phone/publication changes.
+- **State**:
+  - U5 is accepted and committed locally as `bd5014d` (983 pytest passed / 1 deselected at acceptance; root WebKit
+    proofs are under `/tmp/reef-codex-u5-20261022`; real-device gaps remain). The old `term_bc7a30e2` and the U5 writer
+    are idle and have relinquished ownership.
+- **Who's working**:
+  - Root coordinator: `term_a1a35e94-ec0d-4c97-a320-2c6a2a95c78d` (replacement root after an explicit RELEASE from
+    `term_d731eb62`), owns Run `run_644fd9908c5b` generation 2.
+  - Sole writer: `term_62492f92-3dea-4cc5-ac14-f76f76a4bdb7` (Claude). Current Task `task_e630e35fb597`, Dispatch
+    `ctx_dcc35f052515`, batch 2: it owns only `downloader.py`, `playlists.py`, their tests and this file.
+  - The previous writer Task `task_a93a61d0b573` / `ctx_320829a25ceb` (batch 1) is settled; the terminal was kept
+    idle for this next batch.
+- **Audit**: `/tmp/reef-codebase-audit-20261022.md` (report + addendum).
+  - Findings F1–F11 with validated / hypothesis labels, plus planned batches.
+  - The root independently confirmed F1, F5, F6, F7 and F11 with synthetic data.
+  - The sheets / settings parts of app.js were skimmed, not line-audited. Don't claim perfect correctness.
+- **Batch 1 (persistence: F1, F5, F6 store half)**: **accepted by the root** and committed locally (not pushed).
+  - Root checks: an independent diff review; 155 focused tests passed; full pytest 1003 passed / 1 deselected
+    (16.22 s); Ruff and `git diff --check` clean.
+  - A separate root scratch probe showed that a like added concurrently after the preflight and the snapshot is kept.
+  - Details are in "Audit batch 1" below.
+- **Batch 2 (keep / .m3u collisions: F3, F9)**: in progress, stays uncommitted until the root accepts it. See
+  "Audit batch 2" below.
+- **Remaining batches, root assigns each**:
+  - the credential + API / CSRF boundary (an Origin guard must still work behind Tailscale Serve, which keeps
+    the Host header and adds https X-Forwarded-Proto);
+  - updater health checks with auth;
+  - durable JS tests in CI;
+  - bad-JSON API handling, and the byte-bounded art cache if justified.
+- **Tooling note**: `worker-start --terminal` returns `agent_unconfigured`. The proven fallback is manual
+  task-create, then `dispatch --return-preamble`, then terminal-send the exact preamble.
 
 ## What's running
 
@@ -1012,6 +1049,51 @@ Settings / Stats / Recap screens. Prerequisite: serve Reef over HTTPS with `tail
 - `/api/artist/<id>` adds `videos` (marked tracks, `video: true`), `subscribers`, `monthly_listeners`, `radio_id`,
   `shuffle_id`; `/api/album/<id>` and `/api/playlist/<id>` add `description` (+ playlist `track_count`); Home's Charts
   shelf adds `playlist_id`.
+
+## Audit batch 1 (2026-10-22): persistence correctness (accepted by root Codex; local commit)
+
+Audit report: `/tmp/reef-codebase-audit-20261022.md` (findings F1, F5, F6). Base `bd5014d`; changed files: `backup.py`,
+`store.py`, `updater.py`, `tests/test_backup.py`, `tests/test_library.py`, `tests/test_listens.py`, `tests/test_updater.py`.
+
+- `updater.check` (F5): the GitHub / PyPI calls still run outside the file lock, but the save re-reads update.json under
+  `_file.lock` and only replaces `github` / `pypi` / `compare`. An update `run` recorded while the check waited is kept,
+  so `POST /api/update` still answers 409 while it runs (before: the check's stale copy erased `run`).
+- `store.seconds` (F6, store half): an int too big for a float (`10**400` in a JSON body) is an invalid length (None)
+  like nan / inf: `PUT /api/likes`, `POST /api/playlists`, `POST /api/listens` (400) no longer 500. `app._seconds`
+  (`/api/match`, keep hints) still lacks the same catch: app.py was out of scope for this batch.
+- Restore (F1), `backup.py`:
+  - `_num` accepts only finite numbers, so JSON `1e400` / `Infinity` / `NaN` / huge ints can't get through.
+  - Timestamps must be epoch seconds in [0, 1e11).
+  - History, likes, listens and dislikes items are `store.clean_track` plus per-section field checks:
+    - history: `file` (exists here), `kept_at`, `nd_id` / `nd_cover` (`[\w.-]{1,128}`), `thumb` / `art` (http(s) or ""),
+      `upgraded_from`, `lyrics`, `gain_db`;
+    - listens: `played_s` < 86400 and `started_at` (both required), `ended_at`, `counted` / `skipped` / `scrobbled`
+      booleans, `via`;
+    - likes: `liked_at`;
+    - dislikes: `at` (required), `until`, `artist_key`, `artist_id`, `blocked`.
+  - A bad field is dropped and the item kept; fields Reef doesn't know travel only as plain scalars.
+  - Playlists: the name is trimmed (blank = skipped); `pinned` (default false), `created_at` / `updated_at`, `description`,
+    `exported` (a relative `.m3u` path, no `..`) and `import` (`kind`, `rows` / `skipped` / `total` ints, `at`) are
+    checked; `cover_id` is recomputed as `playlists._touch` does; duplicate ids are skipped (history, likes, dislikes
+    too), at most `PLAYLISTS_MAX`.
+  - Lyrics: `at`, packed `words`, the `lrclib` copy and a pin's `lrclib_id` are checked. Matches: `at` / `score` finite.
+  - The merge sort keys never raise, even on junk already in the stores from before this fix.
+  - `restore()` first merges every section into a copy of the current store (a section that can't apply refuses with
+    400 "nothing was changed", no snapshot written), then snapshots and writes each store, merging again against that
+    store under its own lock. A write failing midway raises `backup.RestoreIncomplete` (a `BackupError`, so today
+    a 400): its message names the sections already restored and `backups/pre-restore-…json`. The stores are separate
+    atomic files; the restore as a whole is not atomic.
+- Not done here (later batches): data written before this fix stays as it is until a restore replaces it
+  (`playlists.all_playlists` still sorts on a raw `updated_at`); app.py `_seconds` OverflowError, JSON-array bodies,
+  the Origin check, keep / .m3u name collisions, credential redaction, the committed JS checks, updater health with
+  `REEF_OPEN`.
+- Checks (Mac, scratch data, no network):
+  - `python -m pytest -q tests/test_backup.py tests/test_backup_coverage.py tests/test_updater.py tests/test_library.py
+    tests/test_listens.py`;
+  - full `python -m pytest -q`: 1003 passed, 1 deselected;
+  - `ruff check .` and `git diff --check`: clean;
+  - the five new restore tests, the `store.seconds` tests and the updater test were also run against `bd5014d`'s
+    backup.py / store.py / updater.check (a scratch pytest plugin loading the old code): all of them fail there.
 
 ## Ideas / next steps
 
