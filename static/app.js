@@ -172,10 +172,16 @@
   async function api(path, opts) {
     const r = await fetch(path, opts);
     if (r.status === 204) return null;
-    const body = await r.json().catch(() => ({}));
-    if (!r.ok) throw Object.assign(new Error(body.error || r.statusText || "Request failed"), { status: r.status, body });
-    return body;
+    if (r.ok) {
+      try { return await r.json(); } catch (e) { // a 2xx that isn't JSON is a failure, never an empty success
+        throw Object.assign(new Error("Reef's reply wasn't JSON"), { status: r.status, body: {}, cause: e });
+      }
+    }
+    let body = await r.json().catch(() => null);
+    if (!body || typeof body !== "object" || Array.isArray(body)) body = {};
+    throw Object.assign(new Error(body.error || r.statusText || `Request failed (${r.status})`), { status: r.status, body });
   }
+  let restoreGen = 0; // bumped by a successful backup restore: a read asked before it is out of date
 
   // Warm the server's stream-URL cache; best effort, never blocks or surfaces errors.
   function prefetch(ids) {
@@ -1721,14 +1727,15 @@
   async function loadKind(kind) {
     if (!grouped() || !["songs", "videos", "albums", "artists", "playlists"].includes(kind)) return;
     if (DC.kindAction(state.kinds.get(kind)) !== "fetch") return; // loaded, loading, or failed (Retry clears it)
-    const q = state.query, seq = searchSeq;
+    const q = state.query, seq = searchSeq, gen = restoreGen;
     state.kinds.set(kind, { loading: true });
     let entry;
     try {
       const url = kind === "songs" ? `/api/search?q=${encodeURIComponent(q)}&src=yt` : `/api/search?q=${encodeURIComponent(q)}&filter=${kind}`;
       const items = await api(url);
       entry = { items: Array.isArray(items) ? items : [] };
-      if (kind === "songs" || kind === "videos") noteKept(entry.items);
+      // Liked / kept flags asked before a restore are out of date (the list itself isn't)
+      if ((kind === "songs" || kind === "videos") && DC.genCurrent(gen, restoreGen)) noteKept(entry.items);
     } catch (e) {
       entry = { err: e };
     }
@@ -1894,10 +1901,13 @@
   // (+ Import), Navidrome's newest albums and the Kept songs. The Library hub (§6) replaces it in step 6.
   // Each part paints into its own box, so the 1.5 s jobs poll repaints Downloads only.
   async function loadPlaylists() {
+    const gen = restoreGen;
     try {
       const list = await api("/api/playlists");
+      if (!DC.genCurrent(gen, restoreGen)) return; // asked before a restore: the restore's own load has it
       if (Array.isArray(list)) { state.playlists = list; state.playlistsErr = null; }
     } catch (e) {
+      if (!DC.genCurrent(gen, restoreGen)) return;
       if (!state.playlists) state.playlistsErr = e; // keep the last list
     }
     if (state.view === "library") { renderLibPlaylists(); renderLibSub(); }
@@ -2058,11 +2068,17 @@
     const slash = key.indexOf("/");
     const kind = slash < 0 ? key : key.slice(0, slash), id = slash < 0 ? "" : key.slice(slash + 1);
     const p = (async () => {
-      let changed = true;
+      const gen = restoreGen;
+      let changed = true, data, err;
+      try { data = await api(PAGE_API[kind](id)); } catch (e) { err = e; }
+      // Dropped by a restore (or replaced since): this answer is out of date, and the cache and the newer load aren't
+      // its to touch. Whoever awaits it gets the current load instead.
+      if (detail.inflight.get(key) !== p) return loadPage(key);
       try {
-        const data = await api(PAGE_API[kind](id));
+        if (err) throw err;
         if (kind === "local") for (const t of data.tracks || []) if (!t.title) t.title = `YouTube video ${t.id}`; // a Takeout row not looked up yet
-        noteKept(kind === "artist" ? [...(data.songs || []), ...(data.videos || [])] : data.tracks);
+        // Liked / kept flags from before a restore are out of date (the page itself isn't)
+        if (DC.genCurrent(gen, restoreGen)) noteKept(kind === "artist" ? [...(data.songs || []), ...(data.videos || [])] : data.tracks);
         if (kind === "local" && (data.import || (data.tracks || []).some(M.isPlaceholder))) loadImportStatus(id);
         if (kind === "artist") for (const r of [...(data.albums || []), ...(data.singles || [])]) if (r.type) releaseType.set(r.id, r.type);
         const old = detail.cache.get(key);
@@ -2556,14 +2572,14 @@
 
   // Re-run the current search in place (no skeleton, no navigation), e.g. after an artist was unhidden.
   async function refetchSearch() {
-    const q = state.query, seq = ++searchSeq;
+    const q = state.query, seq = ++searchSeq, gen = restoreGen;
     try {
       const r = await fetchSearch(q);
       if (seq !== searchSeq) return;
       state.all = r.all;
       state.results = r.results;
       state.kinds.clear();
-      noteKept(r.results);
+      if (DC.genCurrent(gen, restoreGen)) noteKept(r.results); // flags from before a restore are out of date
       if (state.view === "search") renderSearch();
     } catch { /* keep what's shown */ }
   }
@@ -2705,11 +2721,15 @@
 
   // ---------- data ----------
   async function loadHistory() {
+    const gen = restoreGen;
     try {
-      state.history = await api("/api/history");
+      const list = await api("/api/history");
+      if (!DC.genCurrent(gen, restoreGen)) return; // asked before a restore
+      state.history = list;
       state.historyLoaded = true;
       state.historyErr = null;
     } catch (e) {
+      if (!DC.genCurrent(gen, restoreGen)) return;
       if (!state.historyLoaded) state.historyErr = e; // else keep the previous list
     }
     for (const h of state.history) if (h && h.id && h.nd_id) ndIds.set(h.id, h.nd_id);
@@ -2730,14 +2750,17 @@
     clearTimeout(homeTimer);
     if (!again) homeTries = 0;
     homeAt = Date.now();
+    const gen = restoreGen;
     let body;
     try {
       body = await api("/api/home");
     } catch (e) {
+      if (!DC.genCurrent(gen, restoreGen)) return; // asked before a restore
       homeAt = 0;
       if (!state.home) { state.homeErr = e; if (state.view === "home") renderHome(); }
       return;
     }
+    if (!DC.genCurrent(gen, restoreGen)) return;
     state.homeErr = null;
     if (!body || !Array.isArray(body.shelves)) return;
     for (const s of body.shelves) {
@@ -2817,7 +2840,11 @@
   }
 
   async function loadSettings() {
-    try { state.settings = (await api("/api/settings")).values || {}; } catch { /* keep the defaults */ }
+    const gen = restoreGen;
+    try {
+      const body = await api("/api/settings");
+      if (DC.genCurrent(gen, restoreGen)) state.settings = body.values || {}; // else asked before a restore
+    } catch { /* keep the defaults */ }
   }
 
   async function loadHealth() {
@@ -2881,7 +2908,7 @@
     $("#q").blur();
     if (!asLink) rememberSearch(q);
     if (location.hash !== "#search") location.hash = "#search"; else renderSearch();
-    const seq = ++searchSeq;
+    const seq = ++searchSeq, gen = restoreGen;
     try {
       if (asLink) {
         let r;
@@ -2905,8 +2932,10 @@
         state.all = r.all;
         state.results = r.results;
       }
-      noteKept(state.results);
-      noteKept(state.all?.videos);
+      if (DC.genCurrent(gen, restoreGen)) { // liked / kept flags from before a restore are out of date
+        noteKept(state.results);
+        noteKept(state.all?.videos);
+      }
     } catch (e) {
       if (seq !== searchSeq) return;
       state.results = [];
@@ -4509,9 +4538,10 @@
     $(".np-cap").classList.toggle("solo", b.hidden || $("#np-keep").hidden);
   }
   async function loadLikes() {
+    const gen = restoreGen;
     try {
       const list = await api("/api/likes");
-      if (!Array.isArray(list)) return;
+      if (!Array.isArray(list) || !DC.genCurrent(gen, restoreGen)) return; // a list asked before a restore is out of date
       likedIds.clear();
       for (const t of list) if (t && t.id) likedIds.add(t.id);
       paintLike();
@@ -4754,7 +4784,7 @@
     if (!p) {
       p = api(`/api/lyrics/${encodeURIComponent(t.id)}?${lyricsHints(t)}`).catch((e) => {
         if (e.status === 404) return null; // a real miss sticks
-        lyr.cache.delete(t.id); // a network blip or a server error doesn't
+        if (lyr.cache.get(t.id) === p) lyr.cache.delete(t.id); // a network blip or a server error doesn't (a newer read stays)
         return { error: e };
       });
       lyr.cache.set(t.id, p);
@@ -5572,10 +5602,20 @@
       st.restored = await api("/api/restore", { method: "POST", body: fd });
       st.restoreFile = null;
       toast("Backup restored");
+      // Reef's data changed under the app: reads asked before now are out of date (restoreGen, blockGen), Reef
+      // playlist pages and lyrics are dropped from memory, and what's shown loads again. Playback isn't touched.
+      restoreGen++;
+      blockGen++;
+      for (const m of [detail.cache, detail.errors, detail.inflight]) for (const k of [...m.keys()]) if (k.startsWith("local/")) m.delete(k);
+      lyr.cache.clear();
+      if (lyr.id) resetLyrics();
       loadSettings();
       loadHistory();
       loadBlocklist();
       loadHome();
+      loadLikes();
+      loadPlaylists();
+      if (state.view === "detail" && detail.kind === "local") loadPage(detail.key, { force: true });
     } catch (e) {
       toast(`Couldn't restore: ${e.message}`);
     }
@@ -6143,11 +6183,15 @@
   // queue: paste the right YouTube / YouTube Music link, or pick from YouTube Music's top 5 (scored like /api/match).
   // The choice is pinned under the song's match key (PUT /api/match/<key>: imports and later lookups use it, the
   // automatic matcher never overwrites it) and swapped in where the song sits in the queue (playing on if it's current).
-  const fix = { t: null, key: null, pinned: null, seq: 0, busy: false, pending: null };
+  // `session` counts openings (the same song opened again is a new one): a pick only acts on the sheet it was made in.
+  const fix = { t: null, key: null, pinned: null, seq: 0, session: 0, busy: false, pending: null };
   function openFix(t, { ret = null } = {}) {
+    fix.session++;
     fix.t = M.isPlaceholder(t) ? t : slim(t);
     fix.key = SH.fixKey(t);
     fix.pinned = null;
+    fix.busy = false; // an earlier sheet's pick still running doesn't hold this one
+    $("#fix-sheet").classList.remove("busy");
     $("#fix-link").value = "";
     $("#fix-q").value = `${t.title || ""} ${t.artist || t.channel || ""}`.trim();
     renderFixTrack();
@@ -6189,23 +6233,29 @@
     fix.pending = p;
     return p;
   }
+  // One pick at a time, claimed before waiting for the key (a second tap meanwhile is dropped). After each await the
+  // pick acts only if its sheet is still the open one, and it pins and applies under the one key it read.
   async function pinFix(raw, hint = null) {
-    const t = fix.t;
+    const t = fix.t, session = fix.session;
     if (!t || fix.busy || !raw) return;
-    if (!fix.key && fix.pending) await fix.pending;
-    if (!fix.key) { toast("Couldn't reach Reef"); return; }
+    const live = () => session === fix.session;
+    const free = () => { if (live()) { fix.busy = false; $("#fix-sheet").classList.remove("busy"); } };
     fix.busy = true;
     $("#fix-sheet").classList.add("busy");
+    if (!fix.key && fix.pending) await fix.pending;
+    if (!live()) return; // the sheet moved on (another song, or this one opened again) before the key came
+    const key = fix.key;
+    if (!key) { free(); toast("Couldn't reach Reef"); return; }
     let r = null;
     try {
-      r = await api(`/api/match/${encodeURIComponent(fix.key)}`, { method: "PUT", headers: { "Content-Type": "application/json" },
+      r = await api(`/api/match/${encodeURIComponent(key)}`, { method: "PUT", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ id: raw, title: hint?.title || t.title || "", artist: hint?.artist || t.artist || t.channel || "" }) });
     } catch (e) {
       toast(e.message || "Couldn't use that");
     }
-    fix.busy = false;
-    $("#fix-sheet").classList.remove("busy");
-    if (r?.track?.id) applyFix(t, r.track, fix.key);
+    free();
+    // A sheet opened since (even for the same song) owns the queue swap now: an older answer changes nothing here.
+    if (r?.track?.id && live()) applyFix(t, r.track, key);
   }
   function applyFix(old, track, key) {
     noteKept([track]);

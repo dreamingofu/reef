@@ -1,7 +1,8 @@
 # Reef — handoff notes (resume on another machine)
 
-Last updated: 2026-10-22 (Round 16, UI remake step 5, audit batches 1-5 accepted by the root and committed locally;
-batch 3 = credentials / API / CSRF, batch 4 = updater health auth, batch 5 = JS proof in CI).
+Last updated: 2026-10-22 (Round 16, UI remake step 5, audit batches 1-6 accepted by the root and committed locally;
+batch 3 = credentials / API / CSRF, batch 4 = updater health auth, batch 5 = JS proof in CI, batch 6 = frontend
+async correctness).
 
 ## CURRENT supervision (read first; 2026-10-22, written for a session rotation)
 
@@ -16,19 +17,29 @@ batch 3 = credentials / API / CSRF, batch 4 = updater health auth, batch 5 = JS 
   - Batch 2 `2ba24bbd0434e2b932cd44e7baf9c62628118d23` (accepted clean base of batch 3).
   - Batch 3 `4fbc2ea09c98d98602573910e0f8d3f7d116365d` (accepted clean base of batch 4).
   - Batch 4 `e920c5714c7bc19e8c484e5cc0e29d6e04feaec4` (accepted clean base of batch 5).
-  - Batch 5: the local commit directly on top of `e920c57` that adds this text (`git log -1`; its hash is in the
-    milestone's worker_done report to the root).
+  - Batch 5 `afbcffeb5c535a59669784612193a25a51a5b2f8` (accepted clean base of batch 6).
+  - Batch 6: the local commit directly on top of `afbcffeb5c535a59669784612193a25a51a5b2f8` that adds this text
+    (`git log -1`; its hash is in the milestone's worker_done report to the root).
 - **Who's working**:
   - Root coordinator: `term_d76429bc-6214-450e-8f42-08b9079686d6`, sole supervisor and sole review / acceptance owner of
     Run `run_644fd9908c5b` generation 4 (replaced generation 3's `term_3c425302-cae4-4be9-97c0-cb65b1ba1535`).
-  - Claude writer: `term_52e489b5-69d0-4ab7-bf9e-78308462b9b3`.
+  - Claude writer (batch 6): `term_0f126efc-cb50-4555-a543-c524e4c799da`, sole writer of Task `task_fd512d52fe1c` /
+    Dispatch `ctx_90a49cc91a95` (frontend correctness, base `afbcffeb5c535a59669784612193a25a51a5b2f8`), then the
+    root review repair Task `task_1af4fce8fc0b` / Dispatch `ctx_f45a568106c1` and the search follow-up Task
+    `task_6754636a7a42` / Dispatch `ctx_a9fbd9e30396` (all settled), then this milestone Task `task_3dcc97804933` /
+    Dispatch `ctx_caf9d7eb927e` (this file and the local batch 6 commit of `static/app.js`, `tests/js/harness.js`,
+    `tests/js/app-async.test.js`, `HANDOFF.md`, nothing else). After that commit this Claude **relinquishes
+    checkout writer ownership** and idles (tab kept, shell open). A fresh Claude owns the next batch only after the
+    root confirms its readiness and sends a new Dispatch. No duplicate writers.
+  - Batches 1-6 are closed (accepted, committed); their proof stands and isn't re-reviewed or re-run.
+  - Previous Claude writer `term_52e489b5-69d0-4ab7-bf9e-78308462b9b3` relinquished writer ownership after the batch 5
+    commit and idles (tab kept).
     - Settled batch 5 Task `task_c3403283cf1f` / Dispatch `ctx_5b4db1c2fe75` (JS proof in CI, on base
       `e920c5714c7bc19e8c484e5cc0e29d6e04feaec4`).
     - This milestone Task `task_fb5a4400ad3c` / Dispatch `ctx_ba1c6274faa3` owns only this file and the local batch 5
       commit (`.github/workflows/ci.yml`, `tests/js/**`, `HANDOFF.md`), no other work. After that commit this Claude
       **relinquishes checkout writer ownership** and idles (tab kept, shell open). A fresh Claude owns the next
       frontend batch only after the root confirms its readiness and sends a new Dispatch. No duplicate writers.
-  - Batches 1-5 are closed (accepted, committed); their proof stands and isn't re-reviewed or re-run.
   - Previous Claude writer `term_8969653d-0e79-47c1-8e88-3ce3b86a64c6` relinquished writer ownership and idles (tab kept).
     - Settled batch 3 Tasks: `task_f48c451fcebe` / `ctx_5ea180eba2eb` (implementation) and `task_4434847b17e2` /
       `ctx_8c5e9a8b2d1c` (long-userinfo repair).
@@ -160,10 +171,97 @@ batch 3 = credentials / API / CSRF, batch 4 = updater health auth, batch 5 = JS 
   - Limits: only Node 26 was run locally (CI pins 26). Tests run in Node's realm, not a browser; a core that silently
     used a Node global of the same name as a browser one wouldn't be caught. Not proven: Safari / WebKit, the DOM
     code around the cores.
+- **Batch 6 (frontend async correctness: U-a, pinFix races, restore refresh)**: **accepted by the root** (generation
+  4) after its independent review of the final diff, committed locally on `afbcffe`. The root's review found two
+  defects in the first patch, both repaired with regressions that failed first (details below): an old PUT finishing
+  after the same song's sheet reopened still swapped the queue (hidden because the tests stubbed `swapEverywhere`),
+  and pre-restore catalog page / search / chip-list / refetch answers re-applied stale liked / kept flags through
+  `noteKept`. Changed:
+  `static/app.js`, `tests/js/harness.js` (new `decl` / `scope`), new `tests/js/app-async.test.js`. No server change.
+  - `api()`: valid 2xx JSON unchanged; 204 is null; a 2xx body that isn't JSON (HTML, empty, cut) rejects with
+    "Reef's reply wasn't JSON" (`status`, `body: {}`, `cause`), never `{}`. Non-2xx: `body.error`, else statusText,
+    else `Request failed (<status>)`; a JSON body that isn't an object (`null`, array) or no JSON becomes `body: {}`
+    (no more `Cannot read properties of null`); typed `status` / `body` (block, hint, job) kept.
+  - Fix wrong match: `fix.session` counts openings (`openFix` bumps it, even for the same placeholder object, and
+    frees `busy` and the sheet's busy class). `pinFix` captures `t` and the session, claims `busy` **before** waiting
+    on the pending key (a second pick meanwhile is dropped: one PUT), drops the pick if the session changed while
+    waiting (never a PUT under a newly opened song's key), reads the key once and uses it for both the PUT and
+    `applyFix` (not the mutable `fix.key`), and frees busy only for its own session. An old PUT finishing after a
+    reopen (success or failure) changes nothing in the UI: no queue swap, no reload, no close, busy kept (the server
+    pin happened; the newer sheet's pick decides the queue). `applyFix` keeps its base signature. Normal pick, API
+    failure + retry, pending-key failure + later search unchanged.
+  - **Root review repair** (`task_1af4fce8fc0b`): the first patch still applied a stale-session PUT with
+    `close: false`. Root repro `/tmp/reef-codex-refactor-20261022/pin-reopen-put-root4.cjs` (actual fix / openFix /
+    runFixSearch / pinFix / applyFix / swapEverywhere): the same song reopened, a second pick while the first PUT
+    waits, old answers first → the old swap replaced the queue id, so the latest pin found nothing to swap
+    (`finalQueue: [playing, pick-one]`, exit 1). The fix tests had stubbed `swapEverywhere`, which hid it; they now run
+    the real `swapEverywhere` (M.swap) and assert `state.queue`. Root also found that a pre-restore catalog page
+    (album / artist / playlist) answering after the restored `loadLikes` re-applied old `liked` flags through
+    `noteKept`: `loadPage` now captures `restoreGen` and calls `noteKept` only if no restore happened since (the page
+    data is still cached; no catalog reload).
+  - **Search follow-up** (`task_6754636a7a42`): root repro `/tmp/reef-codex-refactor-20261022/restore-search-root4.cjs`
+    (actual `loadKind` + `noteKept`): a `songs` chip list asked before a restore and answering after it wiped the
+    restored like (`likes: []`, exit 1). The same read path was in `runSearch` and `refetchSearch`. Each now captures
+    `restoreGen` with its search seq and calls `noteKept` only if no restore happened since. Results, chip lists,
+    rendering and the `searchSeq` / query checks are unchanged, and a search asked after the restore still updates
+    likes / kept. Mutation replies (`resolvePlaceholder`, dead-track replacement, `applyFix`) keep their behavior.
+  - Restore success: `restoreGen++` and `blockGen++`, drops `local/*` (Reef playlist) entries from `detail.cache` /
+    `errors` / `inflight` (other pages kept), clears `lyr.cache` and resets the lyrics view if it holds a track
+    (`resetLyrics`, reloads when shown), then reloads settings, history, blocklist, Home **plus likes and playlists**,
+    and the shown Reef playlist page (`loadPage(force)`). Playback (queue, index, audio src / position / play state)
+    isn't touched. `loadLikes` / `loadPlaylists` / `loadSettings` / `loadHistory` / `loadHome` drop an answer (success
+    or error) asked before the restore (`DC.genCurrent(gen, restoreGen)`); `loadBlocklist` already used `blockGen`.
+    `loadPage` ignores an answer whose promise is no longer the key's inflight one (cache, errors and the newer
+    inflight entry untouched; awaiters get `loadPage(key)`, i.e. the current load), and skips `noteKept` for any page
+    asked before a restore. `fetchLyrics` deletes a failed
+    entry only if it is still that read's promise.
+  - Harness: `scope(names, vars)` compiles the named top-level declarations of static/app.js (functions, consts,
+    lets; `decl` finds each exactly once) in one strict scope at their real line numbers over stub vars. Tests run the
+    shipped `api`, `openFix` / `runFixSearch` / `pinFix` / `applyFix` / `fixQuery` / `fix`, and `restoreBackup` with
+    `loadPage`, the six loaders, `fetchLyrics` / `showLyrics` / `resetLyrics`, `noteKept`, `detail`, `PAGE_API`,
+    `likedIds` / `keptIds` / `ndIds`, plus the real `swapEverywhere`, with
+    deferred API replies, real `Response` objects and real M / SH / DC cores. Each test has a 5 s timeout.
+  - Before / after: the 20 new tests on a `git archive` of `afbcffe` → 12 fail by assertion, 8 pass (preserved
+    behavior), 0 cancelled (`/tmp/reef-batch6/base-app-async.txt`); after → 20 pass. A first draft hung on base (an
+    unanswered stale PUT awaited); fixed by asserting PUTs after a flush before awaiting. Mutation probes on a scratch
+    copy: removing any single guard (`restoreGen++`, the restore's `blockGen++`, the lyrics identity delete, the
+    loadPage inflight check, the openFix busy reset, the session check after the key wait) fails at least one test.
+  - Repair before / after: the 2 new tests (same song reopened with the old PUT in flight: queued and current-track
+    success plus an old failure; pre-restore album page vs restored likes) on the first patch → both fail by assertion,
+    0 cancelled (`/tmp/reef-batch6/repair-before.txt`: old answer swapped the queue to `pick-one`; `liked-old` came
+    back; the current-track case alone also fails, `repair-before-current.txt`); after → 21 / 21 pass and the root
+    repro prints `finalQueue: [playing, pick-two]`, exit 0. Mutation probes: dropping `&& live()` before `applyFix` or
+    the `restoreGen` check before `noteKept` each fails one test.
+  - Search before / after: 3 new tests (`runSearch`, `loadKind`, `refetchSearch` with the real `noteKept`, replies
+    crossing a restore, then a post-restore read that must still update flags) fail by assertion on the prior repair,
+    0 cancelled (`/tmp/reef-batch6/search-before.txt`); after → 24 / 24 in `app-async.test.js`, and the root repro
+    prints `likes: [restored-song]`, `kindStored: true`, exit 0. Removing any one of the three guards fails exactly
+    its own test.
+  - Checks by Claude: `node --check static/app.js` ok; `node --test tests/js/` → 210 passed (186 + 24), 0 failed;
+    `.venv/bin/ruff check .` and `git diff --check` clean. Python unchanged: batch 4's full pytest (1150 / 1) stands.
+  - Root acceptance checks (root generation 4):
+    - `node --check static/app.js`; `node --test --test-reporter=dot tests/js/` → 210 passed; Ruff and diff check
+      clean; Python unchanged (batch 4's full pytest 1150 passed / 1 deselected reused);
+    - actual shipped repros: `pin-reopen-put-root4.cjs` → the latest pick (`pick-two`) survives;
+      `restore-page-root4.cjs` (with DC) → restored like kept, catalog page cached; `restore-search-root4.cjs` →
+      restored like kept, search list stored; all exit 0;
+    - WebKit `/tmp/reef-codex-refactor-20261022/frontend-browser-root4.js` (static-only loopback server, synthetic
+      API and WAV, external requests blocked before navigation): pending-key target switch sends no stale PUT; two
+      form submissions on a pending key send one PUT; a reopened same target's old PUT can't change queue / busy and
+      the latest pick wins; a malformed 2xx JSON shows an error; restore refreshes likes / playlists / the cached
+      local playlist and lyrics, and an old search can't undo a restored like. Audio kept the same src, time 13.361 →
+      15.493 s, `paused` false before and after, no pause / emptied / loadstart events, no page errors. Proof:
+      `frontend-browser-root4-result.json`, `frontend-browser-root4.png`. All scratch browsers and the QA server closed;
+      no real services, data or phone.
+  - Limits: Node only for the writer's own checks (WebKit by the root). A stale playlist-page load with no newer load re-asks the page
+    once (`loadPage(key)`) even if nobody shows it. Stale non-restore overlaps of the same loader (two loads without a
+    restore) keep their old last-answer-wins behavior. An old pick's error toast still shows after a reopen; an old
+    pick's success is silent. Restored `matches` don't re-resolve placeholders already in the queue. Every read that calls
+    `noteKept` (Home, pages, search, chip lists, refetch) is now restore-gated; mutation replies aren't (by design).
 - **Next work for a fresh root / Claude** (one bounded batch each, regressions first, no guessed
   rewrites, no survey redo, features, U6, deploy, push, phone, real services, or default / model / credential /
   permission changes):
-  1. **Frontend correctness** (meaningful async regressions, then an independent WebKit check).
+  1. **Frontend correctness**: done, accepted and committed as batch 6 above; the notes below were its brief.
      - ROOT3-confirmed double-selection race: `/tmp/reef-codex-refactor-20261022/pin-double-root3.cjs` runs the
        actual `pinFix`. Two selections waiting on the same pending key issue TWO PUTs (`first-pick`, then
        `second-pick`): `busy` is set after the await, with no recheck. The frontend batch needs a committed
@@ -176,9 +274,9 @@ batch 3 = credentials / API / CSRF, batch 4 = updater health auth, batch 5 = JS 
        - A successful restore refreshes settings / history / blocklist / Home but not likes / playlists. Cached
          detail and lyrics may need scoped invalidation that keeps playback going.
      - Add regressions first.
-  2. **U-b art byte budget (justified).** Root mocked 33 valid 512 KiB responses: 17,301,504 bytes retained; the
-     400-entry count alone allows 209,715,200 bytes. Keep the count limit, add a sensible byte budget with race-safe
-     accounting.
+  2. **First remaining required task: U-b art byte budget (justified).** Root mocked 33 valid 512 KiB responses:
+     17,301,504 bytes retained; the 400-entry count alone allows 209,715,200 bytes. Keep the 400-entry count limit and
+     add a 16 MiB byte budget alongside it, with race-safe accounting. Scope: `app.py` and tests only.
   3. **Only with evidence:** F10 (finished-job cap) if shown necessary. J1–J3 / U-c / U-d performance and gesture
      hypotheses need measurements first. No cosmetic whole-file splits.
 - **Tooling note**: `worker-start --terminal` returns `agent_unconfigured`. The proven fallback is manual
