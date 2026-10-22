@@ -292,6 +292,27 @@ def song(video_id):
     return None
 
 
+def lyrics(video_id):
+    """YouTube Music's own lyrics for a song (the "Lyrics" tab: LyricFind and the like), or None when it has none:
+    {"lines": [(start s, text)] | None (line timing, when the mobile client gets it), "text": str | None, "source"}.
+    The watch "next" call names the lyrics page; a second call reads it. Raises on failure like every call here."""
+    browse = (_call("get_watch_playlist", videoId=video_id, limit=1) or {}).get("lyrics")
+    if not browse:
+        return None
+    found = _call("get_lyrics", browse, timestamps=True)
+    if not found:
+        return None
+    raw = found.get("lyrics")
+    if found.get("hasTimestamps") and isinstance(raw, list):
+        lines = [(round(ln.start_time / 1000, 3), str(ln.text or "").strip()) for ln in raw
+                 if isinstance(getattr(ln, "start_time", None), int)]
+        if lines:
+            return {"lines": lines, "text": "\n".join(text for _, text in lines), "source": found.get("source")}
+    if isinstance(raw, str) and raw.strip():
+        return {"lines": None, "text": raw, "source": found.get("source")}
+    return None
+
+
 def _cached(cache, key, fetch):
     """A deep copy of the cached page (routes mark tracks kept / filter them), fetched on a miss."""
     hit = cache.get(key)

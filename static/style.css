@@ -537,8 +537,9 @@ body:not(.is-playing) .np-art { transform: scale(.86); }
 .round.glass[aria-pressed="true"] { background: rgba(255, 255, 255, .92); color: #000; }
 
 /* lyrics: replaces the artwork (same flexible slot), so the title row, seek bar and controls stay put */
+.np-lyrics-wrap { display: none; flex: 1; min-height: 0; position: relative; margin: 8px -6px 14px; }
 .np-lyrics {
-  display: none; flex: 1; min-height: 0; position: relative; margin: 8px -6px 14px; padding: 0 6px;
+  position: absolute; inset: 0; padding: 0 6px;
   overflow-y: auto; overscroll-behavior: contain; touch-action: pan-y; scrollbar-width: none;
   container-type: size;
   -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 11%, #000 80%, transparent 100%);
@@ -546,7 +547,7 @@ body:not(.is-playing) .np-art { transform: scale(.86); }
 }
 .np-lyrics::-webkit-scrollbar { display: none; }
 .np.show-lyrics .np-art-wrap { display: none; }
-.np.show-lyrics .np-lyrics { display: block; }
+.np.show-lyrics .np-lyrics-wrap { display: block; }
 /* room above the first line (out of the top fade) and below the last, so it can still rise to the 1/3 mark */
 .lyr { padding: 64px 0 260px; }
 .lyr-line, .lyr p {
@@ -556,6 +557,10 @@ body:not(.is-playing) .np-art { transform: scale(.86); }
 }
 .lyr-line { color: rgba(255, 255, 255, .34); transition: color .35s ease, opacity .35s ease; }
 .lyr-line.on { color: #fff; }
+/* word-timed lines: the active line's words light up as they're sung (class toggled on timeupdate) */
+.lyr.wordy .lyr-line.on { color: rgba(255, 255, 255, .5); }
+.lyr-line .w { transition: color .2s linear; }
+.lyr-line.on .w.on { color: #fff; }
 .lyr-line.gap { font-size: 20px; }
 .lyr.plain p { color: rgba(255, 255, 255, .88); }
 .lyr.plain p.gap { padding: 0; height: 18px; }
@@ -568,6 +573,41 @@ body:not(.is-playing) .np-art { transform: scale(.86); }
 .lyr-sk i:nth-child(2) { width: 62%; }
 .lyr-sk i:nth-child(3) { width: 86%; }
 .lyr-sk i:nth-child(4) { width: 54%; }
+/* lyrics tools: a small ⋯ in the panel's faded top corner, a popover with the timing nudge and "Wrong lyrics?" */
+.lyr-more {
+  position: absolute; top: 0; right: 4px; z-index: 2; width: 32px; height: 32px; border-radius: 50%;
+  display: grid; place-items: center; color: rgba(255, 255, 255, .7); background: rgba(0, 0, 0, .28);
+}
+.lyr-more .i { width: 18px; height: 18px; }
+.lyr-more[aria-expanded="true"] { background: rgba(255, 255, 255, .92); color: #000; }
+.lyr-pop {
+  position: absolute; top: 40px; right: 4px; z-index: 3; width: min(290px, calc(100% - 8px)); padding: 12px;
+  border-radius: 18px; background: #1e1e20; box-shadow: 0 12px 40px rgba(0, 0, 0, .45); /* solid: see-through
+  lyrics under it read as clutter (WebKit showed them through a .94 alpha), and no blur to pay for on iOS */
+}
+.lyr-pop-row { display: flex; align-items: center; gap: 6px; }
+.lyr-pop-row .k { flex: 1; font-size: 14px; font-weight: 600; color: var(--muted); }
+.lyr-nudge {
+  height: 36px; min-width: 50px; padding: 0 10px; border-radius: 10px; background: rgba(255, 255, 255, .1);
+  font-size: 14px; font-weight: 600; font-variant-numeric: tabular-nums;
+}
+.lyr-nudge.lyr-off { min-width: 62px; background: transparent; color: var(--muted); }
+.lyr-nudge[disabled] { opacity: .4; }
+.lyr-nudge.lyr-off[disabled] { opacity: 1; color: var(--faint); }
+.lyr-hint { margin-top: 6px; font-size: 12px; color: var(--faint); }
+.lyr-pop-item {
+  width: 100%; margin-top: 10px; height: 40px; border-radius: 10px; background: rgba(255, 255, 255, .1);
+  display: flex; align-items: center; justify-content: center; gap: 8px; font-size: 15px; font-weight: 600;
+}
+.lyr-pop-item .i { width: 18px; height: 18px; }
+.lyr-src { margin-top: 8px; font-size: 12px; color: var(--faint); text-align: center; }
+/* "Find lyrics" sheet */
+.lyr-results { margin-top: 8px; }
+.lyr-res { width: 100%; display: flex; align-items: center; gap: 10px; padding: 10px 0; text-align: left; border-bottom: 1px solid var(--line); }
+.lyr-res:last-child { border-bottom: 0; }
+.lyr-res[disabled] { opacity: .5; }
+.lyr-badge { flex: none; padding: 3px 8px; border-radius: 8px; font-size: 11px; font-weight: 700; color: var(--muted); background: rgba(255, 255, 255, .08); }
+.lyr-badge.on { color: var(--accent-soft); background: rgba(251, 44, 90, .14); }
 @supports (height: 1cqh) {
   .lyr { padding: 13cqh 0 62cqh; }
   .lyr-sk { padding-top: 13cqh; }

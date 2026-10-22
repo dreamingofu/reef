@@ -1319,6 +1319,27 @@ def _seconds(value):
     return d if 0 < d < 86400 else None
 
 
+@app.get("/api/lyrics/search")
+def api_lyrics_search():
+    """LRCLIB's search for the "Wrong lyrics?" sheet. `q` is what the user typed; without it, the current track's
+    title + artist hints. With hints, the results are ordered by how well they match the track (stable)."""
+    args = request.args
+    hint = {"title": _hint(args.get("title")), "artist": _hint(args.get("artist")),
+            "duration": _seconds(args.get("duration"))}
+    q = _hint(args.get("q")) or (matching.search_text(hint) if hint["title"] else "")
+    if not q:
+        return jsonify({"error": "Type something to search for"}), 400
+    try:
+        results = lyrics.search(q)
+    except lyrics.Unavailable as e:
+        return jsonify({"error": str(e)}), 502
+    if hint["title"]:
+        for r in results:
+            r["score"] = matching.score(hint, {"title": r["track"], "artist": r["artist"], "duration": r["duration"]})[1]
+        results.sort(key=lambda r: -r["score"])
+    return jsonify({"q": q, "results": results})
+
+
 @app.get("/api/lyrics/<track_id>")
 def api_lyrics(track_id):
     """Lyrics for the Now Playing view. The client sends what it shows (title, artist, ...) as hints,
@@ -1330,10 +1351,12 @@ def api_lyrics(track_id):
     args = request.args
     title, artist, album = _hint(args.get("title")), _hint(args.get("artist")), _hint(args.get("album"))
     duration = _seconds(args.get("duration"))
-    found = None
-    if src.key == "nd":
-        found = navidrome.lyrics(native)  # what Navidrome reads from the file's tags (Reef embeds them on keep)
-    else:
+    found = lyrics.pinned(track_id)  # the user's pick wins over everything, the library's tags too
+    if not found and src.key == "nd":
+        nd = navidrome.lyrics(native)  # what Navidrome reads from the file's tags (Reef embeds them on keep)
+        if nd:
+            found = {**nd, "provider": "navidrome", "offset_ms": lyrics.offset(track_id)}
+    elif not found:
         entry = history.get(track_id)
         if entry:  # normally a cache hit: the keep looked lyrics up under this id
             title, artist = title or _hint(entry.get("title")), artist or _hint(entry.get("channel"))
@@ -1341,15 +1364,55 @@ def api_lyrics(track_id):
         if src.key == "yt":
             # "Artist - Song (Official Video)" from channel "ArtistVEVO" -> ("Song", "Artist"), as a keep tags it.
             title, artist = tagging.guess(title, artist)
-    # No title means nothing to search by; for_track would cache that as a miss for a day.
+    # No title means nothing to search by; the chain would cache that as a miss for a day.
     if not found and title:
-        found = lyrics.for_track(track_id, title, artist, album or None, duration)
+        found = lyrics.for_display(track_id, title, artist, album or None, duration)
     if not found:
-        return jsonify({"error": "No lyrics found"}), 404
-    resp = jsonify({"synced": found.get("synced"), "plain": found.get("plain"),
-                    "instrumental": bool(found.get("instrumental"))})
-    resp.headers["Cache-Control"] = "private, max-age=3600"
+        return jsonify({"error": "No lyrics found", "offset_ms": lyrics.offset(track_id)}), 404
+    resp = jsonify(found)
+    resp.headers["Cache-Control"] = "private, no-cache"  # the offset and a pin change it; the server cache is cheap
     return resp
+
+
+@app.put("/api/lyrics/<track_id>/offset")
+def api_lyrics_offset(track_id):
+    """{ms}: this track's lyrics timing, -10000..10000 (+ = lyrics later). Stored with its lyrics cache entry."""
+    t = _track(track_id)
+    if not t:
+        abort(404)
+    body = request.get_json(silent=True)
+    try:
+        ms = lyrics.set_offset(t[1], body.get("ms") if isinstance(body, dict) else None)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    return jsonify({"offset_ms": ms})
+
+
+@app.put("/api/lyrics/<track_id>/pin")
+def api_lyrics_pin(track_id):
+    """{lrclib_id}: show (and embed on a later keep) this LRCLIB record for the track; automatic lookups never
+    replace it. -> the lyrics, like GET."""
+    t = _track(track_id)
+    if not t:
+        abort(404)
+    body = request.get_json(silent=True)
+    rid = body.get("lrclib_id") if isinstance(body, dict) else None
+    if isinstance(rid, bool) or not isinstance(rid, int) or not 0 < rid < 2 ** 53:
+        return jsonify({"error": "lrclib_id must be an LRCLIB record id"}), 400
+    try:
+        return jsonify(lyrics.pin(t[1], rid))
+    except LookupError as e:
+        return jsonify({"error": str(e)}), 404
+    except lyrics.Unavailable as e:
+        return jsonify({"error": str(e)}), 502
+
+
+@app.delete("/api/lyrics/<track_id>/pin")
+def api_lyrics_unpin(track_id):
+    t = _track(track_id)
+    if not t:
+        abort(404)
+    return ("", 204) if lyrics.unpin(t[1]) else (jsonify({"error": "Nothing pinned"}), 404)
 
 
 @app.get("/api/tiles")

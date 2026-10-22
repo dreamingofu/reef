@@ -40,8 +40,12 @@ SCHEMA = {
     "replace_dead_tracks": {"type": "bool", "default": lambda: True, "label": "Replace removed songs",
                             "help": "When a song in the queue was removed or is blocked, play the same song from "
                                     "another upload instead of skipping it (only the queue changes)."},
-    "lyrics_providers": {"type": "list", "choices": ["navidrome", "lrclib"], "default": lambda: ["navidrome", "lrclib"],
-                         "label": "Lyrics sources", "help": "Where lyrics come from, in order. (Not used yet.)"},
+    # Library tracks read Navidrome's tags first whatever this says. SimpMusic is off by default: its API answers
+    # 403 "only available to SimpMusic clients" to everyone else (checked 2026-10-22).
+    "lyrics_providers": {"type": "list", "choices": ["lrclib", "simpmusic", "youtube", "betterlyrics"],
+                         "default": lambda: ["lrclib", "youtube", "betterlyrics"], "label": "Lyrics sources",
+                         "help": "Where the lyrics view looks, in order (LRCLIB, SimpMusic, YouTube Music, "
+                                 "BetterLyrics for word timing). Kept songs are tagged with LRCLIB lyrics only."},
     "listenbrainz_token": {"type": "secret", "default": lambda: "", "label": "ListenBrainz token",
                            "help": "User token from listenbrainz.org/settings, for scrobbling. Never shown again once saved."},
     "scrobble_enabled": {"type": "bool", "default": lambda: True, "label": "Scrobble to ListenBrainz",

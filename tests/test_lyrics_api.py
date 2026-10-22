@@ -1,4 +1,5 @@
-"""GET /api/lyrics/<id> and navidrome.lyrics. Offline: lyrics.for_track and the Subsonic call are faked."""
+"""GET /api/lyrics/<id> and navidrome.lyrics. Offline: lyrics.for_display and the Subsonic call are faked.
+(Offset, pin and search routes: tests/test_lyrics_chain.py.)"""
 import pytest
 
 import app
@@ -8,7 +9,8 @@ import navidrome
 import sources
 from sources import navidrome_src
 
-FOUND = {"synced": "[00:01.00]a\n[00:02.00]b\n[00:03.00]c", "plain": None, "instrumental": False}
+FOUND = {"synced": "[00:01.00]a\n[00:02.00]b\n[00:03.00]c", "plain": None, "instrumental": False,
+         "provider": "lrclib", "offset_ms": 0}
 
 
 @pytest.fixture
@@ -29,14 +31,14 @@ class _Calls(list):
 
 @pytest.fixture
 def calls(monkeypatch):
-    """Records lyrics.for_track calls; answers with `calls.result`."""
+    """Records lyrics.for_display calls; answers with `calls.result`."""
     rec = _Calls()
 
     def fake(track_id, title, artist, album=None, duration=None):
         rec.append((track_id, title, artist, album, duration))
         return rec.result
 
-    monkeypatch.setattr(lyrics, "for_track", fake)
+    monkeypatch.setattr(lyrics, "for_display", fake)
     return rec
 
 
@@ -58,7 +60,7 @@ def test_youtube_hints_are_cleaned(client, calls):
         "duration": "213.5"})
     assert r.status_code == 200
     assert r.get_json() == FOUND
-    assert r.headers["Cache-Control"] == "private, max-age=3600"
+    assert r.headers["Cache-Control"] == "private, no-cache"  # the offset / a pin change it
     assert calls == [("dQw4w9WgXcQ", "Never Gonna Give You Up", "Rick Astley", None, 213.5)]
 
 
@@ -96,11 +98,11 @@ def test_not_found_404(client, calls):
     calls.result = None
     r = client.get("/api/lyrics/mc:1", query_string={"title": "Nothing", "artist": "Nobody"})
     assert r.status_code == 404
-    assert r.get_json() == {"error": "No lyrics found"}
+    assert r.get_json() == {"error": "No lyrics found", "offset_ms": 0}
 
 
 def test_no_title_skips_lookup(client, calls):
-    # for_track would cache an empty-title lookup as a miss under this id for a day.
+    # the chain would cache an empty-title lookup as a miss under this id for a day.
     assert client.get("/api/lyrics/mc:1").status_code == 404
     assert calls == []
 
@@ -110,7 +112,7 @@ def test_library_prefers_navidrome(client, calls, library, monkeypatch):
     asked = []
     monkeypatch.setattr(navidrome, "lyrics", lambda sid: asked.append(sid) or nd)
     r = client.get("/api/lyrics/nd:abc123", query_string={"title": "Song", "artist": "Band"})
-    assert r.status_code == 200 and r.get_json() == nd
+    assert r.status_code == 200 and r.get_json() == {**nd, "provider": "navidrome", "offset_ms": 0}
     assert asked == ["abc123"] and calls == []
 
 

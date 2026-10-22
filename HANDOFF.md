@@ -94,6 +94,8 @@ Pass the Navidrome password through the environment. Don't put it in a committed
 - `scrobble.py` (ListenBrainz queue + worker), `updater.py` (version check, in-app update child), `backup.py`
   (backup / restore / daily snapshots), `health.py` (`/api/health/sources`): Round 12.
 - `matching.py` (same-song scoring + `matches.json`), `segments.py` (SponsorBlock at play time): Round 13.
+- `lyrics.py` (LRCLIB, the provider chain, cache, offset/pin, embedding) + `lyrics_providers.py` (SimpMusic,
+  YouTube Music, BetterLyrics TTML, the text checks): Round 14.
 - `log.py`: logging setup (stderr + `logs/reef.log` rotated 1 MB × 5 + a 300-line in-memory tail), `redact()` for
   signed-URL params / Subsonic tokens / cookies. Modules log through `logging.getLogger(__name__)`, no print().
 - `termux/reef-run.sh`: restart loop with backoff; `termux/reef-boot.sh` (Termux:Boot) (re)starts it.
@@ -275,7 +277,7 @@ explicit?}`; lists from the server add `kept`, `liked`, and `nd_id` when kept + 
 - `GET /api/settings` → `{values: {key: value, listenbrainz_token: {set}}, schema: [{key, type: bool|choice|list|secret,
   default, label, help, choices?, overridden}]}`; `PATCH {key: value|null}` → same, 400 `{error}` (nothing written).
   Keys: default_source, ytmusic, prefer_library, autoplay_radio (default for new devices; not wired in the client
-  yet), sponsorblock_keep, replaygain, lrc_sidecar, lyrics_providers (placeholder, not read yet), listenbrainz_token.
+  yet), sponsorblock_keep, replaygain, lrc_sidecar, lyrics_providers (read since Round 14), listenbrainz_token.
 
 ## Round 11 (2026-10-22): For you shelves + Home from cache (production plan P1.10, P1.14)
 
@@ -504,6 +506,80 @@ title/artist/album VIDA/ISRC/ReplayGain/synced lyrics, 15.5 s on cable; "Me at t
    only while the page gets `timeupdate`.
 2. `PATCH /api/settings {"keep_lossless": true}` and keep a popular song; Downloads shows LOSSLESS, Navidrome gets a
    .flac (bigger files on the phone's storage).
+
+## Round 14 (2026-10-22): more lyrics providers, timing offset, manual search (production plan P1.3)
+
+- **Chain** (`lyrics.py` `_chain`; sources in `lyrics_providers.py`), display only: order = setting `lyrics_providers`
+  (choices `lrclib, simpmusic, youtube, betterlyrics`; default **`lrclib, youtube, betterlyrics`**: SimpMusic's API
+  answers 403 "only available to SimpMusic clients" to anyone else, checked live; it stays selectable). Each source
+  runs on its own daemon thread: 8 s each, 25 s per lookup; the first line-synced answer ends it, except the
+  word-timed source (BetterLyrics, started at once next to the others) gets ≤ 4 s more and wins with `words`.
+  Synced > plain > instrumental; plain only as the fallback. 401/403/429 → that source paused 10 min; network /
+  5xx / bad JSON / no answer in 8 s → 60 s (LRCLIB retries a 502/503/504 once after 0.4 s first: it 503'd about one
+  request in three on 2026-10-22). One lookup per track id (stripes). Log line per lookup: `lyrics id=… provider=…
+  complete=0|1 ms=… asked=lrclib:synced,betterlyrics:words` (also `:none :plain :error :403 :timeout :paused :cut`).
+- **SimpMusic** `GET api-lyrics.simpmusic.org/v1/{videoId}` → `data[]` (or a bare list / one object):
+  `richSyncLyrics` (enhanced LRC → words) > `syncedLyrics` > `plainLyric`, then votes. **YouTube Music**:
+  `ytmusic.lyrics(id)` = `get_watch_playlist` → `lyrics` browseId → `get_lyrics(timestamps=True)` (line-timed via the
+  mobile client when YouTube has it, else plain); "No content returned" / unreadable page = none (no pause).
+  **BetterLyrics** `GET lyrics-api.boidu.dev/getLyrics?s=&a=&al=&d=` → `{ttml}`; 401 "Uncached … API key" = none (no
+  pause); TTML parsed with `xml.etree` after refusing any `<!DOCTYPE`/`<!ENTITY` (no DTD → no entity expansion, no
+  external entities; an undeclared `&x;` is a parse error); `<span begin end>` = words (`ttm:role="x-bg"` containers
+  included), `<body dur>` more than 10 s off the track's length = another recording → none.
+- **Checks on every answer** (`lyrics_providers.result`): `[mm:ss:xx]` → `[mm:ss.xx]`; credit lines ("Synced by",
+  "Lyrics by", "Written by", "Composed by", "Lyrics & music by", "Lyrics from", "Source:", 作词/作曲) dropped among
+  the first/last 3 lines only; synced text whose lyric lines span < 10 s or whose first line starts after
+  duration + 10 s is kept as plain; < 3 lines = junk (as before). LRCLIB keeps /get (±2 s) then /search (±5 s,
+  closest first). Words are dropped unless there's one entry per LRC line as the client's parseLRC reads them.
+- **Embedding unchanged**: `for_track` (keeps) returns LRCLIB's part only (the entry keeps `lrclib` when another source
+  won; a pinned LRCLIB record counts); `for_display` (the view) returns the winner. History `lyrics=` records what was
+  embedded.
+- **Cache** (`lyrics.json`, entry `v: 2`): hits forever; a hit from an incomplete lookup (a source before it failed /
+  was paused, or the word wait was cut) gets `retry` and is re-asked after a day (served meanwhile, kept if the
+  refresh finds nothing); misses need a complete lookup, last a day, and only count for the same source list
+  (`sig`). Reef 1 entries (no `v`): LRCLIB synced hits stand, plain hits and misses are asked again. Words are stored
+  packed `[[t ms, d ms|null, text]]` per line (lyrics.json is rewritten whole per new entry). Pinned entries are
+  evicted last.
+- **Offset**: `offset_ms` (+ = lyrics later) stored in the entry, kept across re-lookups, reset by a pin. Works for
+  library tracks too (an offset-only entry next to Navidrome's tags). **Pin**: provider `lrclib-pinned`, never
+  replaced by lookups, beats Navidrome's tags for `nd:` tracks, embedded by a later keep (already-kept files keep
+  their old tag).
+- **Client** (`lyrics-core` section = `LY` in app.js: parseLRC moved there, `attachWords`, `indexAt`, `wordAt`,
+  `lyricTime`, `seekTime`, `nudge`, `fmtOffset`): word-timed lines render one `<span class="w">` per word, lit up to
+  the current word on `timeupdate` (DOM touched only when the word changes); offset applied to highlighting and
+  tap-to-seek. A ⋯ in the lyrics panel's top-right corner opens a small popover: Timing −0.5 / value (tap = reset)
+  / +0.5 (saved 600 ms after the last tap), "Wrong lyrics? Search", "From <source> · word timing". The **Find
+  lyrics** sheet searches LRCLIB (first by the track's title + artist, ranked by `matching.score`), tap a result =
+  pin; "Use automatic lyrics" unpins. `GET /api/lyrics/<id>` is now `Cache-Control: private, no-cache`.
+
+### API shapes
+
+- `GET /api/lyrics/<id>?title=&artist=&album=&duration=` → `{synced, plain, instrumental, words?: [[{t, d?, text}]]
+  (seconds; one list per LRC line), provider: lrclib|lrclib-pinned|simpmusic|youtube|betterlyrics|navidrome,
+  offset_ms}`; 404 `{error, offset_ms}`.
+- `PUT /api/lyrics/<id>/offset {ms: -10000..10000}` → `{offset_ms}`; 400 bad value, 404 bad id.
+- `GET /api/lyrics/search?q=[&title=&artist=&duration=]` → `{q, results: [{id, track, artist, album, duration,
+  synced, plain, instrumental, score?}]}` (≤ 20, junk dropped; `q` defaults to `matching.search_text` of the hints;
+  `score` + ordering when hints are given); 400 nothing to search, 502 LRCLIB unavailable.
+- `PUT /api/lyrics/<id>/pin {lrclib_id}` → the GET shape (provider `lrclib-pinned`, offset 0); 400 bad id, 404 no such
+  record / no real lyrics in it, 502 LRCLIB unavailable. `DELETE /api/lyrics/<id>/pin` → 204 / 404.
+
+### Measured on the Mac (live, port 5309, scratch data)
+
+Never Gonna Give You Up → betterlyrics (LRCLIB synced + 58 word-timed lines) 0.63 s (0.39 s again after
+the unpin); Despacito (FXovf5dsRTw) → betterlyrics, 81 lines, 0.21 s; Sezen Aksu "Gidiyorum", Ivete Sangalo, Dalida,
+Cesária Évora, Fela Kuti, Bonga → youtube line-synced 0.8-2.5 s (LRCLIB was 503ing / paused then, so marked
+`retry`); Tinariwen → youtube plain; Ana Gabriel "Simplemente Amigos" → betterlyrics words; Mariza, Oumou Sangaré
+→ lrclib (BetterLyrics: none); "Me at the zoo" → 404. SimpMusic on: `simpmusic:403` → paused 600 s. Offset / pin /
+unpin / search round trips as in the API shapes. WebKit 390×844: word highlight progressing in the active line,
+nudges saved (+1.5 s on the server), the sheet's 18 LRCLIB results, a pin replaces the view (plain → timing
+disabled), unpin brings the word-timed lyrics back, offset survives a reload, tap-to-seek lands at stamp + offset.
+
+### To check on the phone
+
+1. Open lyrics on a popular song: BetterLyrics word highlighting on iPhone Safari (timeupdate ~4/s: words light in
+   small groups); nudge timing and reopen the app.
+2. "Wrong lyrics?" → pick another result → it stays after a restart; keep the song → the file has the pinned text.
 
 ## Production plan (2026-10-21)
 

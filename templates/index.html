@@ -128,7 +128,11 @@
       <a class="icon-btn" id="np-yt" target="_blank" rel="noopener" aria-label="Open on YouTube"><svg class="i"><use href="#i-external"/></svg></a>
     </header>
     <div class="np-art-wrap"><img class="np-art" id="np-art" alt=""></div>
-    <div class="np-lyrics" id="np-lyrics" role="region" aria-label="Lyrics"></div>
+    <div class="np-lyrics-wrap">
+      <div class="np-lyrics" id="np-lyrics" role="region" aria-label="Lyrics"></div>
+      <button class="lyr-more" id="lyr-more" aria-label="Lyrics timing and source" aria-expanded="false" aria-controls="lyr-pop"><svg class="i"><use href="#i-more"/></svg></button>
+      <div class="lyr-pop" id="lyr-pop" role="group" aria-label="Lyrics options" hidden></div>
+    </div>
     <div class="np-title-row">
       <div class="np-titles"><h2 id="np-t"></h2><button class="np-s" id="np-s"></button></div>
       <button class="icon-btn" id="np-share" aria-label="Share"><svg class="i"><use href="#i-share"/></svg></button>
@@ -234,6 +238,21 @@
   <div class="sheet" role="dialog" aria-label="Sleep timer">
     <div class="sheet-top"><div class="grabber"></div><h3>Sleep timer</h3></div>
     <div class="menu" id="sleep-menu"></div>
+  </div>
+</div>
+
+<div class="sheet-wrap" id="lyrics-sheet" hidden>
+  <div class="scrim" data-close></div>
+  <div class="sheet tall" role="dialog" aria-label="Find lyrics">
+    <div class="sheet-top"><div class="grabber"></div><h3>Find lyrics</h3></div>
+    <p class="st-note st-lead">Pick the right lyrics from LRCLIB: they'll show for this song from now on.</p>
+    <form class="st-form" id="lyr-search-form" autocomplete="off">
+      <input class="st-input" id="lyr-q" type="search" enterkeyhint="search" placeholder="Song and artist" aria-label="Song and artist">
+      <button class="chip" type="submit">Search</button>
+    </form>
+    <div class="sheet-body lyr-results" id="lyr-results"></div>
+    <button class="btn-wide alt" id="lyr-unpin" hidden>Use automatic lyrics</button>
+    <button class="btn-wide" data-close>Done</button>
   </div>
 </div>
 

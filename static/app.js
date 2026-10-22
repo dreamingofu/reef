@@ -442,6 +442,75 @@
   })();
   // ==== match-core:end ====
 
+  // ---------- lyrics core ----------
+  // Pure helpers for the lyrics view (production plan P1.3): LRC parsing, word timing from /api/lyrics `words`,
+  // and the per-track timing offset. Unit-checked from node by slicing the text between these sentinel comments.
+  // ==== lyrics-core:start ====
+  const LY = (() => {
+    const OFFSET_MAX = 10000; // ms either way, as the server allows
+    const NUDGE = 500;
+    const SOURCES = { lrclib: "LRCLIB", "lrclib-pinned": "LRCLIB (your pick)", simpmusic: "SimpMusic",
+      youtube: "YouTube Music", betterlyrics: "BetterLyrics", navidrome: "your library" };
+    // LRC text -> [{ t: seconds, text }] sorted by time. Handles several stamps per line, [mm:ss(.x|.xx|.xxx)],
+    // [offset:±ms] (positive = sooner), skips [ar:]/[ti:]-style metadata and strips enhanced <mm:ss.xx> word tags.
+    // The server's word timing (`words`) is aligned with exactly these lines (lyrics_providers.parse_lrc).
+    function parseLRC(lrc) {
+      const STAMP = /^\[(\d{1,3}):(\d{1,2})(?:[.:](\d{1,3}))?\]\s*/;
+      const out = [];
+      let offset = 0;
+      for (const raw of String(lrc || "").split(/\r?\n/)) {
+        let line = raw.trim(), m;
+        const off = /^\[offset:\s*([+-]?\d+)\s*\]$/i.exec(line);
+        if (off) { offset = Number(off[1]) / 1000; continue; }
+        const times = [];
+        while ((m = STAMP.exec(line))) {
+          times.push(Number(m[1]) * 60 + Number(m[2]) + (m[3] ? Number(m[3]) / 10 ** m[3].length : 0));
+          line = line.slice(m[0].length);
+        }
+        if (!times.length) continue;
+        const text = line.replace(/<\d{1,3}:\d{1,2}(?:[.:]\d{1,3})?>/g, "").replace(/\s+/g, " ").trim();
+        for (const t of times) out.push({ t, text });
+      }
+      for (const l of out) l.t = Math.max(0, l.t - offset); // [offset:] may come after the lines it shifts
+      return out.sort((a, b) => a.t - b.t);
+    }
+    // Lines with `words` ([{t, d?, text}] sorted) where the server sent word timing for them. Pairs by index, and
+    // only when there is one entry per line: misaligned timing is worse than none (the line mode stays).
+    function attachWords(lines, words) {
+      if (!Array.isArray(words) || words.length !== lines.length) return lines;
+      return lines.map((l, i) => {
+        const w = (Array.isArray(words[i]) ? words[i] : [])
+          .filter((x) => x && Number.isFinite(x.t) && typeof x.text === "string" && x.text)
+          .map((x) => ({ t: x.t, d: Number.isFinite(x.d) ? x.d : null, text: x.text }))
+          .sort((a, b) => a.t - b.t);
+        return w.length ? { ...l, words: w } : l;
+      });
+    }
+    // Index of the last entry of sorted `times` at or before `now`, else -1 (binary search).
+    function indexAt(times, now) {
+      let lo = 0, hi = times.length - 1, i = -1;
+      while (lo <= hi) {
+        const mid = (lo + hi) >> 1;
+        if (times[mid] <= now) { i = mid; lo = mid + 1; } else hi = mid - 1;
+      }
+      return i;
+    }
+    // The word being sung in a line at `now`: the last one started, -1 before the first.
+    const wordAt = (words, now) => indexAt((words || []).map((w) => w.t), now);
+    // offset_ms: + = the lyrics come later. The playhead in lyrics time, and the playhead for a line's time.
+    const lyricTime = (audioTime, offsetMs) => audioTime - (Number(offsetMs) || 0) / 1000;
+    const seekTime = (lineTime, offsetMs) => Math.max(0, lineTime + (Number(offsetMs) || 0) / 1000);
+    const nudge = (offsetMs, delta) => Math.max(-OFFSET_MAX, Math.min(OFFSET_MAX, Math.round((Number(offsetMs) || 0) + delta)));
+    // "+0.5 s" / "0 s" / "−1.5 s".
+    function fmtOffset(ms) {
+      const s = Math.round((Number(ms) || 0) / 100) / 10;
+      return s === 0 ? "0 s" : `${s > 0 ? "+" : "−"}${Math.abs(s).toFixed(1)} s`;
+    }
+    const sourceLabel = (p) => SOURCES[p] || p || "";
+    return { OFFSET_MAX, NUDGE, parseLRC, attachWords, indexAt, wordAt, lyricTime, seekTime, nudge, fmtOffset, sourceLabel };
+  })();
+  // ==== lyrics-core:end ====
+
   const navidromeUrl = (path) => `${location.protocol}//${location.hostname}:4533${path}`;
   const cur = () => state.queue[state.index];
   // What a queued / remembered track keeps (queue, session, "plays"). `auto` (an autoplay item) is dropped
@@ -2612,44 +2681,21 @@
   })();
 
   // ---------- lyrics ----------
-  // LRC text -> [{ t: seconds, text }] sorted by time. Handles several stamps per line, [mm:ss(.x|.xx|.xxx)],
-  // [offset:±ms] (positive = sooner), skips [ar:]/[ti:]-style metadata and strips enhanced <mm:ss.xx> word tags.
-  function parseLRC(lrc) {
-    const STAMP = /^\[(\d{1,3}):(\d{1,2})(?:[.:](\d{1,3}))?\]\s*/;
-    const out = [];
-    let offset = 0;
-    for (const raw of String(lrc || "").split(/\r?\n/)) {
-      let line = raw.trim(), m;
-      const off = /^\[offset:\s*([+-]?\d+)\s*\]$/i.exec(line);
-      if (off) { offset = Number(off[1]) / 1000; continue; }
-      const times = [];
-      while ((m = STAMP.exec(line))) {
-        times.push(Number(m[1]) * 60 + Number(m[2]) + (m[3] ? Number(m[3]) / 10 ** m[3].length : 0));
-        line = line.slice(m[0].length);
-      }
-      if (!times.length) continue;
-      const text = line.replace(/<\d{1,3}:\d{1,2}(?:[.:]\d{1,3})?>/g, "").replace(/\s+/g, " ").trim();
-      for (const t of times) out.push({ t, text });
-    }
-    for (const l of out) l.t = Math.max(0, l.t - offset); // [offset:] may come after the lines it shifts
-    return out.sort((a, b) => a.t - b.t);
-  }
-
-  const LYRIC_LEAD = 0.2; // Safari fires timeupdate ~4x/s; showing a line a beat early reads as on time
+  const LYRIC_LEAD = 0.2; // Safari fires timeupdate ~4x/s; showing a line (or word) a beat early reads as on time
   const lyr = {
     on: store.get("lyricsOn", false),
-    cache: new Map(), // track id -> Promise of {synced, plain, instrumental} | null (misses too)
-    seq: 0, id: null, lines: [], times: [], els: [], active: -1, held: false, holdTimer: 0,
+    cache: new Map(), // track id -> Promise of the /api/lyrics body | null (misses too)
+    seq: 0, id: null, data: null, lines: [], times: [], els: [], wordEls: [], active: -1, word: -1,
+    held: false, holdTimer: 0, offset: 0, offsetTimer: 0,
   };
   const lyricsPanel = $("#np-lyrics");
+  const lyrPop = $("#lyr-pop");
   const npOpen = () => $("#np").classList.contains("open");
 
   function fetchLyrics(t) {
     let p = lyr.cache.get(t.id);
     if (!p) {
-      const q = new URLSearchParams();
-      for (const [k, v] of [["title", t.title], ["artist", t.channel], ["album", t.album], ["duration", t.duration]]) if (v) q.set(k, v);
-      p = api(`/api/lyrics/${encodeURIComponent(t.id)}?${q}`).catch((e) => {
+      p = api(`/api/lyrics/${encodeURIComponent(t.id)}?${lyricsHints(t)}`).catch((e) => {
         if (e.status !== 404) lyr.cache.delete(t.id); // a network blip shouldn't stick; a real miss should
         return null;
       });
@@ -2657,19 +2703,29 @@
     }
     return p;
   }
+  function lyricsHints(t) {
+    const q = new URLSearchParams();
+    for (const [k, v] of [["title", t.title], ["artist", t.channel], ["album", t.album], ["duration", t.duration]]) if (v) q.set(k, v);
+    return q;
+  }
 
   function lyricsMsg(text, cls = "") {
     lyricsPanel.innerHTML = `<div class="lyr-msg ${cls}">${cls ? icon("note") : ""}${esc(text)}</div>`;
   }
 
   function renderLyrics(data) {
-    const lines = data?.synced ? parseLRC(data.synced) : [];
+    lyr.data = data;
+    lyr.offset = Number(data?.offset_ms) || 0;
+    const lines = data?.synced ? LY.attachWords(LY.parseLRC(data.synced), data.words) : [];
     lyr.lines = lines;
     lyr.times = lines.map((l) => l.t);
     lyr.active = -1;
+    lyr.word = -1;
     if (lines.length) {
-      lyricsPanel.innerHTML = `<div class="lyr synced">${lines.map((l, i) => l.text
-        ? `<button class="lyr-line" data-i="${i}">${esc(l.text)}</button>`
+      // Word-timed lines hold one span per word; syncWords lights them up as they're sung.
+      const body = (l) => (l.words ? l.words.map((w) => `<span class="w">${esc(w.text)}</span>`).join("") : esc(l.text));
+      lyricsPanel.innerHTML = `<div class="lyr synced${lines.some((l) => l.words) ? " wordy" : ""}">${lines.map((l, i) => l.text
+        ? `<button class="lyr-line" data-i="${i}">${body(l)}</button>`
         : `<button class="lyr-line gap" data-i="${i}" aria-label="Instrumental break">♪</button>`).join("")}</div>`;
     } else if (data?.plain || data?.synced) {
       const text = data.plain || data.synced.replace(/^(\s*\[[^\]]*\])+/gm, ""); // unparseable synced: show its words
@@ -2681,7 +2737,9 @@
       lyricsMsg("No lyrics for this track");
     }
     lyr.els = $$(".lyr-line", lyricsPanel);
+    lyr.wordEls = lyr.els.map((el) => $$(".w", el));
     lyricsPanel.scrollTop = 0;
+    renderLyrTools();
     syncLyrics(true);
   }
 
@@ -2692,8 +2750,9 @@
     if (lyr.id === t.id) { syncLyrics(true); return; }
     lyr.id = t.id;
     const seq = ++lyr.seq;
-    lyr.lines = []; lyr.times = []; lyr.els = []; lyr.active = -1;
+    lyr.data = null; lyr.lines = []; lyr.times = []; lyr.els = []; lyr.wordEls = []; lyr.active = -1; lyr.word = -1;
     lyricsPanel.innerHTML = `<div class="lyr-sk" role="status" aria-label="Loading lyrics…"><i class="sk"></i><i class="sk"></i><i class="sk"></i><i class="sk"></i></div>`;
+    renderLyrTools();
     const data = await fetchLyrics(t);
     if (seq !== lyr.seq || cur()?.id !== t.id) return; // the track changed while this was loading
     renderLyrics(data);
@@ -2702,7 +2761,9 @@
   // New track: drop what the panel shows, then load if it's visible.
   function resetLyrics() {
     lyr.id = null; lyr.seq++;
-    lyr.lines = []; lyr.times = []; lyr.els = []; lyr.active = -1;
+    lyr.data = null; lyr.lines = []; lyr.times = []; lyr.els = []; lyr.wordEls = []; lyr.active = -1; lyr.word = -1;
+    lyr.offset = 0;
+    showLyrTools(false);
     if (lyr.on && npOpen()) showLyrics();
   }
 
@@ -2713,22 +2774,30 @@
     lyricsPanel.scrollTo({ top: Math.max(0, top), behavior: smooth && !reduce ? "smooth" : "auto" });
   }
 
-  // Highlight the line for audio.currentTime: binary search, and the DOM is touched only when the line changes.
+  // Highlight the line for the playhead (in lyrics time: the track's offset applied): binary search, and the DOM
+  // is touched only when the line (or, in a word-timed line, the word) changes.
   function syncLyrics(force = false, smooth = !force) {
-    const ts = lyr.times;
-    if (!ts.length) return;
-    const now = audio.currentTime + LYRIC_LEAD;
-    let lo = 0, hi = ts.length - 1, i = -1;
-    while (lo <= hi) {
-      const mid = (lo + hi) >> 1;
-      if (ts[mid] <= now) { i = mid; lo = mid + 1; } else hi = mid - 1;
+    if (!lyr.times.length) return;
+    const now = LY.lyricTime(audio.currentTime, lyr.offset) + LYRIC_LEAD;
+    const i = LY.indexAt(lyr.times, now);
+    if (i !== lyr.active || force) {
+      for (const w of lyr.wordEls[lyr.active] || []) w.classList.remove("on");
+      lyr.word = -1;
+      lyr.els[lyr.active]?.classList.remove("on");
+      lyr.els[i]?.classList.add("on");
+      lyr.active = i;
+      if (i < 0) { if (force && !lyr.held) lyricsPanel.scrollTop = 0; } else scrollToLine(lyr.els[i], smooth);
     }
-    if (i === lyr.active && !force) return;
-    lyr.els[lyr.active]?.classList.remove("on");
-    lyr.els[i]?.classList.add("on");
-    lyr.active = i;
-    if (i < 0) { if (force && !lyr.held) lyricsPanel.scrollTop = 0; return; }
-    scrollToLine(lyr.els[i], smooth);
+    syncWords(now);
+  }
+  // Word-timed line: every word sung so far is lit (a seek back unlights the ones after the playhead).
+  function syncWords(now) {
+    const words = lyr.lines[lyr.active]?.words;
+    if (!words) return;
+    const k = LY.wordAt(words, now);
+    if (k === lyr.word) return;
+    (lyr.wordEls[lyr.active] || []).forEach((el, j) => el.classList.toggle("on", j <= k));
+    lyr.word = k;
   }
 
   function setLyricsOn(on) {
@@ -2736,6 +2805,7 @@
     store.set("lyricsOn", on);
     $("#np").classList.toggle("show-lyrics", on);
     $("#np-lyr").setAttribute("aria-pressed", String(on));
+    if (!on) showLyrTools(false);
     if (on) showLyrics();
   }
 
@@ -2751,9 +2821,122 @@
     if (!line || !lyr.lines[line.dataset.i]) return;
     clearTimeout(lyr.holdTimer);
     lyr.held = false;
-    seekTo(lyr.lines[line.dataset.i].t);
+    seekTo(LY.seekTime(lyr.lines[line.dataset.i].t, lyr.offset));
     if (audio.paused) playAudio();
     syncLyrics(true, true);
+  });
+
+  // ---------- lyrics tools: timing nudge, source, "Wrong lyrics?" ----------
+  // A small ⋯ over the panel's top corner opens them; the full lyrics UI (UI_REMAKE_PLAN §5) comes later.
+  function renderLyrTools() {
+    const synced = lyr.times.length > 0, d = lyr.data;
+    const src = d?.provider ? `From ${esc(LY.sourceLabel(d.provider))}${lyr.lines.some((l) => l.words) ? " · word timing" : ""}` : "";
+    lyrPop.innerHTML = `
+      <div class="lyr-pop-row"><span class="k">Timing</span>
+        <button class="lyr-nudge" data-lyr-nudge="${-LY.NUDGE}" aria-label="Show lyrics half a second sooner" ${synced ? "" : "disabled"}>−0.5</button>
+        <button class="lyr-nudge lyr-off" data-lyr-nudge="reset" aria-label="Reset lyrics timing" ${synced && lyr.offset ? "" : "disabled"}>${esc(LY.fmtOffset(lyr.offset))}</button>
+        <button class="lyr-nudge" data-lyr-nudge="${LY.NUDGE}" aria-label="Show lyrics half a second later" ${synced ? "" : "disabled"}>+0.5</button></div>
+      ${synced ? `<p class="lyr-hint">Lyrics ahead of the song? Tap +0.5.</p>` : ""}
+      <button class="lyr-pop-item" data-lyr-search>${icon("search")}<span>Wrong lyrics? Search</span></button>
+      ${src ? `<p class="lyr-src">${src}</p>` : ""}`;
+  }
+  function showLyrTools(open) {
+    lyrPop.hidden = !open;
+    $("#lyr-more").setAttribute("aria-expanded", String(open));
+  }
+  function setLyricsOffset(ms) {
+    const id = lyr.id;
+    lyr.offset = ms;
+    if (lyr.data) lyr.data.offset_ms = ms; // the cached promise holds this object: reopening keeps the nudge
+    renderLyrTools();
+    syncLyrics(true, true);
+    clearTimeout(lyr.offsetTimer);
+    lyr.offsetTimer = setTimeout(() => {
+      api(`/api/lyrics/${encodeURIComponent(id)}/offset`, {
+        method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ms }),
+      }).catch(() => toast("Couldn't save the lyrics timing"));
+    }, 600); // several taps, one save
+  }
+  $("#lyr-more").addEventListener("click", (e) => { e.stopPropagation(); renderLyrTools(); showLyrTools(lyrPop.hidden); });
+  lyrPop.addEventListener("click", (e) => {
+    e.stopPropagation(); // re-rendering detaches the target: the outside-click check below would misread it
+    const b = e.target.closest("[data-lyr-nudge],[data-lyr-search]");
+    if (!b || b.disabled) return;
+    if ("lyrSearch" in b.dataset) { showLyrTools(false); openLyricsSearch(); return; }
+    const v = b.dataset.lyrNudge;
+    setLyricsOffset(v === "reset" ? 0 : LY.nudge(lyr.offset, Number(v)));
+  });
+  document.addEventListener("click", (e) => {
+    if (!lyrPop.hidden && !e.target.closest("#lyr-pop,#lyr-more")) showLyrTools(false);
+  });
+
+  // "Wrong lyrics?": search LRCLIB and pin a result to this track (the server never replaces a pin).
+  const lyrSearch = { seq: 0, id: null };
+  async function runLyricsSearch(q) {
+    const t = sheetTrack(lyrSearch.id);
+    if (!t) return;
+    const seq = ++lyrSearch.seq;
+    const hints = lyricsHints(t);
+    if (q) hints.set("q", q);
+    $("#lyr-results").innerHTML = `<p class="st-note">Searching LRCLIB…</p>`;
+    try {
+      const r = await api(`/api/lyrics/search?${hints}`);
+      if (seq !== lyrSearch.seq) return;
+      if (!q) $("#lyr-q").value = r.q;
+      $("#lyr-results").innerHTML = r.results.length ? r.results.map((x) => `
+        <button class="lyr-res" data-pin="${x.id}">
+          <span class="row-text"><span class="row-t">${esc(x.track)}</span><span class="row-s">${esc([x.artist, x.album].filter(Boolean).join(" · "))}</span></span>
+          <span class="lyr-badge${x.synced ? " on" : ""}">${x.synced ? "Synced" : x.instrumental ? "Instrumental" : "Plain"}</span>
+          <span class="hl-ms">${x.duration ? fmt(x.duration) : ""}</span>
+        </button>`).join("") : `<p class="st-note">Nothing on LRCLIB for that. Try fewer words, or the artist's spelling there.</p>`;
+    } catch (e) {
+      if (seq === lyrSearch.seq) $("#lyr-results").innerHTML = `<p class="st-note bad">${esc(e.message)}</p>`;
+    }
+  }
+  // The track the sheet was opened for, while it's still the one playing (the sheet pins to that id only).
+  const sheetTrack = (id) => (cur()?.id === id ? cur() : null);
+  function openLyricsSearch() {
+    const t = cur();
+    if (!t) return;
+    lyrSearch.id = t.id;
+    $("#lyr-q").value = "";
+    $("#lyr-unpin").hidden = lyr.data?.provider !== "lrclib-pinned";
+    openSheet("#lyrics-sheet");
+    runLyricsSearch("");
+  }
+  $("#lyr-search-form").addEventListener("submit", (e) => {
+    e.preventDefault();
+    const q = $("#lyr-q").value.trim();
+    if (q) { $("#lyr-q").blur(); runLyricsSearch(q); }
+  });
+  $("#lyr-results").addEventListener("click", async (e) => {
+    const b = e.target.closest("[data-pin]");
+    const id = lyrSearch.id;
+    if (!b || !id) return;
+    b.disabled = true;
+    try {
+      const data = await api(`/api/lyrics/${encodeURIComponent(id)}/pin`, {
+        method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ lrclib_id: Number(b.dataset.pin) }),
+      });
+      lyr.cache.set(id, Promise.resolve(data));
+      if (lyr.id === id) renderLyrics(data);
+      closeSheet("#lyrics-sheet");
+      toast("These lyrics will show for this song from now on");
+    } catch (err) {
+      b.disabled = false;
+      toast(err.message || "Couldn't use those lyrics");
+    }
+  });
+  $("#lyr-unpin").addEventListener("click", async () => {
+    const id = lyrSearch.id;
+    try {
+      await api(`/api/lyrics/${encodeURIComponent(id)}/pin`, { method: "DELETE" });
+    } catch (err) {
+      if (err.status !== 404) { toast(err.message || "Couldn't reset the lyrics"); return; }
+    }
+    lyr.cache.delete(id);
+    closeSheet("#lyrics-sheet");
+    if (lyr.id === id) { lyr.id = null; showLyrics(); }
   });
 
   // ---------- keep ----------

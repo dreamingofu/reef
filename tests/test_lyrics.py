@@ -1,4 +1,4 @@
-"""lyrics.py (LRCLIB lookup, cache, embedding) and tagging.guess. Offline: the HTTP layer is faked."""
+"""lyrics.py with LRCLIB alone (lookup, cache, embedding) and tagging.guess. Offline: the HTTP layer is faked."""
 import json
 import shutil
 import subprocess
@@ -13,12 +13,12 @@ import config
 import lyrics
 import tagging
 
-SYNCED = "[00:01.00] Never gonna give you up\n[00:03.50] Never gonna let you down\n[00:06.20] Never gonna run around"
+SYNCED = "[00:01.00] Never gonna give you up\n[00:05.50] Never gonna let you down\n[00:12.20] Never gonna run around"
 PLAIN = "Never gonna give you up\nNever gonna let you down\nNever gonna run around"
 
 
 def _lrc(first):
-    return f"[00:00.10] {first}\n[00:02.00] and then\n[00:04.00] the end"
+    return f"[00:00.10] {first}\n[00:06.00] and then\n[00:14.00] the end"
 
 
 class _R:
@@ -54,7 +54,8 @@ def cache_file(tmp_path, monkeypatch):
     path = tmp_path / "lyrics.json"
     monkeypatch.setattr(config, "LYRICS_FILE", path)
     monkeypatch.setattr(lyrics, "_cache", None)
-    monkeypatch.setattr(lyrics, "_down_until", 0.0)
+    monkeypatch.setattr(lyrics, "_paused", {})
+    monkeypatch.setattr(lyrics, "order", lambda: ["lrclib"])  # the other sources: tests/test_lyrics_chain.py
     monkeypatch.setattr(config, "LRC_SIDECAR", False)
     return path
 
@@ -148,9 +149,24 @@ def test_server_error_is_not_a_miss(monkeypatch, cache_file):
         def get(self, url, params=None, headers=None, timeout=None):
             super().get(url, params, headers, timeout)
             return _R(503)
-    monkeypatch.setattr(lyrics, "_session", Fake())
+    fake = Fake()
+    monkeypatch.setattr(lyrics, "_session", fake)
+    monkeypatch.setattr(lyrics, "_RETRY_S", 0)
     assert lyrics.for_track("t1", "Song", "Rick Astley") is None
     assert not cache_file.exists()
+    assert len(fake.calls) == 2  # one retry, then LRCLIB counts as down
+
+
+def test_one_retry_after_a_503(monkeypatch):
+    class Fake(_Lrclib):
+        def get(self, url, params=None, headers=None, timeout=None):
+            r = super().get(url, params, headers, timeout)
+            return _R(503) if len(self.calls) == 1 else r
+    fake = Fake(rec=_rec(213.0, SYNCED))
+    monkeypatch.setattr(lyrics, "_session", fake)
+    monkeypatch.setattr(lyrics, "_RETRY_S", 0)
+    assert lyrics.lookup("Song", "Rick Astley", None, 213)["synced"] == SYNCED
+    assert [c[0] for c in fake.calls] == ["get", "get"]
 
 
 # ---------- cache ----------
@@ -183,7 +199,7 @@ def test_network_error_is_not_cached(monkeypatch, cache_file):
     # Right after a failure LRCLIB is skipped for a while instead of making every caller wait.
     calls = len(fake.calls)
     assert lyrics.for_track("t1", "Song", "Rick Astley") is None and len(fake.calls) == calls
-    monkeypatch.setattr(lyrics, "_down_until", 0.0)
+    monkeypatch.setattr(lyrics, "_paused", {})
     _serve(monkeypatch, rec=_rec(200.0, None, PLAIN))
     assert lyrics.for_track("t1", "Song", "Rick Astley")["plain"] == PLAIN
 

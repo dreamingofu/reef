@@ -30,7 +30,7 @@ import requests  # noqa: E402
 
 class NoNetwork:
     """Stands in for the requests sessions of scrobble / updater / health: nothing in the suite reaches
-    ListenBrainz, GitHub, PyPI or a source by accident (a settings PATCH with a token validates it, for one)."""
+    ListenBrainz, GitHub, PyPI, a lyrics source or a source by accident (a settings PATCH with a token validates it, for one)."""
     headers = {}
 
     def request(self, *a, **k):
@@ -42,7 +42,11 @@ class NoNetwork:
 @pytest.fixture(autouse=True)
 def _offline_sessions(monkeypatch):
     import health
+    import lyrics
+    import lyrics_providers
     import scrobble
     import updater
-    for mod in (scrobble, updater, health):
+    import ytmusic
+    for mod in (scrobble, updater, health, lyrics, lyrics_providers):
         monkeypatch.setattr(mod, "_session", NoNetwork())
+    monkeypatch.setattr(ytmusic, "lyrics", NoNetwork().request)  # the lyrics chain's YouTube Music source
