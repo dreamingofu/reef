@@ -2351,6 +2351,7 @@
     $("#status-list").innerHTML = rows.map(([k, v, c]) => `<li><span class="k">${esc(k)}</span><span class="v ${c}">${esc(v)}</span></li>`).join("")
       + `<li class="st-link"><button data-open-hidden><span class="k">Hidden artists</span><span class="v">${n == null ? "" : n}${icon("chev-right")}</span></button></li>`
       + `<li class="st-link"><button data-yt-reset${ytResetting ? " disabled" : ""}><span class="k">Reset YouTube session</span><span class="v">${ytResetting ? "Resetting…" : icon("repeat")}</span></button></li>`
+      + `<li class="st-link"><button data-copy-diag><span class="k">Copy diagnostics</span><span class="v">${icon("copy")}</span></button></li>`
       + (streamNote(h) ? `<li class="st-note">${esc(streamNote(h))}</li>` : "");
   }
   // "Last stream: visionos · 2 clients gated (tv, web)": the client of the last play and the gated ones.
@@ -2379,10 +2380,43 @@
     await loadHealth();
     renderStatus();
   }
+  // GET /api/diagnostics (versions, config without secrets, caches, gates, recent redacted log lines) as JSON text.
+  // Fetched when the sheet opens so the tap can copy at once: iOS only lets a page copy inside the tap itself,
+  // and over plain http (the tailnet address) there is no navigator.clipboard, only the textarea fallback.
+  let diagText = null;
+  async function loadDiagnostics() {
+    try { diagText = JSON.stringify(await api("/api/diagnostics"), null, 2); } catch { diagText = null; }
+  }
+  function copyFallback(text) {
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.setAttribute("readonly", "");
+    ta.style.cssText = "position:fixed;opacity:0;top:0";
+    document.body.appendChild(ta);
+    ta.select();
+    ta.setSelectionRange(0, text.length);
+    let ok = false;
+    try { ok = document.execCommand("copy"); } catch { ok = false; }
+    ta.remove();
+    return ok;
+  }
+  async function copyDiagnostics() {
+    if (!diagText) await loadDiagnostics();  // not loaded yet: the copy may then need a second tap on iOS
+    const text = diagText;
+    if (!text) { toast("Couldn't load diagnostics"); return; }
+    let ok = false;
+    if (navigator.clipboard && window.isSecureContext) {
+      try { await navigator.clipboard.writeText(text); ok = true; } catch { ok = false; }
+    }
+    if (!ok) ok = copyFallback(text);
+    toast(ok ? "Diagnostics copied" : "Couldn't copy, tap again");
+    loadDiagnostics();  // fresh numbers for the next copy
+  }
   async function openStatus() {
     renderStatus();
     openSheet("#status-sheet");
     loadBlocklist();
+    loadDiagnostics();
     await loadHealth();
     renderStatus();
   }
@@ -2518,7 +2552,7 @@
 
   // ---------- events ----------
   document.addEventListener("click", (e) => {
-    const t = e.target.closest("[data-keep],[data-play],[data-search],[data-source],[data-home-tab],[data-filter],[data-dismiss],[data-play-all],[data-shuffle-all],[data-close],[data-clear-finished],[data-clear-searches],[data-more],[data-act],[data-q-jump],[data-q-remove],[data-q-clear],[data-q-mode],[data-sleep],[data-fill],[data-keep-all],[data-retry],[data-page-radio],[data-artist-hide],[data-unhide],[data-unhide-page],[data-open-hidden],[data-yt-reset],[data-about]");
+    const t = e.target.closest("[data-keep],[data-play],[data-search],[data-source],[data-home-tab],[data-filter],[data-dismiss],[data-play-all],[data-shuffle-all],[data-close],[data-clear-finished],[data-clear-searches],[data-more],[data-act],[data-q-jump],[data-q-remove],[data-q-clear],[data-q-mode],[data-sleep],[data-fill],[data-keep-all],[data-retry],[data-page-radio],[data-artist-hide],[data-unhide],[data-unhide-page],[data-open-hidden],[data-yt-reset],[data-copy-diag],[data-about]");
     if (!t) return;
     const d = t.dataset;
     if ("keep" in d) { e.preventDefault(); if (d.keep) keep(d.keep, d.list); return; }
@@ -2536,6 +2570,7 @@
     if ("unhide" in d) { unhideArtists([{ id: d.unhide, name: d.name }]); return; }
     if ("openHidden" in d) { openHidden(); return; }
     if ("ytReset" in d) { resetYouTube(); return; }
+    if ("copyDiag" in d) { copyDiagnostics(); return; }
     if ("about" in d) {
       detail.about = !detail.about;
       $("#about")?.classList.toggle("clamp", !detail.about);

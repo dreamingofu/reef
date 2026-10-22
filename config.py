@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 from pathlib import Path
 
@@ -38,7 +39,16 @@ SEARCH_LIMIT = int(os.environ.get("REEF_SEARCH_LIMIT", "10"))
 NAVIDROME_URL = os.environ.get("REEF_NAVIDROME_URL", "http://127.0.0.1:4533").rstrip("/")
 NAVIDROME_USER = os.environ.get("REEF_NAVIDROME_USER", "")
 NAVIDROME_PASS = os.environ.get("REEF_NAVIDROME_PASS", "")
+# HTTP Basic password for clients outside loopback and the tailnet (100.64.0.0/10, fd7a:115c:a1e0::/48).
+# Empty = those clients get a 403; loopback and Tailscale never need it.
 PASSWORD = os.environ.get("REEF_PASSWORD", "")
+# 1 = the pre-2026-10-22 behaviour: every network is treated alike (REEF_PASSWORD, if set, applies to all).
+OPEN = os.environ.get("REEF_OPEN", "0").strip() == "1"
+# 1 = Flask's development server instead of waitress (local debugging only).
+DEV = os.environ.get("REEF_DEV", "0").strip() == "1"
+# Rotated reef.log (1 MB x 5) lives here (default logs/). REEF_LOG_STDERR=0 (set by termux/reef-run.sh) drops the console copy.
+LOG_DIR = Path(os.environ["REEF_LOG_DIR"]) if os.environ.get("REEF_LOG_DIR") else BASE_DIR / "logs"
+LOG_STDERR = os.environ.get("REEF_LOG_STDERR", "1").strip() != "0"
 # Search source used when /api/search has no `src` (yt = YouTube, mc = Monochrome, nd = Navidrome library).
 DEFAULT_SOURCE = os.environ.get("REEF_DEFAULT_SOURCE", "yt").strip() or "yt"
 # Monochrome tracks API instance(s), comma-separated; empty disables the source.
@@ -71,7 +81,7 @@ def _ydl_extra(raw):
     except ValueError:
         extra = None
     if not isinstance(extra, dict):
-        print("reef: ignoring REEF_YDL_EXTRA, it isn't a JSON object")
+        logging.getLogger(__name__).warning("reef: ignoring REEF_YDL_EXTRA, it isn't a JSON object")
         return {}
     return extra
 

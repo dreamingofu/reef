@@ -2,6 +2,7 @@
 mood page, `art` is its first playlist's cover); otherwise, or until moods were fetched once, the hard-coded
 search tiles below with a daily cache of a few result ids per tile (for artwork) in `tiles.json`."""
 import json
+import logging
 import os
 import re
 import threading
@@ -11,6 +12,8 @@ import blocklist
 import ytmusic
 from sources import youtube
 from config import TILES_FILE
+
+logger = logging.getLogger(__name__)
 
 # (label, color, search query): the fallback tiles.
 TILES = [
@@ -85,13 +88,13 @@ def _refresh_searches():
             ids = [r["id"] for r in found if _VIDEO_ID.match(r["id"])][:PER_TILE]
             ok += 1
         except Exception as e:
-            print(f"tiles: search failed for {query!r}: {str(e)[:200]}", flush=True)
+            logger.warning(f"tiles: search failed for {query!r}: {str(e)[:200]}")
             ids = prev.get(query, [])
         out.append({"label": label, "color": color, "query": query, "ids": ids})
     tmp = TILES_FILE.with_name(TILES_FILE.name + ".tmp")
     tmp.write_text(json.dumps(out, ensure_ascii=False), encoding="utf-8")
     os.replace(tmp, TILES_FILE)
-    print(f"tiles refreshed n={ok} ms={int((time.monotonic() - start) * 1000)}", flush=True)
+    logger.info(f"tiles refreshed n={ok} ms={int((time.monotonic() - start) * 1000)}")
 
 
 def refresh():
@@ -101,10 +104,10 @@ def refresh():
         try:
             ytmusic.moods()
             n = ytmusic.refresh_mood_art(first=[t["params"] for t in _mood_tiles()])
-            print(f"tiles: moods ok, art filled={n} ms={int((time.monotonic() - start) * 1000)}", flush=True)
+            logger.info(f"tiles: moods ok, art filled={n} ms={int((time.monotonic() - start) * 1000)}")
             return
         except Exception as e:
-            print(f"tiles: moods failed, refreshing search tiles: {str(e)[:200]}", flush=True)
+            logger.warning(f"tiles: moods failed, refreshing search tiles: {str(e)[:200]}")
     _refresh_searches()
 
 
@@ -114,7 +117,7 @@ def _loop():
         try:
             refresh()
         except Exception as e:
-            print(f"tiles: refresh failed: {str(e)[:200]}", flush=True)
+            logger.warning(f"tiles: refresh failed: {str(e)[:200]}")
         time.sleep(REFRESH_EVERY)
 
 

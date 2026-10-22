@@ -1,9 +1,13 @@
 import hmac
+import ipaddress
+import logging
 import os
+import platform
 import re
+import subprocess
 import threading
 import time
-from urllib.parse import parse_qs, quote, urlsplit
+from urllib.parse import parse_qs, parse_qsl, quote, urlsplit, urlunsplit
 
 import yt_dlp
 from flask import Flask, Response, abort, jsonify, redirect, render_template, request
@@ -13,6 +17,7 @@ import config
 import downloader
 import errors
 import history
+import log
 import lyrics
 import navidrome
 import sources
@@ -20,6 +25,8 @@ import streamer
 import tagging
 import tiles
 import ytmusic
+
+logger = logging.getLogger(__name__)
 
 VIDEO_ID = re.compile(r"^[A-Za-z0-9_-]{11}$")
 TRACK_ID = re.compile(r"^(?:[a-z]{2}:)?[\w.-]{1,128}$")
@@ -39,6 +46,11 @@ SHORT_HOSTS = {"youtu.be", "www.youtu.be"}
 # A YouTube link inside shared text ("Check this out https://youtu.be/... via app").
 SHARED_LINK = re.compile(r"(?<![\w./-])(?:https?://)?(?:(?:www|m|music)\.)?(?:youtube\.com|youtu\.be)/[^\s<>\"']+", re.I)
 
+# Loopback and Tailscale (CGNAT range + Tailscale's IPv6 ULA) are trusted; any other network needs REEF_PASSWORD.
+TRUSTED_NETS = [ipaddress.ip_network(n) for n in ("127.0.0.0/8", "::1/128", "100.64.0.0/10", "fd7a:115c:a1e0::/48")]
+OFF_TAILNET = "Reef is only open on Tailscale. Set REEF_PASSWORD in reef.env to allow other networks.\n"
+STARTED = time.time()
+
 app = Flask(__name__)
 
 
@@ -53,12 +65,27 @@ def _track(track_id):
     return src, sources.track_id(key, native), native
 
 
+def trusted(addr):
+    """True for a loopback or Tailscale client address. Nothing proxies Reef, so the socket peer
+    (REMOTE_ADDR) is the client; X-Forwarded-For is never read, a client could forge it."""
+    try:
+        ip = ipaddress.ip_address((addr or "").split("%")[0])
+    except ValueError:
+        return False
+    ip = getattr(ip, "ipv4_mapped", None) or ip  # ::ffff:100.x.y.z from a dual-stack socket
+    return any(ip in net for net in TRUSTED_NETS)
+
+
 @app.before_request
 def require_password():
-    if not config.PASSWORD:
+    if not config.OPEN and trusted(request.remote_addr):
         return None
+    if not config.PASSWORD:
+        if config.OPEN:
+            return None
+        return Response(OFF_TAILNET, 403, {"Content-Type": "text/plain; charset=utf-8"})
     auth = request.authorization
-    if auth and hmac.compare_digest(auth.password or "", config.PASSWORD):
+    if auth and hmac.compare_digest((auth.password or "").encode(), config.PASSWORD.encode()):
         return None
     return Response("Password required", 401, {"WWW-Authenticate": 'Basic realm="reef"'})
 
@@ -78,13 +105,76 @@ def health():
         "yt_client": config.YT_CLIENT,
         "yt_backend": sources.youtube.last_backend,
         "yt_fallbacks": sources.youtube.fallback_names(),
-        "stream_timing": streamer.last_timing,
+        "stream_timing": log.redact_obj(streamer.last_timing),
         "stream_cache": streamer.stats(),
         "yt_gates": sources.youtube.gates.snapshot(),
         "failover_cooling": sources.failover.cooling(),
         "sources": list(sources.SOURCES),
         "ytmusic": {"enabled": ytmusic.enabled(), "version": ytmusic.VERSION},
     })
+
+
+_git_sha = None
+
+
+def _version():
+    """Short git sha of the checkout (the phone runs `git pull`), or None without git."""
+    global _git_sha
+    if _git_sha is None:
+        try:
+            out = subprocess.run(["git", "-C", str(config.BASE_DIR), "rev-parse", "--short", "HEAD"],
+                                 capture_output=True, text=True, timeout=5)
+            _git_sha = out.stdout.strip() if out.returncode == 0 else ""
+        except (OSError, subprocess.SubprocessError):
+            _git_sha = ""
+    return _git_sha or None
+
+
+def _safe_url(url):
+    """A configured instance URL without user:pass@ and with every query value masked (an API key, a token)."""
+    try:
+        u = urlsplit(str(url))
+        host = u.hostname or ""
+        netloc = (f"[{host}]" if ":" in host else host) + (f":{u.port}" if u.port else "")
+    except ValueError:
+        return "<invalid url>"
+    query = "&".join(f"{k}={log.mask(v)}" for k, v in parse_qsl(u.query, keep_blank_values=True))
+    return urlunsplit((u.scheme, netloc, u.path, query, ""))
+
+
+def _config_summary():
+    """The settings that change behaviour, never secrets: passwords only as set/unset, yt-dlp extras by key."""
+    return {
+        "host": config.HOST, "port": config.PORT, "server": "flask-dev" if config.DEV else "waitress",
+        "open": config.OPEN, "password_set": bool(config.PASSWORD),
+        "download_dir": str(config.DOWNLOAD_DIR), "default_source": config.DEFAULT_SOURCE,
+        "yt_client": config.YT_CLIENT, "ytmusic": config.YTMUSIC,
+        "tracks_api": [_safe_url(u) for u in config.TRACKS_API],
+        "piped": [_safe_url(u) for u in config.PIPED_INSTANCES],
+        "invidious": [_safe_url(u) for u in config.INVIDIOUS_INSTANCES],
+        "navidrome": {"url": _safe_url(config.NAVIDROME_URL), "configured": navidrome.configured()},
+        "sponsorblock": config.SPONSORBLOCK, "replaygain": config.REPLAYGAIN, "lrc_sidecar": config.LRC_SIDECAR,
+        "ydl_extra_keys": sorted(config.YDL_EXTRA), "fake_wall": config.FAKE_WALL,
+        "log_dir": str(config.LOG_DIR) if config.LOG_DIR else None,
+    }
+
+
+@app.get("/api/diagnostics")
+def api_diagnostics():
+    """Everything worth pasting into a bug report, from the status sheet's "Copy diagnostics"."""
+    return jsonify(log.redact_obj({
+        "version": {"reef": _version(), "ytdlp": yt_dlp.version.__version__, "ytmusicapi": ytmusic.VERSION,
+                    "python": platform.python_version(), "platform": platform.platform(terse=True)},
+        "uptime_s": int(time.time() - STARTED),
+        "config": _config_summary(),
+        "stream_cache": streamer.stats(),
+        "last_stream": streamer.last_timing,
+        "yt_backend": sources.youtube.last_backend,
+        "yt_gates": sources.youtube.gates.snapshot(),
+        "failover_cooling": sources.failover.cooling(),
+        "jobs": [{k: j.get(k) for k in ("id", "status", "error")} for j in downloader.list_jobs()][:20],
+        "log": log.recent(),
+    }))
 
 
 @app.get("/api/search")
@@ -119,7 +209,7 @@ def api_suggest():
         try:
             out = ytmusic.suggestions(q)
         except Exception as e:
-            print(f"suggest failed: {str(e)[:160]!r}", flush=True)
+            logger.warning(f"suggest failed: {str(e)[:160]!r}")
     resp = jsonify(out)
     resp.headers["Cache-Control"] = "private, max-age=600"
     return resp
@@ -200,7 +290,7 @@ def _link_track(video_id):
             if found:
                 return found
         except Exception as e:
-            print(f"link: ytmusic song {video_id} failed: {str(e)[:160]!r}", flush=True)
+            logger.warning(f"link: ytmusic song {video_id} failed: {str(e)[:160]!r}")
     return sources.youtube.lookup(video_id)
 
 
@@ -211,7 +301,7 @@ def _link_playlist(list_id):
             if page["tracks"]:
                 return page["title"], page["tracks"]
         except Exception as e:
-            print(f"link: ytmusic playlist {list_id} failed: {str(e)[:160]!r}", flush=True)
+            logger.warning(f"link: ytmusic playlist {list_id} failed: {str(e)[:160]!r}")
     return sources.youtube.playlist_flat(list_id)
 
 
@@ -664,8 +754,26 @@ def api_tiles():
     return jsonify(tiles.load())
 
 
-if __name__ == "__main__":
+def main():
+    log.setup()
     downloader.start_worker()
     tiles.start_refresher()
-    print(f"Reef listening on http://{config.HOST}:{config.PORT}  (downloads -> {config.DOWNLOAD_DIR})")
-    app.run(host=config.HOST, port=config.PORT, threaded=True)
+    server = "flask-dev" if config.DEV else "waitress"
+    logger.info(f"reef start host={config.HOST} port={config.PORT} server={server} version={_version()} "
+                f"open={int(config.OPEN)} password={int(bool(config.PASSWORD))} downloads={config.DOWNLOAD_DIR}")
+    if config.DEV:
+        app.run(host=config.HOST, port=config.PORT, threaded=True)
+        return
+    from waitress import serve
+    # 16 threads: every playing <audio> holds one for its whole Range response, plus art, search and prefetch
+    # calls in parallel. waitress flushes each chunk as it's written (send_bytes=1 by default), so /api/stream
+    # still streams; channel_timeout only closes idle keep-alive connections, never a response in progress.
+    # outbuf_high_watermark: by default waitress lets a response run 16 MB ahead of a slow client (spilling to
+    # temp files), so a Range Safari aborts after the first KB would still pull MBs from googlevideo over the
+    # phone's data. 1 MiB keeps the proxy close to what the client actually reads, like the dev server did.
+    serve(app, host=config.HOST, port=config.PORT, threads=16, channel_timeout=120, connection_limit=100,
+          outbuf_high_watermark=1024 * 1024, ident=None)
+
+
+if __name__ == "__main__":
+    main()

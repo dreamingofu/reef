@@ -1,4 +1,5 @@
 """Request a path from a list of interchangeable API instances, rotating past dead ones."""
+import logging
 import random
 import threading
 import time
@@ -7,6 +8,8 @@ import requests
 from requests.adapters import HTTPAdapter
 
 from .base import BROWSER_UA
+
+logger = logging.getLogger(__name__)
 
 TIMEOUT = 10
 RETRY_STATUS = 429
@@ -30,7 +33,7 @@ def _retryable(status):
 def cool(base, seconds, why=""):
     with _cool_lock:
         _cooling[base] = max(_cooling.get(base, 0), _clock() + seconds)
-    print(f"failover cool host={base} s={seconds} why={why[:80]!r}", flush=True)
+    logger.warning(f"failover cool host={base} s={seconds} why={why[:80]!r}")
 
 
 def _until(base):

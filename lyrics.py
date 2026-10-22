@@ -4,6 +4,7 @@ Navidrome reads the lyrics tag and, when the text carries LRC timestamps, serves
 as synced lyrics, so the LRC text is written verbatim.
 """
 import json
+import logging
 import os
 import re
 import threading
@@ -20,6 +21,8 @@ from mutagen.mp4 import MP4
 from mutagen.ogg import OggFileType
 
 import config
+
+logger = logging.getLogger(__name__)
 
 API = "https://lrclib.net/api"
 _HEADERS = {"User-Agent": "Reef (https://github.com/dreamingofu/reef)"}  # LRCLIB asks clients to name themselves
@@ -176,7 +179,7 @@ def _store(track_id, found):
         tmp.write_text(json.dumps(entries, ensure_ascii=False), encoding="utf-8")
         os.replace(tmp, path)  # a crash mid-write leaves the old file, never half a JSON
     except OSError as e:
-        print(f"reef: couldn't save the lyrics cache: {e}")
+        logger.warning(f"reef: couldn't save the lyrics cache: {e}")
 
 
 def for_track(track_id, title, artist, album=None, duration=None):
@@ -189,7 +192,7 @@ def for_track(track_id, title, artist, album=None, duration=None):
         try:
             found = _lookup(title, artist, album, duration)
         except (requests.RequestException, ValueError) as e:
-            print(f"reef: lyrics lookup failed for {track_id}: {str(e)[:200]}")
+            logger.warning(f"reef: lyrics lookup failed for {track_id}: {str(e)[:200]}")
             return None  # not cached: next time LRCLIB may be back
         with _lock:
             _store(track_id, found)
@@ -220,11 +223,11 @@ def embed(path, found):
             return False
         f.save()
     except (MutagenError, OSError, ValueError) as e:
-        print(f"reef: couldn't embed lyrics in {os.path.basename(str(path))}: {e}")
+        logger.warning(f"reef: couldn't embed lyrics in {os.path.basename(str(path))}: {e}")
         return False
     if config.LRC_SIDECAR and found.get("synced"):
         try:
             Path(path).with_suffix(".lrc").write_text(found["synced"], encoding="utf-8")
         except OSError as e:
-            print(f"reef: couldn't write the .lrc sidecar: {e}")
+            logger.warning(f"reef: couldn't write the .lrc sidecar: {e}")
     return True

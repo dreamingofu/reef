@@ -603,14 +603,14 @@ def fixed(monkeypatch):
     return run
 
 
-def test_resume_after_drop_is_contiguous(fixed, capsys):
+def test_resume_after_drop_is_contiguous(fixed, caplog):
     c = fixed(DATA)
     c.drops = [1000, 2500]
     r = get(f"/api/stream/{VID}", "bytes=100-")
     assert r.status_code == 206 and r.data == DATA[100:]
     assert [rng for _, rng in c.calls] == [f"bytes=100-{100 + streamer._FIRST_SPAN - 1}", "bytes=1100-6143",
                                           "bytes=3600-6143"]
-    assert capsys.readouterr().out.count("stream-resume") == 2
+    assert caplog.text.count("stream-resume") == 2
 
 
 @pytest.mark.parametrize("exc", [requests.exceptions.ChunkedEncodingError, requests.ConnectionError,
@@ -644,14 +644,14 @@ def test_resume_after_patched_head(fixed):
     assert r.data[len(mp4()):] == data[len(mp4()):]
 
 
-def test_resume_gives_up_after_five(fixed, capsys):
+def test_resume_gives_up_after_five(fixed, caplog):
     c = fixed(DATA)
     c.drops = [500]
     c.reopen_status = 503
     r = get(f"/api/stream/{VID}", "bytes=0-")
     assert r.data == DATA[:500]
     assert len(c.calls) == 6
-    out = capsys.readouterr().out
+    out = caplog.text
     assert out.count("stream-resume id=") == 6 and "gave up after 500 bytes" in out
 
 

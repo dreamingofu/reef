@@ -6,6 +6,7 @@ Every call raises on failure; callers decide the fallback (sources/youtube.py fa
 """
 import copy
 import json
+import logging
 import os
 import re
 import threading
@@ -17,6 +18,8 @@ from functools import partial
 import requests
 
 import config
+
+logger = logging.getLogger(__name__)
 
 try:  # optional at runtime: a phone that pulled new code but hasn't re-run pip keeps yt-dlp search
     import ytmusicapi
@@ -248,7 +251,7 @@ def song(video_id):
     except Exception as e:
         if not enabled():
             raise
-        print(f"ytmusic get_song {video_id} failed: {str(e)[:160]!r}", flush=True)
+        logger.warning(f"ytmusic get_song {video_id} failed: {str(e)[:160]!r}")
         details = {}
     if details.get("videoId") == video_id and details.get("title"):
         t = normalize({
@@ -353,7 +356,7 @@ def _use_audio_ids(tracks, audio_list):
     try:
         audio = playlist(audio_list, limit=max(100, len(tracks)))["tracks"]
     except Exception as e:
-        print(f"ytmusic: album audio playlist {audio_list} failed, keeping video ids: {str(e)[:160]!r}", flush=True)
+        logger.warning(f"ytmusic: album audio playlist {audio_list} failed, keeping video ids: {str(e)[:160]!r}")
         return
     if not audio:
         return
@@ -473,7 +476,7 @@ def _save_browse():
         tmp.write_text(json.dumps(_browse, ensure_ascii=False), encoding="utf-8")
         os.replace(tmp, path)
     except OSError as e:  # a read-only checkout still browses, it just refetches after a restart
-        print(f"ytmusic: couldn't save {path.name}: {e}", flush=True)
+        logger.warning(f"ytmusic: couldn't save {path.name}: {e}")
 
 
 def _color(title):
@@ -557,7 +560,7 @@ def mood_playlists(params):
         try:
             raw = _mood_playlists_tolerant(params)
         except (ImportError, AttributeError, KeyError, IndexError, TypeError) as e:  # ytmusicapi internals moved
-            print(f"ytmusic: tolerant mood parse failed, using get_mood_playlists: {str(e)[:120]!r}", flush=True)
+            logger.warning(f"ytmusic: tolerant mood parse failed, using get_mood_playlists: {str(e)[:120]!r}")
             raw = None
         if not raw:
             raw = _call("get_mood_playlists", params)
@@ -593,6 +596,6 @@ def refresh_mood_art(first=(), pause=0.5):
                 _set_art(params, found[0]["thumb"])  # also re-stamps art served from the playlists cache
                 done += 1
         except Exception as e:
-            print(f"ytmusic: mood art failed: {str(e)[:160]!r}", flush=True)
+            logger.warning(f"ytmusic: mood art failed: {str(e)[:160]!r}")
         time.sleep(pause)
     return done

@@ -1,5 +1,6 @@
 """Track loudness (EBU R128, via ffmpeg's ebur128 filter) written as ReplayGain / R128 gain tags, so
 Navidrome clients can play kept tracks at an even volume next to the rest of the library."""
+import logging
 import math
 import re
 import subprocess
@@ -12,6 +13,8 @@ from mutagen.mp3 import MP3
 from mutagen.mp4 import MP4, MP4FreeForm
 from mutagen.ogg import OggFileType
 from mutagen.oggopus import OggOpus
+
+logger = logging.getLogger(__name__)
 
 RG_REFERENCE = -18.0    # ReplayGain 2.0 reference loudness, LUFS
 R128_REFERENCE = -23.0  # RFC 7845 R128_TRACK_GAIN reference, LUFS
@@ -74,6 +77,6 @@ def tag(path, m):
             return False
         f.save()
     except (MutagenError, OSError, ValueError) as e:
-        print(f"reef: couldn't write gain tags: {e}")
+        logger.warning(f"reef: couldn't write gain tags: {e}")
         return False
     return True

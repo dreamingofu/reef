@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+    paths-ignore: ["docs/**", "**.md"]
+  pull_request:
+    paths-ignore: ["docs/**", "**.md"]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+          cache-dependency-path: requirements*.txt
+      # Tests generate audio and covers with ffmpeg (lavfi) and measure loudness with it.
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+      - run: pip install -r requirements-dev.txt
+      # Offline suite; `-m live` tests (real YouTube) are deselected by pyproject.toml and skip on Actions anyway.
+      - run: python -m pytest -q
+      - run: ruff check .

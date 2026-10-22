@@ -1,3 +1,4 @@
+import logging
 import re
 import struct
 import threading
@@ -15,6 +16,8 @@ import errors
 import sources
 from sources.youtube import client_of
 from sources.youtube import ydl_options  # noqa: F401  (re-exported for scripts/bench_resolve.py)
+
+logger = logging.getLogger(__name__)
 
 _DEFAULT_TTL = 300   # seconds, for URLs that don't say when they expire
 _EXPIRY_MARGIN = 60  # stop handing out a signed URL this long before its `expire`
@@ -199,7 +202,7 @@ def _resolve(track_id, foreground=True):
                         _stats["misses"] += 1
                         return entry, how
                 stale += 1
-                print(f"stream id={track_id} dropped a stale resolve (gen {gen})", flush=True)
+                logger.warning(f"stream id={track_id} dropped a stale resolve (gen {gen})")
                 if stale >= 2 or not foreground:
                     entry["gen"] = gen
                     return entry, how
@@ -298,9 +301,9 @@ def _warm(track_id):
     try:
         _, how = _resolve(track_id, foreground=False)
         if how != "hit":
-            print(f"prefetch id={track_id} cache={how} resolve_ms={_ms(t0)}", flush=True)
+            logger.info(f"prefetch id={track_id} cache={how} resolve_ms={_ms(t0)}")
     except Exception as e:
-        print(f"prefetch id={track_id} error={str(e)[:160]!r}", flush=True)
+        logger.warning(f"prefetch id={track_id} error={str(e)[:160]!r}")
 
 
 def prefetch(ids):
@@ -329,7 +332,7 @@ def _open(entry, rng=None):
 def _log(timing):
     global last_timing
     last_timing = timing
-    print("stream " + " ".join(f"{k}={v}" for k, v in timing.items() if k != "at"), flush=True)
+    logger.info("stream " + " ".join(f"{k}={v}" for k, v in timing.items() if k != "at"))
 
 
 def resolve(track_id):
@@ -595,7 +598,7 @@ class _Body:
         """Open the current piece from self.pos on. err None: the planned first open of a new piece; otherwise
         (a drop, a short body, a failed open) each attempt logs, waits _RESUME_GAP_S and counts toward _RESUMES."""
         if self.pos is None:
-            print(f"stream-resume id={self.track_id} can't resume (unknown offset) err={err!r}", flush=True)
+            logger.warning(f"stream-resume id={self.track_id} can't resume (unknown offset) err={err!r}")
             return False
         at = self.pos
         rng = f"bytes={at}-{'' if self.last is None else self.last}"
@@ -605,8 +608,7 @@ class _Body:
                     break
                 self.resumes += 1
                 self.reopens += 1
-                print(f"stream-resume id={self.track_id} at={at} try={self.resumes}/{_RESUMES} err={err!r}",
-                      flush=True)
+                logger.info(f"stream-resume id={self.track_id} at={at} try={self.resumes}/{_RESUMES} err={err!r}")
                 _sleep(_RESUME_GAP_S)
             self.upstream.close()  # fully read -> its connection goes back to the pool
             try:
@@ -621,7 +623,7 @@ class _Body:
             if self.upstream.status_code == 206 and got == at:
                 return True
             err = f"reopen answered {self.upstream.status_code} at {got}"
-        print(f"stream-resume id={self.track_id} gave up after {self.sent} bytes err={err!r}", flush=True)
+        logger.warning(f"stream-resume id={self.track_id} gave up after {self.sent} bytes err={err!r}")
         return False
 
     def _reopen(self, at, rng):
@@ -766,7 +768,7 @@ def proxy(track_id, fresh=None):
         finally:
             body.close()
             timing.update(bytes=body.sent, pieces=body.pieces, resumes=body.reopens, body_ms=_ms(t1))
-            print(f"stream-body id={track_id} range={timing['range']} bytes={body.sent} pieces={body.pieces} "
-                  f"resumes={body.reopens} body_ms={timing['body_ms']}", flush=True)
+            logger.info(f"stream-body id={track_id} range={timing['range']} bytes={body.sent} pieces={body.pieces} "
+                        f"resumes={body.reopens} body_ms={timing['body_ms']}")
 
     return Response(generate(), status=status, headers=out_headers, direct_passthrough=True)

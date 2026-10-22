@@ -14,3 +14,5 @@ browse.json
 browse.json.tmp
 blocklist.json
 blocklist.json.tmp
+logs/
+reef-run.pid

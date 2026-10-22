@@ -1,4 +1,5 @@
 import base64
+import logging
 import os
 import queue
 import shutil
@@ -11,7 +12,7 @@ import requests
 import yt_dlp
 from mutagen import File as MutagenFile
 from mutagen.flac import FLAC, Picture
-from mutagen.id3 import APIC, ID3, TALB, TDRC, TIT2, TPE1, TPE2, TRCK
+from mutagen.id3 import APIC, TALB, TDRC, TIT2, TPE1, TPE2, TRCK
 from mutagen.mp3 import MP3
 from mutagen.mp4 import MP4, MP4Cover
 from mutagen.ogg import OggFileType
@@ -31,6 +32,8 @@ import sources
 import streamer
 from config import AUDIO_FORMAT, DOWNLOAD_DIR, TMP_DIR
 from tagging import music_tags, with_hints
+
+logger = logging.getLogger(__name__)
 
 ACTIVE = ("queued", "downloading", "converting")
 
@@ -456,23 +459,23 @@ def _post_steps(job, meta):
             if m and loudness.tag(path, m):
                 gain_db = loudness.track_gain(m["lufs"])
         except Exception as e:
-            print(f"reef: loudness skipped for {tid}: {type(e).__name__}: {str(e)[:200]}")
+            logger.warning(f"reef: loudness skipped for {tid}: {type(e).__name__}: {str(e)[:200]}")
     t1 = time.monotonic()
     try:
         found = lyrics.for_track(tid, meta["title"], meta["artist"], meta.get("album") or None, meta.get("duration"))
         if found and path and not lyrics.embed(path, found) and (found["synced"] or found["plain"]):
-            print(f"reef: lyrics found for {tid} but not embedded in {os.path.basename(path)}")
+            logger.warning(f"reef: lyrics found for {tid} but not embedded in {os.path.basename(path)}")
     except Exception as e:
-        print(f"reef: lyrics skipped for {tid}: {type(e).__name__}: {str(e)[:200]}")
+        logger.warning(f"reef: lyrics skipped for {tid}: {type(e).__name__}: {str(e)[:200]}")
     kind = None
     if found:
         kind = "synced" if found.get("synced") else "plain" if found.get("plain") else "instrumental"
     try:
         history.update(tid, lyrics=kind, gain_db=gain_db)
     except Exception as e:
-        print(f"reef: couldn't record lyrics/gain for {tid}: {e}")
-    print(f"keep-post id={tid} loudness_ms={int((t1 - t0) * 1000)} lyrics_ms={int((time.monotonic() - t1) * 1000)} "
-          f"lyrics={kind} gain_db={gain_db}")
+        logger.warning(f"reef: couldn't record lyrics/gain for {tid}: {e}")
+    logger.info(f"keep-post id={tid} loudness_ms={int((t1 - t0) * 1000)} lyrics_ms={int((time.monotonic() - t1) * 1000)} "
+                f"lyrics={kind} gain_db={gain_db}")
 
 
 def _run(job):

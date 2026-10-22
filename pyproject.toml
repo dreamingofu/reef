@@ -1,0 +1,15 @@
+# Tool settings only: Reef isn't packaged (run it with `python app.py`).
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Network tests (real YouTube) run only on request: `python -m pytest -m live` (on the phone; CI IPs are walled).
+addopts = "-m 'not live'"
+log_level = "INFO"  # the `op k=v` info lines are what several tests assert on (caplog.text)
+markers = ["live: talks to real YouTube; deselected unless run with -m live, skipped on GitHub Actions"]
+
+[tool.ruff]
+extend-exclude = ["tmp", "logs"]
+
+[tool.ruff.lint]
+# Real mistakes only (undefined names, unused imports/variables, syntax): no style or line-length rules.
+select = ["F", "E9"]

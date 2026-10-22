@@ -1,5 +1,6 @@
 #!/data/data/com.termux/files/usr/bin/bash
-# One-shot Reef installer for Termux. Re-running it updates Reef (git pull) and restarts it.
+# One-shot Reef installer for Termux. Re-running it updates Reef (git pull, pip) and restarts it.
+# Reef runs under termux/reef-run.sh (restarts on crash) and logs to ~/reef/logs/reef.log.
 set -e
 
 REPO="https://github.com/dreamingofu/reef.git"
@@ -57,6 +58,7 @@ REEF_MUSIC_DIR=$MUSIC
 REEF_NAVIDROME_URL=http://127.0.0.1:4533
 REEF_NAVIDROME_USER=$ND_USER
 REEF_NAVIDROME_PASS=$ND_PASS
+# Only needed to open Reef from outside Tailscale (e.g. home Wi-Fi); without it those get a 403.
 REEF_PASSWORD=
 EOF
     chmod 600 "$DIR/reef.env"
@@ -68,7 +70,7 @@ cp "$DIR/termux/reef-boot.sh" "$HOME/.termux/boot/reef.sh"
 chmod +x "$HOME/.termux/boot/reef.sh"
 "$HOME/.termux/boot/reef.sh"
 
-sleep 4
+sleep 6  # waitress + first imports take a few seconds on a phone
 echo
 if curl -sf http://127.0.0.1:5274/api/health; then
     echo
@@ -79,6 +81,6 @@ if curl -sf http://127.0.0.1:5274/api/health; then
     echo "Tailscale IP: $(ip -4 addr show tailscale0 2>/dev/null | awk '/inet /{print $2}' | cut -d/ -f1 || echo 'see Tailscale app')"
 else
     echo "Reef did not start. Last log lines:"
-    tail -20 "$DIR/reef.log"
+    tail -20 "$DIR/logs/reef.out" "$DIR/logs/reef.log" "$DIR/logs/reef-run.log" 2>/dev/null
     exit 1
 fi

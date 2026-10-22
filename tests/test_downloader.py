@@ -207,12 +207,12 @@ def test_ydl_extra_cannot_clobber_protected_keys(monkeypatch):
     assert opts["postprocessors"] and len(opts["progress_hooks"]) == 1
 
 
-def test_ydl_extra_parsing(capsys):
+def test_ydl_extra_parsing(caplog):
     assert config._ydl_extra('{"a": 1}') == {"a": 1}
     assert config._ydl_extra("") == {} and config._ydl_extra(None) == {}
     assert config._ydl_extra("{nope") == {}
     assert config._ydl_extra("[1]") == {}
-    assert capsys.readouterr().out.count("REEF_YDL_EXTRA") == 2
+    assert caplog.text.count("REEF_YDL_EXTRA") == 2
 
 
 # ---------- generic fetch retries ----------
@@ -374,7 +374,7 @@ def _fake_keep(monkeypatch, path):
     config.HISTORY_FILE.write_text("[]", encoding="utf-8")
 
 
-def test_post_step_failures_do_not_fail_the_keep(monkeypatch, tmp_path, capsys):
+def test_post_step_failures_do_not_fail_the_keep(monkeypatch, tmp_path, caplog):
     f = tmp_path / "song.opus"
     f.write_bytes(b"x")
     _fake_keep(monkeypatch, f)
@@ -388,7 +388,7 @@ def test_post_step_failures_do_not_fail_the_keep(monkeypatch, tmp_path, capsys):
     assert job["status"] == "done" and job["error"] is None and job["file"] == str(f)
     entry = history.get(VID)
     assert entry["lyrics"] is None and entry["gain_db"] is None
-    out = capsys.readouterr().out
+    out = caplog.text
     assert "loudness skipped" in out and "lyrics skipped" in out
 
 

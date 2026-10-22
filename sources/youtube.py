@@ -10,6 +10,7 @@ when REEF_PIPED_INSTANCES / REEF_INVIDIOUS_INSTANCES are set.
 Client gating (P0.2): streamer reports upstream failures through YouTube.failed(); `gates` then leaves the
 failing player clients out of later resolves (yt-dlp's `-client` syntax). reset() is "Reset YouTube session".
 """
+import logging
 import os
 import threading
 import time
@@ -23,6 +24,8 @@ import search as _yt_search
 import ytmusic
 
 from .base import Source
+
+logger = logging.getLogger(__name__)
 
 # A muxed mp4 (the last-resort pick, e.g. format 18) is served as audio/mp4: Safari's <audio> plays its audio track.
 _MIME = {"m4a": "audio/mp4", "mp4": "audio/mp4", "webm": "audio/webm", "opus": "audio/ogg", "mp3": "audio/mpeg"}
@@ -98,8 +101,8 @@ class ClientGates:
                 self.denials[client] = times
                 if len(times) >= 2:
                     self.glob[client] = now + GLOBAL_GATE_S
-        print(f"yt gate client={client} id={video_id} verdict={verdict}"
-              f"{' global' if client in self.glob else ''}", flush=True)
+        logger.info(f"yt gate client={client} id={video_id} verdict={verdict}"
+                    f"{' global' if client in self.glob else ''}")
         return True
 
     def _prune(self, now):
@@ -236,7 +239,7 @@ def _extract(video_id, turn=None):
                 full = True
                 continue
             if block == "BOT_WALL" and not reset_done and _may_auto_reset():
-                print(f"yt bot wall id={video_id}; resetting the YouTube session", flush=True)
+                logger.warning(f"yt bot wall id={video_id}; resetting the YouTube session")
                 reset_done = True
                 reset()
                 continue
@@ -249,7 +252,7 @@ def _extract(video_id, turn=None):
         fmt = _choose(info)
         if _preview(fmt, info.get("duration")):
             preview = client_of(fmt.get("url"))
-            print(f"yt preview id={video_id} client={preview}", flush=True)
+            logger.info(f"yt preview id={video_id} client={preview}")
             if gates.strike(video_id, preview, "preview"):
                 full = False
                 continue
@@ -275,7 +278,7 @@ def _clear_ydl_cache():
         ydl.cache.remove()
         return n
     except Exception as e:
-        print(f"yt reset: couldn't clear the yt-dlp cache: {str(e)[:160]!r}", flush=True)
+        logger.warning(f"yt reset: couldn't clear the yt-dlp cache: {str(e)[:160]!r}")
         return 0
 
 
@@ -297,7 +300,7 @@ def reset():
     cleared = {"instances": len(built), "cache_files": _clear_ydl_cache(), **gates.clear()}
     for hook in reset_hooks:
         cleared.update(hook())
-    print("yt reset " + " ".join(f"{k}={v}" for k, v in cleared.items()), flush=True)
+    logger.info("yt reset " + " ".join(f"{k}={v}" for k, v in cleared.items()))
     return cleared
 
 
@@ -311,10 +314,10 @@ def _with_fallbacks(kind, primary, fallbacks, *args):
             try:
                 out = fb(*args)
             except Exception as e:
-                print(f"yt {kind} fallback {getattr(fb, '__name__', fb)} failed: {str(e)[:160]!r}", flush=True)
+                logger.warning(f"yt {kind} fallback {getattr(fb, '__name__', fb)} failed: {str(e)[:160]!r}")
                 continue
             last_backend[kind] = getattr(fb, "backend", getattr(fb, "__name__", "fallback"))
-            print(f"yt {kind} via {last_backend[kind]} (yt-dlp failed: {str(err)[:120]!r})", flush=True)
+            logger.warning(f"yt {kind} via {last_backend[kind]} (yt-dlp failed: {str(err)[:120]!r})")
             return out
         raise err
 
@@ -334,7 +337,7 @@ class YouTube(Source):
             try:
                 results = ytmusic.search(q, limit)
             except Exception as e:
-                print(f"yt search via ytmusic failed: {str(e)[:160]!r}", flush=True)
+                logger.warning(f"yt search via ytmusic failed: {str(e)[:160]!r}")
         if results:
             last_backend["search"] = "ytmusic"
         else:

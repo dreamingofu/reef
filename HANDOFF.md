@@ -1,6 +1,6 @@
 # Reef — handoff notes (resume on another machine)
 
-Last updated: 2026-10-21.
+Last updated: 2026-10-22.
 
 ## What's running
 
@@ -13,6 +13,7 @@ Last updated: 2026-10-21.
 
 - Phone: ARM64, Android 16, Termux + Termux:Boot from F-Droid. Tailscale IP `100.78.71.110`.
 - Autostart: `~/.termux/boot/` has a Navidrome script and `reef.sh` (copied from `termux/reef-boot.sh`). A reboot test passed: both came back on their own.
+  Since Round 9 `reef.sh` starts `termux/reef-run.sh`, which restarts Reef after a crash (see Round 9).
 - Already done over ADB: phantom process killer disabled; Termux and Termux:Boot exempt from battery optimization.
 - Reef config on the phone: `~/reef/reef.env` (it holds the Navidrome password and is git-ignored).
 - Transcoding: Navidrome's built-in "opus audio" profile works. It overshoots the requested bitrate by ~25%, so set Amperfy's cellular bitrate to 96–112 to get a real ~128 kbps.
@@ -20,8 +21,9 @@ Last updated: 2026-10-21.
 ## Updating the phone after changing code
 
 1. Commit and push to `main`.
-2. In Termux on the phone, run `cd ~/reef && git pull --ff-only && ~/.termux/boot/reef.sh`
-   (or re-run `termux/install.sh`, which also pulls and restarts).
+2. In Termux on the phone, run `cd ~/reef && git pull --ff-only && pip install -r requirements.txt && ~/.termux/boot/reef.sh`
+   (or re-run `termux/install.sh`, which also pulls, installs and restarts). After Round 9 also re-copy the boot
+   script once (see "Deploy Round 9").
 
 ### Driving the phone from a Mac (no typing on the phone)
 
@@ -50,8 +52,11 @@ python3 -m venv .venv && . .venv/bin/activate
 pip install -r requirements.txt          # also needs ffmpeg for downloads: brew install ffmpeg
 REEF_PORT=5300 REEF_MUSIC_DIR=/tmp/reef-music \
 REEF_NAVIDROME_URL=http://127.0.0.1:4533 REEF_NAVIDROME_USER=marianne REEF_NAVIDROME_PASS=... \
-python app.py
+python app.py                            # waitress; REEF_DEV=1 for Flask's dev server
 ```
+
+Tests and lint as CI runs them: `pip install -r requirements-dev.txt && python -m pytest -q && ruff check .`
+(`python -m pytest -m live` adds the real-YouTube check; run it on the phone, CI skips it).
 
 Pass the Navidrome password through the environment. Don't put it in a committed file: this repo is public.
 
@@ -75,6 +80,9 @@ Pass the Navidrome password through the environment. Don't put it in a committed
 - `history.py`: `history.json` (git-ignored); entries gain `nd_cover`/`nd_id` once Navidrome has scanned the file.
   `navidrome.py`: Subsonic token auth, ping, startScan, newest albums, cover art, `find_song`.
 - `tiles.py`: the home mood/genre tiles + a daily background search that caches 4 video ids per tile in `tiles.json`.
+- `log.py`: logging setup (stderr + `logs/reef.log` rotated 1 MB × 5 + a 300-line in-memory tail), `redact()` for
+  signed-URL params / Subsonic tokens / cookies. Modules log through `logging.getLogger(__name__)`, no print().
+- `termux/reef-run.sh`: restart loop with backoff; `termux/reef-boot.sh` (Termux:Boot) (re)starts it.
 - `scripts/bench_resolve.py VIDEO_ID`: times yt-dlp resolution per player client, to pick `REEF_YT_CLIENT` on the phone.
 - `templates/index.html` + `static/style.css` + `static/app.js`: the mobile UI, vanilla JS, no build step.
 
@@ -160,6 +168,46 @@ result card, Songs rows with **+**, and filter chips. Design tokens are at the t
 - Player recovery: reload with `?fresh=<token>` and seek back (3 tries, 1/2/4 s), skip unplayable tracks, stop after 3
   dead tracks in a row, resume on `online`. Test hook: `REEF_FAKE_WALL=1`.
 
+## Round 9 (2026-10-22): run it like a service + CI (production plan P0.6, P0.7)
+
+- **Server**: `python app.py` serves with waitress (16 threads, `channel_timeout=120`, `connection_limit=100`, no
+  `Server` header, `outbuf_high_watermark` 1 MiB so an aborted Range doesn't pull MBs from googlevideo).
+  `REEF_DEV=1` = Flask's dev server. Streaming is unchanged: on the Mac `/api/stream/FGBhQbmPwH8` (5.2 MB) Range 0-
+  had a cold TTFB of 1.2-1.5 s (resolve included), warm 21-32 ms, the whole body in ~0.2 s; a 1.3 MB/s reader gets
+  the first chunk in 70 ms and 1 MiB per ~0.9 s; a client that stops after 64 KB leaves the proxy at ~1.9 MB pulled.
+- **Who can connect**: loopback and Tailscale (`100.64.0.0/10`, `fd7a:115c:a1e0::/48`) need nothing. Any other
+  address (home Wi-Fi) gets a 403 ("Reef is only open on Tailscale…") unless `REEF_PASSWORD` is set, then HTTP Basic
+  (any user name). Only the socket address counts (`X-Forwarded-For` is ignored). `REEF_OPEN=1` = the old
+  behaviour (all networks alike; the password, if set, applies to every client). Careful: `tailscale serve`/`funnel`
+  connect from 127.0.0.1, so a **Funnel** (public internet) would be trusted; don't funnel Reef.
+- **Supervisor**: `termux/reef-run.sh` runs `python app.py` in a loop, waiting 2, 4, 8 … 60 s between restarts
+  (reset after 5 min up). Files: `reef-run.pid` (loop), `reef.pid` (app), `logs/reef-run.log` (restarts),
+  `logs/reef.out` (console of the current run, start-up errors only; previous run in `reef.out.1`).
+  `~/.termux/boot/reef.sh` takes the wake lock, stops a running loop/app and starts the loop, so running it by hand
+  still means "restart". Stop Reef: `kill "$(cat ~/reef/reef-run.pid)"`. termux-services (runit `sv`) would also
+  work but isn't needed.
+- **Logs**: `~/reef/logs/reef.log` (1 MB × 5, the old ever-growing `reef.log` can be deleted), lines like
+  `2026-10-22 01:51:27,969 I stream id=… cache=miss resolve_ms=1328 …`. Signed-URL params (`sig`, `lsig`,
+  `signature`, `pot`, `n`), Subsonic `t`/`s`/`p` and Cookie/Authorization values are logged as `len=N,sha1=xxxxxx`.
+  Uncaught exceptions in threads land in the log too.
+- **Diagnostics**: `GET /api/diagnostics` (versions incl. git sha, uptime, config without secrets, stream cache,
+  last stream timing, gates, failover cooldowns, recent jobs, the last 300 log lines). Status sheet → **Copy
+  diagnostics** copies it as JSON (fetched when the sheet opens, so the tap copies at once on iOS over http).
+- **CI**: `.github/workflows/ci.yml` runs pytest + `ruff check .` on Python 3.12 and 3.13 (ubuntu, ffmpeg from apt)
+  for pushes/PRs that touch more than docs. Ruff config (pyflakes + syntax only) and pytest settings are in
+  `pyproject.toml`; `-m live` tests are deselected by default and skip on GitHub Actions.
+
+### Deploy Round 9 (on the phone, once)
+
+1. `cd ~/reef && git pull --ff-only && pip install -r requirements.txt` (adds **waitress**).
+2. `cp ~/reef/termux/reef-boot.sh ~/.termux/boot/reef.sh && chmod +x ~/.termux/boot/reef.sh` (the new boot script
+   starts the supervisor; the old one ran app.py once).
+3. `~/.termux/boot/reef.sh` (stops the old app via `reef.pid`, starts the loop), then check
+   `curl -s http://127.0.0.1:5274/api/health` and `cat ~/reef/logs/reef-run.log`.
+4. Open Reef on the iPhone over Tailscale as before (no password prompt). From home Wi-Fi by LAN IP it now answers
+   403; to allow that, put `REEF_PASSWORD=…` in `~/reef/reef.env` and run `~/.termux/boot/reef.sh` again.
+5. Optional: `rm ~/reef/reef.log` (the old nohup log); try Status → Copy diagnostics; `python -m pytest -m live`.
+
 ## Production plan (2026-10-21)
 
 `docs/PRODUCTION_PLAN.md`: what's left for production readiness, from a read of seven more apps (Metrolist, ArchiveTune,
@@ -180,4 +228,5 @@ Settings / Stats / Recap screens. Prerequisite: serve Reef over HTTPS with `tail
 - Check round 2 on the iPhone: Now Playing on the small screen, tile artwork, source chips, FLAC playback over cellular.
 - Run `scripts/bench_resolve.py` on the phone and record the numbers here.
 - Save the playback queue across reloads; add a lyrics view.
-- Optional `REEF_PASSWORD` in `reef.env` if Reef ever gets exposed beyond the tailnet.
+- A supervisor loop for Navidrome too (same idea as `termux/reef-run.sh`; out of scope for Round 9).
+- Change the weak Navidrome admin password (Reef only needs it for `startScan`).

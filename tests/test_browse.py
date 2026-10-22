@@ -253,12 +253,12 @@ def test_album_partial_title_mismatch_keeps_unmatched_ids(fake):
     assert [t["id"] for t in ytmusic.album(ALBUM)["tracks"]] == ["ATV00000001", "L93-7vRfxNs", "ATV0000feat"]
 
 
-def test_album_keeps_video_ids_when_audio_playlist_fails(fake, capsys):
+def test_album_keeps_video_ids_when_audio_playlist_fails(fake, caplog):
     fake.audio = RuntimeError("playlist down")
     a = ytmusic.album(ALBUM)
     assert a["title"] == "Discovery" and [t["id"] for t in a["tracks"]] == ["FGBhQbmPwH8", "L93-7vRfxNs",
                                                                              "aaaaaaaaaaa"]
-    assert "keeping video ids" in capsys.readouterr().out
+    assert "keeping video ids" in caplog.text
 
 
 def test_artist_page(fake):

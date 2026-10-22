@@ -115,7 +115,7 @@ def assert_pieces(calls, first, last):
     assert all(b - a + 1 == SPAN for a, b in got[1:-1])
 
 
-def test_open_ended_range_is_fetched_in_bounded_pieces(origin, capsys):
+def test_open_ended_range_is_fetched_in_bounded_pieces(origin, caplog):
     o = origin()
     r = get("bytes=0-")
     assert r.status_code == 206 and r.data == DATA
@@ -125,7 +125,7 @@ def test_open_ended_range_is_fetched_in_bounded_pieces(origin, capsys):
     assert_pieces(o.calls, 0, len(DATA) - 1)
     assert len(o.calls) == 1 + -(-(len(DATA) - FIRST) // SPAN)  # 1000 + 7 x 3000 >= 20000
     assert all(up.closed for up in o.ups)  # each finished piece goes back to the keep-alive pool
-    assert f"bytes={len(DATA)} pieces={len(o.calls)} resumes=0" in capsys.readouterr().out
+    assert f"bytes={len(DATA)} pieces={len(o.calls)} resumes=0" in caplog.text
     assert streamer.last_timing["up"] == f"bytes=0-{FIRST - 1}"
 
 
@@ -194,7 +194,7 @@ def test_moov_left_alone_past_byte_zero(origin):
     assert get("bytes=1-").data == data[1:]
 
 
-def test_drop_mid_piece_resumes_within_that_piece(origin, capsys):
+def test_drop_mid_piece_resumes_within_that_piece(origin, caplog):
     o = origin()
     o.drops = {2700, 9000}  # inside the 2nd piece (1000-3999) and the 4th (7000-9999)
     r = get("bytes=0-")
@@ -202,7 +202,7 @@ def test_drop_mid_piece_resumes_within_that_piece(origin, capsys):
     assert "bytes=2700-3999" in o.calls and "bytes=9000-9999" in o.calls
     assert o.calls.index("bytes=2700-3999") == o.calls.index("bytes=1000-3999") + 1
     assert o.calls[o.calls.index("bytes=2700-3999") + 1] == "bytes=4000-6999"  # then the pieces carry on
-    out = capsys.readouterr().out
+    out = caplog.text
     assert out.count("stream-resume id=") == 2 and "resumes=2" in out
 
 
@@ -229,13 +229,13 @@ def test_dead_url_on_a_later_piece_swaps_to_the_same_file(origin, monkeypatch):
     assert o.calls.count("bytes=4000-6999") == 1  # the 403 isn't recorded by the origin; the retry is
 
 
-def test_fake_wall_ends_the_body_at_a_piece_past_it(origin, monkeypatch, capsys):
+def test_fake_wall_ends_the_body_at_a_piece_past_it(origin, monkeypatch, caplog):
     monkeypatch.setattr(config, "FAKE_WALL", True)
     origin(gen=1, clen=len(DATA), duration=200)  # wall at 20000 * 60 / 200 = 6000
     r = get("bytes=0-")
     # pieces start at 0, 1000, 4000 (before the wall) and 7000 (past it): the body stops at 7000
     assert r.data == DATA[:7000]
-    assert "fake wall at byte 7000" in capsys.readouterr().out
+    assert "fake wall at byte 7000" in caplog.text
     r = get("bytes=7000-")  # the player's next request meets the wall
     assert r.status_code == 403 and r.get_json()["block"] == errors.EXPIRED
 
