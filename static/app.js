@@ -2718,6 +2718,21 @@
     if (location.hash === hash) { if (npOpen()) closeNP(); return; }
     location.hash = hash;
   }
+  // A Home Screen app on iOS (Web.app) may treat a native fragment navigation as a page navigation and stop the page's
+  // media (cf. WebKit bug 215884: there it stops capture tracks); the owner's audio paused on a Home -> Library tap.
+  // There the bottom Home / Library tabs add their history entry with pushState and route at once (pushState fires no
+  // hashchange; Back / Forward over the entry still do). Modified clicks, other links and other browsers stay native.
+  function tabClick(e) {
+    if (navigator.standalone !== true || e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return false;
+    const a = e.target.closest?.(".tab[href]");
+    const hash = a?.getAttribute("href");
+    if (!a || a.target || a.hasAttribute("download") || (hash !== "#home" && hash !== "#library")) return false;
+    e.preventDefault();
+    if (location.hash === hash) return true; // a link to the current hash adds no entry and routes nowhere
+    history.pushState(null, "", hash);
+    route();
+    return true;
+  }
 
   // ---------- data ----------
   async function loadHistory() {
@@ -6743,6 +6758,7 @@
 
   // ---------- events ----------
   document.addEventListener("click", (e) => {
+    if (tabClick(e)) return;
     const t = e.target.closest("[data-keep],[data-play],[data-search],[data-source],[data-retry-search],[data-retry-home],[data-retry-history],[data-retry-playlists],[data-retry-library],[data-set-theme],[data-set-swipe],[data-filter],[data-dismiss],[data-play-all],[data-shuffle-all],[data-close],[data-clear-finished],[data-clear-searches],[data-more],[data-act],[data-q-jump],[data-q-remove],[data-q-clear],[data-q-mode],[data-q-save],[data-npbg],[data-open-bg],[data-sleep],[data-fill],[data-keep-all],[data-retry],[data-page-radio],[data-artist-hide],[data-unhide],[data-unhide-page],[data-open-hidden],[data-yt-reset],[data-copy-diag],[data-about],[data-mix],[data-st],[data-import-resolve],[data-top-play],[data-artist-play],[data-recent-del],[data-filter-retry],[data-page-save],[data-page-pin],[data-page-share],[data-page-more],[data-page-sort],[data-page-sortby],[data-pact]");
     if (!t) return;
     const d = t.dataset;

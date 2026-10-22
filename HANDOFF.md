@@ -2,17 +2,26 @@
 
 Last updated: 2026-10-22 (Round 16, UI remake step 5, audit batches 1-7 accepted by the root and committed locally;
 batch 3 = credentials / API / CSRF, batch 4 = updater health auth, batch 5 = JS proof in CI, batch 6 = frontend
-async correctness, batch 7 = tiny-art cache byte budget). The required audit / refactor work is complete.
+async correctness, batch 7 = tiny-art cache byte budget). The required audit / refactor work is complete; `9d71366` was
+later pushed and installed on the Android phone with the owner's authorization. Open: an unreproduced owner report
+(Home → Library stops playback), see CURRENT.
 
 ## CURRENT supervision (read first; 2026-10-22, written for a session rotation)
 
 - **Owner's goal**: finish the current task, then the necessary whole-codebase refactors, implemented by Claude and
   verified and accepted independently by Codex (root).
-  - Root acceptance allows a local commit only. No push, deploy or U6 is authorized (not even after acceptance)
-    unless the owner says so.
-  - No real services, phone, secrets, permissions or model changes.
-  - **Status: complete.** All required batches (B1-B7) are accepted and committed; see Completion below.
-- **Commits on `dreamingofu/codebase-overview-and-risk`** (local only, none pushed):
+  - Historical (batches B1-B7): root acceptance allowed a local commit only; no push, deploy or U6.
+  - **Current authorization (supersedes the line above)**: after B7 the owner authorized pushing the feature branch
+    and installing it on the Android phone. Feature SHA `9d71366c46030cd4c70e96cdc47f981de018fc65` is pushed
+    (`origin/dreamingofu/codebase-overview-and-risk` = `9d71366`) and installed on the phone, with config and data
+    preserved. `origin/main` is unchanged at `f8f09cd`. Root's live GET of the phone's `/api/version` confirmed
+    `self_update.allowed=true`, Reef `9d71366`, latest_reef = main `f8f09cd`, behind false. No new push or deployment for later tasks until the root
+    accepts them. U6, merging to main and other publication still need the owner.
+  - No secrets, permissions, defaults or model changes.
+  - **Status**: B1-B7 are complete (accepted, committed, pushed with `9d71366`). One owner report is open (iPhone
+    Home Screen app: the player shows paused after tapping Library). An uncommitted candidate patch awaits root
+    acceptance; its cause is unconfirmed and it is unproven on a physical iPhone: see "Open playback report" below.
+- **Commits on `dreamingofu/codebase-overview-and-risk`** (all pushed with `9d71366`):
   - U5 `bd5014d`.
   - Batch 1 `8fc8de93c619e1e674ade79fd5e2fe8eead4a698`.
   - Batch 2 `2ba24bbd0434e2b932cd44e7baf9c62628118d23` (accepted clean base of batch 3).
@@ -308,10 +317,78 @@ async correctness, batch 7 = tiny-art cache byte budget). The required audit / r
   - Deferred hypotheses (no work without new evidence): F10 (finished-job cap) stays inspection-only, with no shown
     user-facing failure or need; J1-J3 / U-c / U-d are unmeasured performance / gesture hypotheses and don't justify
     guessed refactors. No cosmetic whole-file splits.
-  - Not planned: features, U6, push, deploy / publication, real data, devices / phone, real services, default /
+  - Not planned at B7 (historical; the push / Android install of `9d71366` was authorized afterwards, see the top of
+    this section): features, U6, push, deploy / publication, real data, devices / phone, real services, default /
     model / credential / permission / billing changes.
   - Not validated (no claim of a perfect codebase): live Safari / on-device behavior, real services, performance.
-  - Root's final next action: verify the clean HEAD and the product blob hashes, then the final Orca accounting.
+- **Open playback report (2026-10-22; open, cause unconfirmed)**: the owner reports that going from Home to Library
+  stops the current playback. **Owner fact** (later): an iPhone **Home Screen app** (standalone), and the player
+  shows **paused** after tapping Library.
+  - Diagnosis Task `task_345d1961f336` / Dispatch `ctx_6feb00b1b864` (settled, outcome failed: not reproduced; read-only
+    plus this file). Candidate Task `task_9e66d131e333` / Dispatch `ctx_be4699a4c48d` (below). Writer of both: Claude
+    `term_d953e2c9-6cd5-4087-9a04-2690fdb9b176`; after its worker_done it relinquishes writer ownership and idles.
+  - Not reproduced on `9d71366`, using a static-only loopback server (`templates/index.html` + `static/*`), mocked
+    `/api/*`, a real WAV stream and external requests blocked:
+    - Claude, WebKit, desktop clicks on `.tab[data-view]` (Library / Home × 4, empty fixtures): `paused` false at
+      every step, same `#audio` element and `currentSrc`, time advancing (4 → 4.13 s), no pause / emptied / loadstart /
+      error events, no page errors.
+    - Root, the same with desktop clicks, and with iPhone UA + `isMobile` + `hasTouch` taps over populated history /
+      playlists / recent albums: same result (`/tmp/reef-codex-refactor-20261022/nav-before-root4.txt`,
+      `nav-touch-root4.txt`; script `nav-browser-root4.js`, server `ui-server-root4.py`).
+  - Static read (no pause / src path found on that navigation): `route()` (`static/app.js` ~2653) only toggles
+    views / tabs, calls `loadHome` / `loadLibrary` / `loadPlaylists` and `RENDER[view]`, and on a route change
+    `closeNP()` (`closeQ` + classes only) and `closeSheet`. `renderLibrary` / `renderDownloads` / `renderLibPlaylists` /
+    `renderLibNavidrome` / `renderKept` / `paint` / `markPlaying` / `updatePlayer` make no `audio` source / play-state
+    writes (`updatePlayer` only reads it). The tab
+    anchors match no `[data-…]` of the delegated document click handler (~6745). `#audio` sits outside every
+    re-rendered container (`templates/index.html` 383). The only `audio.pause()` / `audio.src` sites: user pause /
+    togglePlay, the mini swipe-down dismiss (`dismissMini`, `PC.miniVertical` dy ≥ 32 or a downward flick on
+    `#mini-card`), the sleep timer, `stopAtEnd`, `loadPlaceholder`, recovery `moveOn` / `reload`, `load` /
+    `playAudio`, and the Media Session pause action.
+  - Platform lead (not proof for HTMLAudio): WebKit bug 215884 (comments 2 / 12): in iOS Home Screen apps (Web.app)
+    a hash navigation behaves like "a navigation which stops all the capture tracks" (getUserMedia), fixed in the
+    Safari standalone host, not WebKit; later comments report pushState / path changes doing the same in WKWebView. No
+    source found yet for a fragment navigation pausing `<audio>`. "Paused" also fits a reload (the restored session
+    shows a paused mini); the device can tell (does Library show at once with the same position, or reload?).
+  - **Candidate patch** (root independently reviewed and accepted for a test deployment; physical symptom unconfirmed): `static/app.js`
+    `tabClick(e)` (after `openRoute`), called first in the delegated document click handler. Only when
+    `navigator.standalone === true`, for a plain primary click (no modifier, not `defaultPrevented`) on a bottom
+    `.tab[href]` whose href is exactly `#home` / `#library` (no `target` / `download`): `preventDefault`, then
+    `history.pushState(null, "", hash)` + `route()`; the tab already shown is a no-op (as the native same-hash link).
+    `route` / `openRoute` / programmatic routes / legacy `#kept` / `#downloads` redirects / the Search FAB / See all /
+    page links / `hashchange` traversal are unchanged. No auto-resume, no pause handling changed.
+  - Tests (root review repair Task `task_12d4fa2a27f6` / Dispatch `ctx_1b99da06146e`; product code unchanged):
+    new `tests/js/app-nav.test.js` (10) runs the shipped code through harness.scope over a history / location model
+    (native fragment navigations and Back / Forward fire hashchange → `route`) and DOM stubs. Its two integration
+    tests compile the **actual delegated document click listener** where it stands (its `document.addEventListener(
+    "click", (e) => {` … `  });` lines become `const docClick = (e) => {` … `  };`; `tabClick` joins the scope only if
+    declared), dispatch a tab tap, follow the link natively unless prevented, and model the suspected host pause (a
+    native fragment navigation sets the player paused). The 8 unit cases cover depth / parent, Back / Forward with the
+    saved scroll, Library → Home and a detail page's parent, same tab no entry, non-standalone / modified / middle /
+    handled / target / download clicks, Search / See all / page links and other tab hashes staying native, and legacy
+    `#kept` still redirecting.
+    - Baseline (`git show 9d71366:static/app.js` in scratch, unchanged harness): the standalone integration test fails
+      by behavior: `AssertionError: the tab's native fragment navigation is prevented` (`false !== true`); the
+      non-standalone integration test and the legacy case pass (behavior kept); the 7 helper unit cases fail with
+      `t.s.tabClick is not a function`. After: 10 / 10. Removing the listener's `if (tabClick(e)) return;` fails exactly
+      the standalone integration test; each `tabClick` guard removed fails ≥ 1 unit case.
+  - Checks by Claude: `node --check static/app.js`; `node --test tests/js/` → 220 passed (210 + 10); `.venv/bin/ruff
+    check .` and `git diff --check` clean. Own WebKit (static-only scratch server, mocked API, WAV, external requests
+    blocked, `navigator.standalone` forced true): Library / Home tab clicks ×4 → only `pushState` entries, no
+    hashchange, `paused` false, same element / src, no pause / emptied / loadstart events, no page errors; one
+    `history.back()` → hashchange → Library at depth 3. Root's WebKit with an explicit host-pause fault model
+    (`pwa-before-root4.txt`: first Library tap paused, 1 native interruption; `pwa-after-root4.txt`: paused false, 0,
+    same element / src, Back / Forward depths, same tab no extra entry, a manual pause stays paused). These prove the
+    avoidance mechanism only, not the iOS cause.
+  - Remaining device gap: physical iPhone Home Screen proof (tap Library while playing; also Back / swipe-back,
+    which stays a native traversal, and the Search FAB / See all links, still native fragment navigations). If the
+    pause persists with the patch, the hook is not the fragment navigation (or covers pushState too) and the patch
+    should be dropped. Root acceptance covers this bounded candidate and regression proof, not a confirmed iOS fix.
+  - Root final checks: `node --test tests/js/` → 220 passed (731.87 ms), JS syntax / Ruff / diff clean;
+    `/tmp/reef-codex-refactor-20261022/pwa-root4-checks.json`. No Python changes; accepted B7 Python proof stands.
+    Root's independent WebKit before/after fault-model evidence is above; no actual iOS standalone reproduction claimed.
+    Claude positively relinquished ownership after `msg_ece47f534253` for the repair Dispatch and idles; all QA browsers
+    and scratch servers are closed. Root owns acceptance, the local commit and authorized feature push / Android update.
 - **Tooling note**: `worker-start --terminal` returns `agent_unconfigured`. The proven fallback is manual
   task-create, then `dispatch --return-preamble`, then terminal-send the exact preamble.
 
@@ -1273,8 +1350,9 @@ Settings / Stats / Recap screens. Prerequisite: serve Reef over HTTPS with `tail
 - **Supervision / state (2026-10-22)**: root Codex (Orca terminal `term_d731eb62-3bf8-4362-ad78-88c7e09366c4`) owns
   review and acceptance; Claude (`term_bc7a30e2-cfdf-433d-95e9-470cd4a9d3f2`) implemented U5. **U5 accepted by root
   Codex** and committed locally (one commit on top of `f8f09cd`, worktree `/Users/felipe/orca/workspaces/reef/larvacean`,
-  branch `dreamingofu/codebase-overview-and-risk`). **Not pushed, not deployed**: origin/main and the phone stay on
-  `f8f09cd`; root authorized the local commit only, not publication. U6 and further feature work are on hold.
+  branch `dreamingofu/codebase-overview-and-risk`). **Not pushed, not deployed** at the time: origin/main and the phone
+  stayed on `f8f09cd`; root authorized the local commit only, not publication (superseded later: the owner authorized
+  the push and Android install of `9d71366`, see CURRENT). U6 and further feature work are on hold.
   Root acceptance checks: pytest 983 passed, 1 deselected (16.36 s); Ruff, JS syntax (`node --check`), discovery-core 17
   checks and `git diff --check` pass; root's isolated WebKit runs: `cache-stale-blocklist.js` →
   `{hidden: true, playlistCalls: 3, queuedTitles: []}`, failed-refresh queue empty, ✕-while-pending idle
