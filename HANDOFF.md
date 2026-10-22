@@ -155,6 +155,13 @@ client gating, mid-stream resume, typed failures, failover cooldowns, waitress +
 On-device test of `580a39e` (2026-10-21): 44 offline tests pass in Termux; yt-dlp default client resolves audio-only
 m4a in 1.2 s (`android_vr` gives muxed format 18; `ios`, `web_safari`, `tv`, `mweb` fail), so leave `REEF_YT_CLIENT` empty.
 
+## UI remake plan (2026-10-21)
+
+`docs/UI_REMAKE_PLAN.md`: one combined design from the same seven apps' UIs, with specs per component and a build
+order. Headlines: cover-coloured mini player with progress ring and swipe-to-skip, Now Playing with background styles,
+stretchy transport, joined action row and pull-up queue, depth lyrics, a Library hub replacing Kept/Downloads, new
+Settings / Stats / Recap screens. Prerequisite: serve Reef over HTTPS with `tailscale serve`.
+
 ## Ideas / next steps
 
 - Check round 2 on the iPhone: Now Playing on the small screen, tile artwork, source chips, FLAC playback over cellular.
